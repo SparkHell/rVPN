@@ -33,7 +33,8 @@ rvpn/
 
 ## Building
 
-Requires Rust 1.75+.
+The `rvpn` workspace uses Rust 1.100.0, pinned in `rvpn/rust-toolchain.toml`.
+Its declared minimum supported Rust version remains 1.75.
 
 ```bash
 cd rvpn

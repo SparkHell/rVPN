@@ -68,12 +68,6 @@ async fn control_panel_remains_available_after_vpn_startup_failure() {
 fn client_honors_configured_log_directory_and_disable_switch() {
     for enabled in [true, false] {
         let directory = tempfile::tempdir().unwrap();
-        let binary = directory.path().join(
-            std::path::Path::new(env!("CARGO_BIN_EXE_rvpn"))
-                .file_name()
-                .unwrap(),
-        );
-        std::fs::copy(env!("CARGO_BIN_EXE_rvpn"), &binary).unwrap();
         let config_dir = directory.path().join("config");
         std::fs::create_dir(&config_dir).unwrap();
         std::fs::write(config_dir.join("invalid.key"), "invalid identity").unwrap();
@@ -81,7 +75,7 @@ fn client_honors_configured_log_directory_and_disable_switch() {
         std::fs::write(&config, format!(
             "identity_key_file = './invalid.key'\ndata_dir = './data'\n[logging]\nfile_enabled = {enabled}\ndirectory = './logs'\n"
         )).unwrap();
-        let output = Command::new(&binary)
+        let output = Command::new(env!("CARGO_BIN_EXE_rvpn"))
             .args(["-c", config.to_str().unwrap()])
             .current_dir(std::env::temp_dir())
             .output()
