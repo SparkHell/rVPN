@@ -90,12 +90,6 @@ fn fixture_logging(
     file_logging: bool,
 ) -> (tempfile::TempDir, Process, SocketAddr, SocketAddr) {
     let directory = tempfile::tempdir().unwrap();
-    let binary = directory.path().join(
-        std::path::Path::new(env!("CARGO_BIN_EXE_rvpn"))
-            .file_name()
-            .unwrap(),
-    );
-    std::fs::copy(env!("CARGO_BIN_EXE_rvpn"), &binary).unwrap();
     let server =
         rvpn_core::crypto::X3DHResponder::from_identity(rvpn_core::crypto::IdentityKey::generate());
     std::fs::write(
@@ -124,12 +118,13 @@ fn fixture_logging(
     config.http_proxy.enabled = false;
     config.logging.file_enabled = file_logging;
     if file_logging {
+        config.logging.directory = Some(directory.path().to_owned());
         config.logging.level = "trace".into();
     }
     let path = directory.path().join("client.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     let child = Process(
-        Command::new(binary)
+        Command::new(env!("CARGO_BIN_EXE_rvpn"))
             .args(["-c", path.to_str().unwrap()])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

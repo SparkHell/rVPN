@@ -6,12 +6,6 @@ async fn control_panel_remains_available_after_vpn_startup_failure() {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let directory = tempfile::tempdir().unwrap();
-    let binary = directory.path().join(
-        std::path::Path::new(env!("CARGO_BIN_EXE_rvpn"))
-            .file_name()
-            .unwrap(),
-    );
-    std::fs::copy(env!("CARGO_BIN_EXE_rvpn"), &binary).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
@@ -26,7 +20,7 @@ async fn control_panel_remains_available_after_vpn_startup_failure() {
         }
     }
     let mut child = Process(
-        Command::new(binary)
+        Command::new(env!("CARGO_BIN_EXE_rvpn"))
             .args(["-c", config.to_str().unwrap()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -123,11 +117,12 @@ fn client_creates_identity_but_never_invents_server_bundle() {
     let key_path = dir.path().join("keys/identity.key");
     let mut previous = None;
     for run in 0..2 {
-        let output = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command
             .current_dir(std::env::temp_dir())
-            .args(["-c", config.to_str().unwrap()])
-            .output()
-            .unwrap();
+            .arg("-c")
+            .arg(&config);
+        let output = run_private_copy(&mut command).unwrap();
         assert!(
             !output.status.success(),
             "Missing server bundle should stop startup"
@@ -168,5 +163,24 @@ fn client_creates_identity_but_never_invents_server_bundle() {
         }
         previous = Some(key);
         assert!(!dir.path().join("missing-server-bundle.json").exists());
+    }
+}
+
+// A runner filesystem can briefly report ETXTBSY after copying a binary.
+// Preserve the executable-relative log check and retry only failed launches.
+fn run_private_copy(command: &mut Command) -> std::io::Result<std::process::Output> {
+    use std::io::ErrorKind;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match command.output() {
+            Err(error)
+                if error.kind() == ErrorKind::ExecutableFileBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
     }
 }
