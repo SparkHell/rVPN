@@ -228,8 +228,9 @@ impl Socks5Proxy {
                 router: Arc::clone(&self.router),
             };
 
+            let config = self.socks5_config.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, addr, proxy).await {
+                if let Err(e) = handle_connection(socket, addr, proxy, config).await {
                     error!("SOCKS5 connection error from {}: {:#}", addr, e);
                 }
             });
@@ -237,11 +238,12 @@ impl Socks5Proxy {
     }
 }
 
-/// Handle single SOCKS5 connection: handshake, send success, then route.
+/// Authenticate and connect the destination before granting the SOCKS request.
 async fn handle_connection(
     mut socket: TcpStream,
     addr: SocketAddr,
     proxy: ProxyHandle,
+    config: Socks5Config,
 ) -> Result<()> {
     debug!("New SOCKS5 connection from {}", addr);
 
@@ -249,7 +251,7 @@ async fn handle_connection(
     // connects but never speaks SOCKS5 cannot pin the task + fd forever.
     let target_addr = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        socks5_handshake(&mut socket),
+        socks5_handshake(&mut socket, &config),
     )
     .await
     {
@@ -261,18 +263,31 @@ async fn handle_connection(
     };
     debug!("SOCKS5 target: {}", target_addr);
 
-    // 2. Send SOCKS5 success response
+    let (host, port) = proxy_common::parse_target(&target_addr)?;
+    let mut remote = match proxy_common::open_target(&host, port, &proxy).await {
+        Ok(remote) => remote,
+        Err(error) => {
+            use std::io::ErrorKind;
+            let reply = match error.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
+                Some(ErrorKind::PermissionDenied) => 2,
+                Some(ErrorKind::NetworkUnreachable) => 3,
+                Some(ErrorKind::HostUnreachable) => 4,
+                Some(ErrorKind::ConnectionRefused) => 5,
+                Some(ErrorKind::TimedOut) => 6,
+                _ => 1,
+            };
+            socket.write_all(&[5, reply, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            return Err(error);
+        }
+    };
     send_socks5_success(&mut socket).await?;
-
-    // 3. Delegate to shared routing logic
-    proxy_common::route_connection(socket, addr, &target_addr, &proxy).await?;
-
+    tokio::io::copy_bidirectional(&mut socket, &mut remote).await?;
     debug!("SOCKS5 connection closed: {}", addr);
     Ok(())
 }
 
 /// SOCKS5 handshake - authenticate client (if configured) and parse target address
-async fn socks5_handshake(socket: &mut TcpStream) -> Result<String> {
+async fn socks5_handshake(socket: &mut TcpStream, config: &Socks5Config) -> Result<String> {
     // Read greeting
     let mut buf = [0u8; 2];
     socket.read_exact(&mut buf).await?;
@@ -287,8 +302,27 @@ async fn socks5_handshake(socket: &mut TcpStream) -> Result<String> {
     let mut methods = vec![0u8; nmethods];
     socket.read_exact(&mut methods).await?;
 
-    // No auth required
-    socket.write_all(&[0x05, 0x00]).await?;
+    let method = if config.auth_enabled { 2 } else { 0 };
+    if !methods.contains(&method) {
+        socket.write_all(&[5, 0xff]).await?;
+        anyhow::bail!("No acceptable authentication method");
+    }
+    socket.write_all(&[5, method]).await?;
+    if config.auth_enabled {
+        use subtle::ConstantTimeEq;
+        let version = socket.read_u8().await?;
+        let mut user = vec![0; socket.read_u8().await? as usize];
+        socket.read_exact(&mut user).await?;
+        let mut pass = vec![0; socket.read_u8().await? as usize];
+        socket.read_exact(&mut pass).await?;
+        let valid = match (&config.auth_username, &config.auth_password) {
+            (Some(u), Some(p)) if version == 1 && !user.is_empty() && !pass.is_empty() =>
+                bool::from(user.ct_eq(u.as_bytes()) & pass.ct_eq(p.as_bytes())),
+            _ => false,
+        };
+        socket.write_all(&[1, u8::from(!valid)]).await?;
+        anyhow::ensure!(valid, "Invalid SOCKS5 credentials");
+    }
 
     // Read request
     let mut header = [0u8; 4];
@@ -296,6 +330,10 @@ async fn socks5_handshake(socket: &mut TcpStream) -> Result<String> {
     let cmd = header[1];
     let atyp = header[3];
 
+    if header[0] != 5 || header[2] != 0 {
+        socket.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        anyhow::bail!("Invalid SOCKS5 request header");
+    }
     if cmd != 0x01 {
         socket.write_all(&[0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
         return Err(anyhow::anyhow!("Only CONNECT command supported, got {}", cmd));
@@ -319,9 +357,8 @@ async fn socks5_handshake(socket: &mut TcpStream) -> Result<String> {
         0x04 => {
             let mut addr = [0u8; 16];
             socket.read_exact(&mut addr).await?;
-            let _port = read_port(socket).await?;
-            socket.write_all(&[0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
-            return Err(anyhow::anyhow!("IPv6 address type not supported (server has no IPv6 upstream)"));
+            let port = read_port(socket).await?;
+            format!("[{}]:{}", std::net::Ipv6Addr::from(addr), port)
         }
         _ => {
             socket.write_all(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;

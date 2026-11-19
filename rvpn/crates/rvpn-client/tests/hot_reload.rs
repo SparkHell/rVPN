@@ -247,12 +247,105 @@ async fn server_endpoints_use_direct_socks_and_http_after_configuration_reload()
             drop(flow);
             let mut flow = TcpStream::connect(http).await.unwrap();
             flow.write_all(format!("GET http://{target}/probe HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
-            let mut response = vec![0; reply.len()];
-            flow.read_exact(&mut response).await.unwrap();
-            assert_eq!(response, reply);
+            let mut response = Vec::new();
+            flow.read_to_end(&mut response).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            assert!(response.ends_with(b"\r\n\r\npong"));
         }
         server.await.unwrap();
     }).await.expect("endpoint bypass test timed out");
+}
+
+#[tokio::test]
+async fn proxy_handshakes_and_http_framing() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (_directory, _child, panel, socks) = fixture(false);
+        let (mut panel, mut current) = connect(panel).await;
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let http = address();
+        let mut config = current["config"].clone();
+        config["server_address"] = json!(format!("wss://{target}/ws"));
+        config["socks5"]["auth_enabled"] = json!(true);
+        config["socks5"]["auth_username"] = json!("test");
+        config["socks5"]["auth_password"] = json!("pass");
+        config["http_proxy"]["enabled"] = json!(true);
+        config["http_proxy"]["listen_address"] = json!(http.to_string());
+        let saved = save(&mut panel, &mut current, config).await;
+        assert_eq!(saved["ok"], true, "{saved}");
+
+        let mut client = TcpStream::connect(socks).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        assert_eq!(client.read_u16().await.unwrap(), 0x05ff);
+        for (password, status) in [(b"nope", 1), (b"pass", 0)] {
+            let mut client = TcpStream::connect(socks).await.unwrap();
+            client.write_all(&[5, 2, 0, 2]).await.unwrap();
+            assert_eq!(client.read_u16().await.unwrap(), 0x0502);
+            client.write_all(b"\x01\x04test\x04").await.unwrap();
+            client.write_all(password).await.unwrap();
+            assert_eq!(client.read_u16().await.unwrap(), 0x0100 + status);
+            if status == 0 {
+                client.write_all(&[5, 1, 0, 4]).await.unwrap();
+                client.write_all(&std::net::Ipv6Addr::LOCALHOST.octets()).await.unwrap();
+                client.write_u16(target.port()).await.unwrap();
+                let mut reply = [0; 10];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply[1], 0);
+                drop(listener.accept().await.unwrap());
+            }
+        }
+
+        let origin = tokio::spawn(async move {
+            for method in ["HEAD", "POST"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(stream.read_u8().await.unwrap());
+                }
+                assert!(headers.starts_with(format!("{method} / HTTP/1.1\r\n").as_bytes()));
+                if method == "POST" {
+                    let mut body = Vec::new();
+                    while !body.ends_with(b"\r\n0\r\n\r\n") {
+                        body.push(stream.read_u8().await.unwrap());
+                    }
+                    assert!(body.windows(4).any(|w| w == b"ping"));
+                }
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n").await.unwrap();
+                if method == "POST" { stream.write_all(b"pong").await.unwrap(); }
+            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut early = [0; 4];
+            stream.read_exact(&mut early).await.unwrap();
+            assert_eq!(&early, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+        let mut client = TcpStream::connect(http).await.unwrap();
+        client.write_all(format!("HEAD http://{target}/ HTTP/1.1\r\nHost: {target}\r\n\r\nPOST http://{target}/ HTTP/1.1\r\nHost: {target}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nping\r\n0\r\n\r\n").as_bytes()).await.unwrap();
+        let mut replies = String::new();
+        client.read_to_string(&mut replies).await.unwrap();
+        assert_eq!(replies.matches("HTTP/1.1 200").count(), 2, "{replies}");
+        assert!(replies.contains("\r\n\r\nHTTP/1.1 200") && replies.ends_with("pong"), "{replies}");
+
+        let mut client = TcpStream::connect(http).await.unwrap();
+        client.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\nping").as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("pong"), "{reply}");
+        origin.await.unwrap();
+
+        let mut client = TcpStream::connect(http).await.unwrap();
+        client.write_all(format!("POST http://{target}/ HTTP/1.1\r\nHost: {target}\r\nContent-Length: invalid\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+
+        // The listener has closed. The proxy must report the connection failure.
+        let mut client = TcpStream::connect(http).await.unwrap();
+        client.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
+    }).await.expect("proxy protocol regression timed out");
 }
 
 #[tokio::test]

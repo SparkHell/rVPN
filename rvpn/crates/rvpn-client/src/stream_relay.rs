@@ -10,7 +10,6 @@
 use anyhow::{Context as _, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
@@ -353,14 +352,12 @@ impl StreamRelay {
         use rvpn_core::crypto::ratchet::RatchetMessage;
 
         // Receive the encrypted message
-        let msg = ws_reader
-            .recv()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("WebSocket closed"))?;
-
-        let data = match msg {
-            Message::Binary(data) => data,
-            _ => return Err(anyhow::anyhow!("Expected binary message")),
+        let data = loop {
+            match ws_reader.recv().await {
+                Some(Message::Binary(data)) => break data,
+                Some(Message::Ping(_) | Message::Pong(_)) => continue,
+                _ => anyhow::bail!("WebSocket closed or invalid confirmation frame"),
+            }
         };
 
         // Deserialize RatchetMessage
@@ -393,11 +390,11 @@ impl StreamRelay {
     /// * `ws_writer` - WebSocket writer for sending encrypted data
     pub async fn relay(
         self,
-        local: TcpStream,
+        local: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
         mut ws_reader: WebSocketReader,
         ws_writer: WebSocketWriter,
     ) -> Result<()> {
-        let (mut local_read, mut local_write) = local.into_split();
+        let (mut local_read, mut local_write) = tokio::io::split(local);
 
         debug!("Starting bidirectional relay");
 

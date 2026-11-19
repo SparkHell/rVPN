@@ -6,7 +6,7 @@
 //! After protocol-specific handshake, both produce a target `host:port` and a `TcpStream`.
 //! This module handles the downstream routing: split tunnel decision → bypass/tunnel/block.
 
-use std::net::SocketAddr;
+use std::time::Duration;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -59,7 +59,7 @@ pub fn parse_target(target: &str) -> Result<(String, u16)> {
     let port: u16 = port_str
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid port"))?;
-    Ok((host.to_string(), port))
+    Ok((host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host).to_string(), port))
 }
 
 /// Enable TCP keepalive on an accepted client socket.
@@ -106,88 +106,87 @@ pub fn encode_target_address(target: &str) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Route a connection through the VPN tunnel or directly.
-///
-/// This is the shared routing logic after protocol-specific handshake is complete.
-/// The `socket` should already have the protocol-specific success response sent
-/// (SOCKS5 10-byte reply or HTTP "200 Connection Established").
-pub async fn route_connection(
-    socket: TcpStream,
-    addr: SocketAddr,
-    target_addr: &str,
+/// Open a routed stream only after the destination has accepted the connection.
+pub async fn open_target(
+    host: &str,
+    port: u16,
     proxy: &ProxyHandle,
-) -> Result<()> {
+) -> Result<tokio::io::DuplexStream> {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        open_target_inner(host, port, proxy),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "target connection timed out"))?
+}
+
+async fn open_target_inner(
+    host: &str,
+    port: u16,
+    proxy: &ProxyHandle,
+) -> Result<tokio::io::DuplexStream> {
     crate::dashboard::record_conn_accepted();
-    let (target_host, target_port) = parse_target(target_addr)?;
-
-    // Definitive domain rules go directly to the tunnel without local DNS.
-    let (final_decision, _, addresses) = proxy.split_tunnel.explain_connection(&target_host).await;
-
-    match final_decision {
+    let (decision, _, addresses) = proxy.split_tunnel.explain_connection(host).await;
+    let (client, mut relay_socket) = tokio::io::duplex(64 * 1024);
+    match decision {
+        RoutingDecision::Block => {
+            crate::dashboard::record_conn_blocked();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "blocked by routing policy",
+            )
+            .into());
+        }
         RoutingDecision::Bypass => {
-            debug!("Bypassing VPN for {}:{}", target_host, target_port);
             crate::dashboard::record_conn_bypassed();
-            let result = handle_direct_connection(socket, &target_host, target_port, &addresses).await;
-            crate::dashboard::record_conn_completed();
-            result?;
+            let mut remote = crate::websocket::connect_direct_tcp(host, port, &addresses).await?;
+            tokio::spawn(async move {
+                match tokio::io::copy_bidirectional(&mut relay_socket, &mut remote).await {
+                    Ok((up, down)) => {
+                        crate::dashboard::record_bytes_up(up);
+                        crate::dashboard::record_bytes_down(down);
+                    }
+                    Err(e) => debug!("Direct relay ended: {e}"),
+                }
+                crate::dashboard::record_conn_completed();
+            });
         }
         RoutingDecision::Tunnel => {
             crate::dashboard::record_conn_tunneled();
-            let result = match proxy.mode {
-                Socks5Mode::Multiplex => {
-                    handle_tunnel_multiplexed(socket, addr, target_addr, proxy).await
-                }
-                Socks5Mode::Pooled => handle_tunnel_pooled(socket, addr, target_addr, proxy).await,
-                Socks5Mode::Legacy => handle_tunnel_legacy(socket, addr, target_addr, proxy).await,
-            };
-            crate::dashboard::record_conn_completed();
-            result?;
-        }
-        RoutingDecision::Block => {
-            debug!("Blocking ad/tracker: {}:{}", target_host, target_port);
-            crate::dashboard::record_conn_blocked();
-            // Caller should handle sending an error response to the client before
-            // calling route_connection, but if we get here the socket is just dropped.
+            if proxy.mode == Socks5Mode::Legacy {
+                open_legacy(relay_socket, host, port, proxy).await?;
+            } else {
+                let tunnel = if proxy.mode == Socks5Mode::Pooled {
+                    pooled_tunnel(host, proxy).await?
+                } else {
+                    multiplexed_tunnel(proxy).await?
+                };
+                let flow = tunnel.open_flow(host, port).await?;
+                tokio::spawn(async move {
+                    socks5_tunnel::relay_flow(relay_socket, flow, &tunnel).await;
+                    crate::dashboard::record_conn_completed();
+                });
+            }
         }
     }
-
-    Ok(())
+    Ok(client)
 }
 
-/// Handle direct connection (bypass VPN).
-async fn handle_direct_connection(
+/// Route an established local stream for library callers that handle their own handshake.
+#[allow(dead_code)]
+pub async fn route_connection(
     mut socket: TcpStream,
-    target_host: &str,
-    target_port: u16,
-    addresses: &[std::net::IpAddr],
-) -> Result<()> {
-    let target_addr = format!("{}:{}", target_host, target_port);
-    let mut target = crate::websocket::connect_direct_tcp(target_host, target_port, addresses)
-        .await
-        .with_context(|| format!("Failed to connect to {}", target_addr))?;
-
-    debug!("Direct connection established to {}", target_addr);
-
-    let (mut client_read, mut client_write) = socket.split();
-    let (mut target_read, mut target_write) = target.split();
-
-    let (up, down) = tokio::try_join!(
-        tokio::io::copy(&mut client_read, &mut target_write),
-        tokio::io::copy(&mut target_read, &mut client_write)
-    )?;
-    crate::dashboard::record_bytes_up(up);
-    crate::dashboard::record_bytes_down(down);
-
-    Ok(())
-}
-
-/// Handle tunnel connection — multiplexed mode (single shared WebSocket).
-async fn handle_tunnel_multiplexed(
-    socket: tokio::net::TcpStream,
-    addr: std::net::SocketAddr,
-    target_addr: &str,
+    _addr: std::net::SocketAddr,
+    target: &str,
     proxy: &ProxyHandle,
 ) -> Result<()> {
+    let (host, port) = parse_target(target)?;
+    let mut remote = open_target(&host, port, proxy).await?;
+    tokio::io::copy_bidirectional(&mut socket, &mut remote).await?;
+    Ok(())
+}
+
+async fn multiplexed_tunnel(proxy: &ProxyHandle) -> Result<Arc<Socks5Tunnel>> {
     let tunnel = {
         let mux_path = if proxy.mux_path.is_empty() {
             let base = proxy.server_path.trim_end_matches('/');
@@ -274,24 +273,15 @@ async fn handle_tunnel_multiplexed(
         Arc::clone(guard.as_ref().unwrap())
     };
 
-    socks5_tunnel::handle_multiplexed_connection(socket, addr, target_addr, &tunnel).await
+    Ok(tunnel)
 }
 
-/// Handle tunnel connection — pooled mode (per-exit pool of multiplexed
-/// WebSockets). The router picks the exit; the exit's pool picks the tunnel
-/// (least-loaded, with background pre-warm on failure).
-async fn handle_tunnel_pooled(
-    socket: tokio::net::TcpStream,
-    addr: std::net::SocketAddr,
-    target_addr: &str,
-    proxy: &ProxyHandle,
-) -> Result<()> {
-    let (target_host, _) = parse_target(target_addr)?;
+async fn pooled_tunnel(target_host: &str, proxy: &ProxyHandle) -> Result<Arc<Socks5Tunnel>> {
     let pools = proxy
         .tunnel_pools
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("pooled mode requires tunnel pools"))?;
-    let exit_name = proxy.router.choose(&target_host);
+    let exit_name = proxy.router.choose(target_host);
     let tunnel = pools
         .get_or_default(exit_name)
         .pick_tunnel()
@@ -302,22 +292,16 @@ async fn handle_tunnel_pooled(
         debug!("Routing {} → exit '{}' (pooled)", target_host, exit_name);
     }
 
-    socks5_tunnel::handle_multiplexed_connection(socket, addr, target_addr, &tunnel).await
+    Ok(tunnel)
 }
 
-/// Handle tunnel connection — legacy mode (one WebSocket per flow).
-///
-/// Consults `proxy.router` to pick which named server should handle this
-/// flow. If the choice is anything other than the default, we log it so
-/// operators can see routing decisions in `-vv` mode.
-async fn handle_tunnel_legacy(
-    socket: TcpStream,
-    addr: SocketAddr,
-    target_addr: &str,
+async fn open_legacy(
+    socket: tokio::io::DuplexStream,
+    target_host: &str,
+    port: u16,
     proxy: &ProxyHandle,
 ) -> Result<()> {
-    let (target_host, _) = parse_target(target_addr)?;
-    let server = proxy.pool.get_or_default(proxy.router.choose(&target_host));
+    let server = proxy.pool.get_or_default(proxy.router.choose(target_host));
 
     if server.name != crate::server_pool::DEFAULT_SERVER_NAME {
         debug!(
@@ -326,7 +310,7 @@ async fn handle_tunnel_legacy(
         );
     }
 
-    let (mut relay, ws_reader, ws_writer, ws_tasks) = StreamRelay::connect(
+    let (mut relay, mut ws_reader, ws_writer, ws_tasks) = StreamRelay::connect(
         &server.host,
         server.port,
         &server.path,
@@ -340,25 +324,20 @@ async fn handle_tunnel_legacy(
     .await
     .with_context(|| format!("Failed to connect StreamRelay to server '{}'", server.name))?;
 
-    let target_bytes = encode_target_address(target_addr)?;
-    relay
-        .send_frame(&ws_writer, &target_bytes)
+    let mut request = vec![0]; // Confirmed TCP connect command. Older servers reject it.
+    request.extend(encode_target_address(&format!("{target_host}:{port}"))?);
+    relay.send_frame(&ws_writer, &request).await?;
+    let status = relay
+        .recv_frame(&mut ws_reader)
         .await
-        .context("Failed to send target address")?;
-
-    debug!("Sent target address to server: {}", target_addr);
-
-    let result = relay.relay(socket, ws_reader, ws_writer).await;
-
-    // Stop the reader/writer/ping helper tasks now that the relay has ended
-    // (relay() sent a best-effort WS Close before returning). If the ping
-    // task outlives the relay it keeps the socket alive forever — the server
-    // counts pings as activity, so neither side's idle timeout ever fires
-    // and the flow leaks.
-    ws_tasks.shutdown().await;
-
-    result?;
-
-    debug!("Legacy tunnel connection closed for {}", addr);
+        .context("legacy server did not confirm target connection")?;
+    anyhow::ensure!(status == [0], "legacy server could not connect to target");
+    tokio::spawn(async move {
+        if let Err(e) = relay.relay(socket, ws_reader, ws_writer).await {
+            debug!("Legacy relay ended: {e}");
+        }
+        ws_tasks.shutdown().await;
+        crate::dashboard::record_conn_completed();
+    });
     Ok(())
 }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use crate::server_pool::parse_server_url;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -25,7 +25,7 @@ use crate::config::{ClientConfig, HttpProxyConfig, ServerIdentityConfig, Socks5M
 use crate::proxy_common::{self, ProxyHandle};
 use crate::router::Router;
 use crate::server_pool::ServerPool;
-use crate::split_tunnel::{RoutingDecision, SplitTunnel};
+use crate::split_tunnel::SplitTunnel;
 use rvpn_tls::TlsFingerprint;
 use crate::socks5_tunnel::Socks5Tunnel;
 use crate::dns_cache::DnsResolver;
@@ -69,16 +69,11 @@ impl HttpProxy {
 
         dns_resolver.start_cleanup_task();
 
-        // The HTTP CONNECT path shares `proxy_common::route_connection` with
-        // SOCKS5, so pooled SOCKS5 mode applies here automatically. The
-        // legacy `http_proxy.multiplex` bool still forces single-pipe mode.
-        let mode = if config.http_proxy.multiplex {
+        // The compatibility flag selects a single pipe only for a single exit.
+        let mode = if config.http_proxy.multiplex && pool.extra_count() == 0 {
             Socks5Mode::Multiplex
         } else {
-            match config.socks5.effective_mode() {
-                Socks5Mode::Pooled => Socks5Mode::Pooled,
-                _ => Socks5Mode::Legacy,
-            }
+            config.socks5.effective_mode()
         };
 
         Ok(Self {
@@ -176,507 +171,205 @@ struct AuthConfig {
     password: String,
 }
 
-/// Handle a single HTTP proxy connection.
-/// Supports connection keep-alive for multiple requests on the same TCP connection.
+type Body = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, hyper::Error>;
+
+fn response(status: hyper::StatusCode) -> hyper::Response<Body> {
+    use http_body_util::BodyExt;
+    let mut response = hyper::Response::new(
+        http_body_util::Empty::new()
+            .map_err(|never| match never {})
+            .boxed_unsync(),
+    );
+    *response.status_mut() = status;
+    response
+}
+
 async fn handle_connection(
-    mut socket: TcpStream,
+    socket: TcpStream,
     addr: SocketAddr,
     proxy: ProxyHandle,
-    auth_config: Option<AuthConfig>,
+    auth: Option<AuthConfig>,
 ) -> Result<()> {
-    debug!("New HTTP proxy connection from {}", addr);
-
-    let mut first_request = true;
-    loop {
-        let mut reader = BufReader::new(socket);
-        let mut request_line = String::new();
-        // Bound the wait for the FIRST request on a fresh connection so a
-        // client that connects but never sends anything cannot pin the task
-        // + fd forever. Keep-alive reads between requests stay unbounded.
-        let read_result = if first_request {
-            first_request = false;
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                reader.read_line(&mut request_line),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    debug!("HTTP proxy: first request timed out from {}", addr);
-                    return Err(anyhow::anyhow!(
-                        "HTTP proxy: timed out waiting for first request (30s)"
-                    ));
-                }
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    let service = hyper::service::service_fn(|request| async {
+        let reply = match forward(request, &proxy, auth.as_ref()).await {
+            Ok(reply) => reply,
+            Err(e) => {
+                warn!("HTTP proxy request from {addr} failed: {e:#}");
+                use std::io::ErrorKind;
+                let status = match e.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
+                    Some(ErrorKind::PermissionDenied) => hyper::StatusCode::FORBIDDEN,
+                    Some(ErrorKind::TimedOut) => hyper::StatusCode::GATEWAY_TIMEOUT,
+                    _ => hyper::StatusCode::BAD_GATEWAY,
+                };
+                response(status)
             }
-        } else {
-            reader.read_line(&mut request_line).await
         };
-        match read_result {
-            Ok(0) => return Ok(()),
-            Ok(_) => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        let request_line = request_line.trim_end_matches(['\r', '\n']);
-        if request_line.is_empty() {
-            return Ok(());
-        }
-
-        debug!("HTTP request line: {}", request_line);
-
-        let parts: Vec<&str> = request_line.splitn(3, ' ').collect();
-        if parts.len() < 3 {
-            return Err(anyhow::anyhow!("Invalid HTTP request line: {}", request_line));
-        }
-
-        let method = parts[0];
-        let uri = parts[1];
-        let _http_version = parts[2];
-
-        // Read headers
-        let mut headers = Vec::new();
-        let mut content_length: usize = 0;
-        let mut proxy_auth_value = String::new();
-        let mut host_from_header = String::new();
-        let mut keep_alive = true;
-
-        loop {
-            let mut header_buf = String::new();
-            match reader.read_line(&mut header_buf).await {
-                Ok(0) => return Ok(()),
-                Ok(_) => {}
-                Err(e) => return Err(e.into()),
-            }
-
-            let trimmed = header_buf.trim_end_matches(['\r', '\n']);
-            if trimmed.is_empty() {
-                break;
-            }
-
-            let lower = trimmed.to_lowercase();
-            if lower.starts_with("content-length:") {
-                if let Some(val) = trimmed.split_once(':').map(|x| x.1) {
-                    content_length = val.trim().parse().unwrap_or(0);
-                }
-            }
-            if lower.starts_with("proxy-authorization:") {
-                if let Some(val) = trimmed.split_once(':').map(|x| x.1) {
-                    proxy_auth_value = val.trim().to_string();
-                }
-            }
-            if lower.starts_with("host:") {
-                if let Some(val) = trimmed.split_once(':').map(|x| x.1) {
-                    host_from_header = val.trim().to_string();
-                }
-            }
-            if lower.starts_with("proxy-connection:") {
-                keep_alive = lower.contains("keep-alive");
-            }
-
-            headers.push(trimmed.to_string());
-        }
-
-        // Check authentication
-        if let Some(ref auth) = auth_config {
-            if !check_basic_auth(&proxy_auth_value, &auth.username, &auth.password) {
-                let response = "HTTP/1.1 407 Proxy Authentication Required\r\n\
-                               Proxy-Authenticate: Basic realm=\"rvpn\"\r\n\
-                               Connection: close\r\n\r\n";
-                let mut socket = reader.into_inner();
-                let _ = socket.write_all(response.as_bytes()).await;
-                return Ok(());
-            }
-        }
-
-        if method.eq_ignore_ascii_case("CONNECT") {
-            return handle_connect(reader.into_inner(), addr, uri, &proxy).await;
-        } else {
-            let should_close = handle_http_forward(
-                &mut reader,
-                method,
-                uri,
-                &host_from_header,
-                &headers,
-                content_length,
-                &proxy,
-            )
-            .await?;
-
-            socket = reader.into_inner();
-
-            if should_close || !keep_alive {
-                return Ok(());
-            }
-        }
-    }
-}
-
-/// Handle HTTP CONNECT request (HTTPS tunneling).
-async fn handle_connect(
-    mut socket: TcpStream,
-    addr: SocketAddr,
-    target: &str,
-    proxy: &ProxyHandle,
-) -> Result<()> {
-    let target_addr = if target.contains(':') {
-        target.to_string()
-    } else {
-        format!("{}:443", target)
-    };
-
-    debug!("HTTP CONNECT to {}", target_addr);
-
-    let response = "HTTP/1.1 200 Connection Established\r\n\r\n";
-    socket.write_all(response.as_bytes()).await?;
-
-    proxy_common::route_connection(socket, addr, &target_addr, proxy).await
-}
-
-/// Handle plain HTTP forwarding (GET, POST, etc. with absolute URL).
-/// Returns Ok(true) if the connection should be closed.
-async fn handle_http_forward(
-    reader: &mut BufReader<TcpStream>,
-    method: &str,
-    uri: &str,
-    host_from_header: &str,
-    headers: &[String],
-    content_length: usize,
-    proxy: &ProxyHandle,
-) -> Result<bool> {
-    // Extract host, port, path from URI or Host header
-    let (target_host, target_port, path) = if let Some(without_scheme) = uri.strip_prefix("http://") {
-        let (authority, path) = without_scheme
-            .split_once('/')
-            .map(|(a, p)| (a, format!("/{}", p)))
-            .unwrap_or((without_scheme, "/".to_string()));
-        let (host, port) = authority
-            .split_once(':')
-            .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(80u16)))
-            .unwrap_or_else(|| (authority.to_string(), 80u16));
-        (host, port, path)
-    } else {
-        let host = if !host_from_header.is_empty() {
-            host_from_header.to_string()
-        } else {
-            return Err(anyhow::anyhow!("No host in request and no Host header"));
-        };
-        let (h, p) = host
-            .split_once(':')
-            .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(80u16)))
-            .unwrap_or_else(|| (host, 80u16));
-        (h, p, uri.to_string())
-    };
-
-    let target_addr = format!("{}:{}", target_host, target_port);
-    debug!("HTTP {} {} → {}", method, uri, target_addr);
-
-    // Read request body if present
-    let body = if content_length > 0 {
-        let mut body = vec![0u8; content_length];
-        reader.read_exact(&mut body).await?;
-        Some(body)
-    } else {
-        None
-    };
-
-    // Reconstruct the request with relative path and filtered headers
-    let request = build_request(method, &path, headers);
-
-    let (final_decision, _, addresses) = proxy.split_tunnel.explain_connection(&target_host).await;
-
-    match final_decision {
-        RoutingDecision::Block => {
-            info!("Blocking ad/tracker HTTP: {}:{}", target_host, target_port);
-            let socket = reader.get_mut();
-            let _ = socket
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await;
-            return Ok(true);
-        }
-        RoutingDecision::Bypass => {
-            info!("Bypassing VPN for HTTP {}:{}", target_host, target_port);
-            let mut target = crate::websocket::connect_direct_tcp(&target_host, target_port, &addresses)
-                .await
-                .with_context(|| format!("Failed to connect to {}", target_addr))?;
-
-            target.write_all(request.as_bytes()).await?;
-            if let Some(ref b) = body {
-                target.write_all(b).await?;
-            }
-            crate::dashboard::record_bytes_up(
-                (request.len() + body.as_ref().map_or(0, |b| b.len())) as u64
-            );
-
-            let socket = reader.get_mut();
-            relay_http_response(&mut target, socket).await?;
-        }
-        RoutingDecision::Tunnel => {
-            forward_through_mux_tunnel(
-                reader,
-                &target_host,
-                target_port,
-                &request,
-                body.as_deref(),
-                proxy,
-            )
-            .await?;
-        }
-    }
-
-    Ok(false)
-}
-
-/// Forward an HTTP request through the multiplexed VPN tunnel.
-async fn forward_through_mux_tunnel(
-    reader: &mut BufReader<TcpStream>,
-    host: &str,
-    port: u16,
-    request: &str,
-    body: Option<&[u8]>,
-    proxy: &ProxyHandle,
-) -> Result<()> {
-    let tunnel = {
-        let mux_path = if proxy.mux_path.is_empty() {
-            let base = proxy.server_path.trim_end_matches('/');
-            if base.ends_with("/mux") {
-                base.to_string()
-            } else {
-                format!("{}/mux", base)
-            }
-        } else {
-            proxy.mux_path.clone()
-        };
-
-        let mut guard = proxy.mux_tunnel.lock().await;
-
-        if let Some(ref t) = *guard {
-            if !t.is_alive() {
-                warn!("Multiplexed tunnel dead — reconnecting");
-                *guard = None;
-            }
-        }
-
-        if guard.is_none() {
-            // Same as proxy_common::handle_tunnel_multiplexed: the tunnel
-            // always dials the default exit, so use that exit's resumption
-            // store to let reconnects resume the TLS session.
-            let default_server = proxy
-                .pool
-                .get_or_default(crate::server_pool::DEFAULT_SERVER_NAME);
-            let t = Socks5Tunnel::connect(
-                &proxy.server_host,
-                proxy.server_port,
-                &mux_path,
-                proxy.tls_fingerprint,
-                proxy.sni_hostname.as_deref(),
-                &proxy.identity_key,
-                &proxy.server_bundle,
-                Some(&proxy.server_identity),
-                Some(&default_server.resumption),
-            )
-            .await
-            .context("Failed to create multiplexed tunnel")?;
-            *guard = Some(t);
-        }
-        Arc::clone(guard.as_ref().unwrap())
-    };
-
-    let mut flow = tunnel
-        .open_flow(host, port)
-        .await
-        .context("Failed to open mux flow")?;
-
-    let flow_id = flow.flow_id;
-    let send_tx = flow.take_send().unwrap();
-    let mut recv_rx = flow.take_recv().unwrap();
-
-    // Send the HTTP request through the mux flow
-    send_tx
-        .send(request.as_bytes().to_vec())
-        .await
-        .map_err(|_| anyhow::anyhow!("Mux flow send channel closed"))?;
-
-    // Send body if present
-    let mut sent_up = request.len() as u64;
-    if let Some(b) = body {
-        send_tx
-            .send(b.to_vec())
-            .await
-            .map_err(|_| anyhow::anyhow!("Mux flow send channel closed"))?;
-        sent_up += b.len() as u64;
-    }
-    crate::dashboard::record_bytes_up(sent_up);
-
-    // Read response from mux flow and write back to client
-    let socket = reader.get_mut();
-    while let Some(data) = recv_rx.recv().await {
-        socket.write_all(&data).await?;
-        crate::dashboard::record_bytes_down(data.len() as u64);
-        // Flow control: grant the server credits for the consumed bytes.
-        tunnel.send_window_update(flow_id, data.len() as u32).await;
-    }
-
+        Ok::<_, std::convert::Infallible>(reply)
+    });
+    hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(30))
+        .max_buf_size(64 * 1024)
+        .serve_connection(TokioIo::new(socket), service)
+        .with_upgrades()
+        .await?;
     Ok(())
 }
 
-/// Relay an HTTP response from target to client, handling Content-Length and chunked encoding.
-/// Unlike `tokio::io::copy`, this reads exactly one response and returns, so keep-alive works.
-async fn relay_http_response(
-    target: &mut TcpStream,
-    client: &mut TcpStream,
-) -> Result<()> {
-    use tokio::io::AsyncBufReadExt;
-
-    let mut target_buf = BufReader::new(&mut *target);
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-    let mut connection_close = false;
-
-    // Read status line
-    let mut status_line = String::new();
-    target_buf.read_line(&mut status_line).await?;
-    client.write_all(status_line.as_bytes()).await?;
-    crate::dashboard::record_bytes_down(status_line.len() as u64);
-
-    // Read response headers
-    loop {
-        let mut header = String::new();
-        target_buf.read_line(&mut header).await?;
-        client.write_all(header.as_bytes()).await?;
-        crate::dashboard::record_bytes_down(header.len() as u64);
-
-        let trimmed = header.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-
-        let lower = trimmed.to_lowercase();
-        if lower.starts_with("content-length:") {
-            if let Some(val) = trimmed.split_once(':').map(|x| x.1) {
-                content_length = val.trim().parse().ok();
-            }
-        }
-        if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
-            chunked = true;
-        }
-        if lower.starts_with("connection:") && lower.contains("close") {
-            connection_close = true;
+fn supported_framing(headers: &hyper::HeaderMap) -> bool {
+    let mut codings = headers.get_all("transfer-encoding").iter();
+    match codings.next() {
+        None => true,
+        Some(coding) => {
+            coding.as_bytes().eq_ignore_ascii_case(b"chunked")
+                && codings.next().is_none()
+                && !headers.contains_key("content-length")
         }
     }
-
-    // Relay body
-    if chunked {
-        relay_chunked_response(&mut target_buf, client).await?;
-    } else if let Some(len) = content_length {
-        let mut remaining = len;
-        while remaining > 0 {
-            let buf = target_buf.fill_buf().await?;
-            if buf.is_empty() {
-                break;
-            }
-            let n = buf.len().min(remaining);
-            client.write_all(&buf[..n]).await?;
-            crate::dashboard::record_bytes_down(n as u64);
-            target_buf.consume(n);
-            remaining -= n;
-        }
-    } else if connection_close || status_line.starts_with("HTTP/1.0") {
-        // No length indicator — copy until EOF
-        let n = tokio::io::copy(&mut target_buf, client).await?;
-        crate::dashboard::record_bytes_down(n);
-    }
-    // else: keep-alive with no content-length and not chunked — nothing to read
-
-    Ok(())
 }
 
-/// Relay a chunked transfer-encoded response body.
-async fn relay_chunked_response(
-    target: &mut BufReader<&mut TcpStream>,
-    client: &mut TcpStream,
-) -> Result<()> {
-    use tokio::io::AsyncBufReadExt;
-
-    loop {
-        // Read chunk size line
-        let mut size_line = String::new();
-        target.read_line(&mut size_line).await?;
-        client.write_all(size_line.as_bytes()).await?;
-        crate::dashboard::record_bytes_down(size_line.len() as u64);
-
-        let size_str = size_line.trim().split(';').next().unwrap_or("0");
-        let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
-
-        if chunk_size == 0 {
-            // Read trailing headers and final CRLF
-            loop {
-                let mut trailer = String::new();
-                target.read_line(&mut trailer).await?;
-                client.write_all(trailer.as_bytes()).await?;
-                crate::dashboard::record_bytes_down(trailer.len() as u64);
-                if trailer.trim().is_empty() {
-                    break;
-                }
-            }
-            break;
-        }
-
-        // Read chunk data + trailing CRLF
-        let mut remaining = chunk_size;
-        while remaining > 0 {
-            let buf = target.fill_buf().await?;
-            if buf.is_empty() {
-                return Err(anyhow::anyhow!("Unexpected EOF in chunked body"));
-            }
-            let n = buf.len().min(remaining);
-            client.write_all(&buf[..n]).await?;
-            crate::dashboard::record_bytes_down(n as u64);
-            target.consume(n);
-            remaining -= n;
-        }
-
-        // Consume the \r\n after chunk data
-        let mut crlf = String::new();
-        target.read_line(&mut crlf).await?;
-        client.write_all(crlf.as_bytes()).await?;
-        crate::dashboard::record_bytes_down(crlf.len() as u64);
-    }
-
-    Ok(())
-}
-
-/// Build an HTTP request string with relative path and filtered headers.
-fn build_request(method: &str, path: &str, headers: &[String]) -> String {
-    let mut request = format!("{} {} HTTP/1.1\r\n", method, path);
-
-    for header in headers {
-        let lower = header.to_lowercase();
-        if lower.starts_with("proxy-connection:") || lower.starts_with("proxy-authorization:") {
-            continue;
-        }
-        request.push_str(header);
-        request.push_str("\r\n");
-    }
-
-    if !headers
+fn strip_hop_headers(headers: &mut hyper::HeaderMap) {
+    let names: Vec<_> = headers
+        .get_all("connection")
         .iter()
-        .any(|h| h.to_lowercase().starts_with("connection:"))
-    {
-        request.push_str("Connection: keep-alive\r\n");
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|s| hyper::header::HeaderName::from_bytes(s.trim().as_bytes()).ok())
+        .collect();
+    for name in names {
+        headers.remove(name);
     }
-
-    request.push_str("\r\n");
-    request
+    for name in [
+        "connection",
+        "proxy-connection",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "keep-alive",
+        "upgrade",
+        "te",
+        "trailer",
+        "transfer-encoding",
+    ] {
+        headers.remove(name);
+    }
 }
 
-/// Check Basic auth credentials using constant-time comparison.
+async fn forward(
+    mut request: hyper::Request<hyper::body::Incoming>,
+    proxy: &ProxyHandle,
+    auth: Option<&AuthConfig>,
+) -> Result<hyper::Response<Body>> {
+    use http_body_util::BodyExt;
+    use hyper::{Method, StatusCode};
+    use hyper_util::rt::TokioIo;
+    if let Some(auth) = auth {
+        let value = request
+            .headers()
+            .get("proxy-authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if auth.username.is_empty()
+            || auth.password.is_empty()
+            || !check_basic_auth(value, &auth.username, &auth.password)
+        {
+            let mut reply = response(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+            reply
+                .headers_mut()
+                .insert("proxy-authenticate", "Basic realm=\"rvpn\"".parse()?);
+            return Ok(reply);
+        }
+    }
+    let connect = request.method() == Method::CONNECT;
+    let uri = request.uri();
+    if uri.scheme_str().is_some_and(|scheme| scheme != "http") {
+        return Ok(response(StatusCode::BAD_REQUEST));
+    }
+    let authority = uri.authority().cloned().or_else(|| {
+        if connect {
+            return None;
+        }
+        request.headers().get("host")?.to_str().ok()?.parse().ok()
+    });
+    let Some(authority) = authority else {
+        return Ok(response(StatusCode::BAD_REQUEST));
+    };
+    if authority.as_str().contains('@') || authority.host().is_empty() {
+        return Ok(response(StatusCode::BAD_REQUEST));
+    }
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = match authority.port_u16() {
+        Some(port) => port,
+        None if authority.as_str() == authority.host() => {
+            if connect {
+                443
+            } else {
+                80
+            }
+        }
+        None => return Ok(response(StatusCode::BAD_REQUEST)),
+    };
+    if !supported_framing(request.headers())
+        || (connect
+            && (request.headers().contains_key("transfer-encoding")
+                || request
+                    .headers()
+                    .get("content-length")
+                    .is_some_and(|v| v != "0")))
+    {
+        return Ok(response(StatusCode::BAD_REQUEST));
+    }
+    let mut remote = proxy_common::open_target(host, port, proxy).await?;
+    if connect {
+        let upgrade = hyper::upgrade::on(&mut request);
+        tokio::spawn(async move {
+            if let Ok(stream) = upgrade.await {
+                if let Err(e) =
+                    tokio::io::copy_bidirectional(&mut TokioIo::new(stream), &mut remote).await
+                {
+                    debug!("CONNECT relay ended: {e}");
+                }
+            }
+        });
+        return Ok(response(StatusCode::OK));
+    }
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    *request.uri_mut() = path.parse()?;
+    strip_hop_headers(request.headers_mut());
+    request
+        .headers_mut()
+        .insert("host", authority.as_str().parse()?);
+    let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+        .max_buf_size(64 * 1024)
+        .handshake(TokioIo::new(remote))
+        .await?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!("Upstream HTTP connection ended: {e}");
+        }
+    });
+    let mut reply = sender.send_request(request).await?;
+    if !supported_framing(reply.headers()) {
+        return Ok(response(StatusCode::BAD_GATEWAY));
+    }
+    strip_hop_headers(reply.headers_mut());
+    Ok(reply.map(|body| body.boxed_unsync()))
+}
+
 fn check_basic_auth(header_value: &str, expected_user: &str, expected_pass: &str) -> bool {
-    if !header_value.starts_with("Basic ") {
+    let Some((scheme, encoded)) = header_value.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("basic") {
         return false;
     }
-
-    let encoded = &header_value[6..];
     let decoded = match BASE64.decode(encoded) {
         Ok(d) => d,
         Err(_) => return false,
@@ -697,24 +390,4 @@ fn check_basic_auth(header_value: &str, expected_user: &str, expected_pass: &str
     let pass_ok: bool = ConstantTimeEq::ct_eq(pass.as_bytes(), expected_pass.as_bytes()).into();
 
     user_ok && pass_ok
-}
-
-/// Parse server URL into (host, port, path) components
-fn parse_server_url(url: &str) -> (String, u16, String) {
-    let url = url
-        .strip_prefix("wss://")
-        .or_else(|| url.strip_prefix("ws://"))
-        .unwrap_or(url);
-
-    let (host_port, path) = url
-        .split_once('/')
-        .map(|(hp, p)| (hp, format!("/{}", p)))
-        .unwrap_or((url, "/".to_string()));
-
-    let (host, port) = host_port
-        .split_once(':')
-        .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(443)))
-        .unwrap_or_else(|| (host_port.to_string(), 443));
-
-    (host, port, path)
 }

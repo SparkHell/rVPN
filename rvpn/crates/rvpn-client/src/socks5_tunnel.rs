@@ -160,12 +160,9 @@ impl Drop for Socks5Flow {
         let Some(tunnel) = self.tunnel.upgrade() else {
             return;
         };
-        let sender = tunnel.sender.clone();
         let flow_id = self.flow_id;
         tokio::spawn(async move {
-            if let Err(e) = send_close_frame(&sender, flow_id).await {
-                debug!("Failed to send CloseFlow for flow {}: {}", flow_id, e);
-            }
+            tunnel.close_flow(flow_id).await;
         });
     }
 }
@@ -262,28 +259,8 @@ impl Socks5Tunnel {
                 if let Err(e) = tunnel.receive_loop(ws_reader).await {
                     error!("SOCKS5 multiplexed tunnel receive loop ended: {}", e);
                 }
-                // Mark tunnel as dead so callers will reconnect
-                tunnel.alive.store(false, Ordering::SeqCst);
-                error!("SOCKS5 multiplexed tunnel marked as DEAD (age {:.1}s) — next flow will trigger reconnect",
-                       tunnel.age().as_secs_f64());
-
-                // Fail all pending FlowCreated oneshots so waiting open_flow calls
-                // return immediately instead of timing out after 10 seconds.
-                let pending: HashMap<u32, PendingFlow> = {
-                    let mut guard = tunnel.pending_flows.lock().await;
-                    std::mem::take(&mut *guard)
-                };
-                let count = pending.len();
-                for (flow_id, pending_flow) in pending {
-                    let _ = pending_flow.tx.send(Err(anyhow::anyhow!(
-                        "Mux tunnel disconnected while waiting for FlowCreated ACK for flow {}",
-                        flow_id
-                    )));
-                }
-                debug!(
-                    "Cleared {} pending flow ACKs after tunnel disconnect",
-                    count
-                );
+                tunnel.shutdown().await;
+                debug!("Multiplexed tunnel disconnected");
             }
         });
 
@@ -468,33 +445,6 @@ impl Socks5Tunnel {
         let flow_id = self.next_flow_id.fetch_add(1, Ordering::Relaxed);
         debug!("Opening flow {} to {}:{}", flow_id, target, port);
 
-        // 0-RTT optimization: send CreateFlow and return immediately.
-        // The server buffers data that arrives before the TCP connection to
-        // the target is established, so the caller can start sending data
-        // right away without waiting for FlowCreated ACK. This saves one
-        // round-trip (~25-50ms to HK) per flow.
-        //
-        // Security: This is NOT TLS 0-RTT. The TLS handshake and X3DH key
-        // exchange are already complete before any data flows. Replay
-        // protection is provided by the Double Ratchet — each message has a
-        // unique message_number, and the ratchet rejects messages with
-        // number < current (see ratchet.rs:decrypt). Message keys are
-        // consumed after use, so replays fail with "Message too old".
-        //
-        // Error handling: if the server sends FlowFailed, the receive_loop
-        // will close the flow's channel, causing the relay to exit naturally.
-        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
-        {
-            let mut pending = self.pending_flows.lock().await;
-            pending.insert(flow_id, PendingFlow { tx: ack_tx });
-        }
-
-        self.send_create_flow(flow_id, target, port).await?;
-        debug!(
-            "Flow {} CreateFlow sent (0-RTT mode — not waiting for ACK)",
-            flow_id
-        );
-
         let (local_to_ws_tx, local_to_ws_rx) = mpsc::channel::<Vec<u8>>(256);
         let (ws_to_local_tx, ws_to_local_rx) = mpsc::channel::<Bytes>(256);
         let send_credits = Arc::new(FlowSendCredits::new());
@@ -508,8 +458,8 @@ impl Socks5Tunnel {
                     send_credits: Arc::clone(&send_credits),
                 },
             );
+            self.flow_count.fetch_add(1, Ordering::Relaxed);
         }
-        self.flow_count.fetch_add(1, Ordering::Relaxed);
 
         let sender = self.sender.clone();
         let bytes_relayed = Arc::clone(&self.bytes_relayed);
@@ -529,12 +479,20 @@ impl Socks5Tunnel {
             }
         });
 
-        Ok(Socks5Flow {
+        let flow = Socks5Flow {
             flow_id,
             local_to_ws_tx: Some(local_to_ws_tx),
             ws_to_local_rx: Some(ws_to_local_rx),
             tunnel: Arc::downgrade(self),
-        })
+        };
+        let (tx, ack) = tokio::sync::oneshot::channel();
+        self.pending_flows.lock().await.insert(flow_id, PendingFlow { tx });
+        anyhow::ensure!(self.is_alive(), "Tunnel closed before CreateFlow");
+        self.send_create_flow(flow_id, target, port).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), ack)
+            .await.context("Timed out waiting for FlowCreated")?
+            .context("Tunnel closed before FlowCreated")??;
+        Ok(flow)
     }
 
     async fn send_create_flow(&self, flow_id: u32, target: &str, port: u16) -> Result<()> {
@@ -780,8 +738,8 @@ impl Socks5Tunnel {
                 state.send_credits.close();
             }
             states.clear();
+            self.flow_count.store(0, Ordering::Relaxed);
         }
-        self.flow_count.store(0, Ordering::Relaxed);
     }
 
     async fn handle_control_message(&self, payload: &[u8]) {
@@ -800,12 +758,11 @@ impl Socks5Tunnel {
                         let _ =
                             p.tx.send(Err(anyhow::anyhow!("Server rejected: {}", error)));
                     }
-                    // In 0-RTT mode, the caller may already be sending data.
-                    // Close the flow state so the relay loop exits cleanly.
                     self.remove_flow_state(flow_id).await;
                 }
                 ControlMessage::CloseFlow { flow_id } => {
                     trace!("Server sent CloseFlow {}", flow_id);
+                    self.pending_flows.lock().await.remove(&flow_id);
                     self.remove_flow_state(flow_id).await;
                 }
                 ControlMessage::WindowUpdate {
@@ -942,39 +899,31 @@ impl Socks5Tunnel {
     }
 }
 
-/// Handle a single tunneled SOCKS5 connection through the multiplexed tunnel.
-///
-/// Called from `socks5.rs` — this function is defined here so it has access
-/// to the `Socks5Tunnel` and `Socks5Flow` types.
+/// Route an established local socket through this multiplexed tunnel.
+#[allow(dead_code)]
 pub async fn handle_multiplexed_connection(
-    mut socket: tokio::net::TcpStream,
-    addr: std::net::SocketAddr,
-    target_addr: &str,
+    socket: tokio::net::TcpStream,
+    _addr: std::net::SocketAddr,
+    target: &str,
     tunnel: &Arc<Socks5Tunnel>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
+    let (host, port) = crate::proxy_common::parse_target(target)?;
+    relay_flow(socket, tunnel.open_flow(&host, port).await?, tunnel).await;
+    Ok(())
+}
+
+/// Relay an acknowledged multiplexed flow to the local proxy.
+pub(crate) async fn relay_flow(
+    socket: impl tokio::io::AsyncRead + tokio::io::AsyncWrite,
+    mut flow: Socks5Flow,
+    tunnel: &Arc<Socks5Tunnel>,
+) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    // The caller is responsible for sending the protocol-specific success response
-    // (SOCKS5 reply or HTTP 200) before calling this function.
-
-    // Parse target
-    let (host, port) = target_addr
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("Invalid target format"))?;
-    let port: u16 = port.parse().map_err(|_| anyhow::anyhow!("Invalid port"))?;
-
     let mut flow_started = Some(std::time::Instant::now());
-    let mut flow = tunnel
-        .open_flow(host, port)
-        .await
-        .context("Failed to open multiplexed flow")?;
-
-    debug!("Flow {} opened to {}:{}", flow.flow_id, host, port);
-
     let flow_id = flow.flow_id;
     let send_tx = flow.take_send().unwrap();
     let mut recv_rx = flow.take_recv().unwrap();
-    let (mut client_read, mut client_write) = socket.split();
+    let (mut client_read, mut client_write) = tokio::io::split(socket);
     // 8190, not 8192 — pad_packet reserves 2 bytes for padding-length field
     let mut buf = vec![0u8; 8190];
 
@@ -1012,8 +961,7 @@ pub async fn handle_multiplexed_connection(
         }
     }
 
-    tracing::debug!("Multiplexed flow {} closed for {}", flow_id, addr);
-    Ok(())
+    tracing::debug!("Multiplexed flow {} closed", flow_id);
 }
 
 #[cfg(test)]
@@ -1021,6 +969,47 @@ mod tests {
     use super::*;
     use rvpn_core::crypto::RatchetMessage;
     use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn open_flow_waits_for_ack_and_keeps_early_data() {
+        use futures::StreamExt;
+        use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+        let (client, server) = tokio::io::duplex(8192);
+        let client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let mut peer = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let (_reader, ws_writer, tasks) = crate::websocket::split_websocket(client);
+        let ratchet = Arc::new(Mutex::new(DoubleRatchet::init_alice([42; 32], [0; 32])));
+        let tunnel = Arc::new(Socks5Tunnel {
+            sender: TunnelSender { ws_writer, ratchet: ratchet.clone(), send_lock: Default::default() },
+            ratchet, next_flow_id: AtomicU32::new(1), pending_flows: Default::default(),
+            flow_states: Default::default(), alive: AtomicBool::new(true), flow_count: Default::default(),
+            bytes_relayed: Default::default(), created_at: std::time::Instant::now(), _ws_tasks: tasks,
+        });
+
+        for flow_id in 1..=2 {
+            let opener = tunnel.clone();
+            let result = tokio::spawn(async move { opener.open_flow("example.com", 443).await });
+            assert!(matches!(peer.next().await, Some(Ok(Message::Binary(_)))));
+            assert!(!result.is_finished());
+            let message = if flow_id == 1 {
+                tunnel.dispatch_data_frame(flow_id, Bytes::from_static(b"hello")).await;
+                ControlMessage::FlowCreated { flow_id, local_port: None }
+            } else {
+                ControlMessage::FlowFailed { flow_id, error: "connection refused".into() }
+            };
+            tunnel.handle_control_message(&bincode::serialize(&message).unwrap()).await;
+            let flow = result.await.unwrap();
+            if flow_id == 1 {
+                assert_eq!(flow.unwrap().recv_data().await.unwrap(), &b"hello"[..]);
+            } else {
+                assert!(flow.is_err());
+            }
+            // Dropping the handle sends CloseFlow after clearing the registry.
+            assert!(matches!(peer.next().await, Some(Ok(Message::Binary(_)))));
+            assert_eq!(tunnel.active_flow_count(), 0);
+            assert!(tunnel.pending_flows.lock().await.is_empty());
+        }
+    }
 
     /// Regression test for the production "Message too old" stall (hk2):
     /// with many tasks encrypting concurrently on the shared tunnel ratchet,

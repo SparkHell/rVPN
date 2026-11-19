@@ -69,7 +69,7 @@ def roundtrip(socks_port, target_port, nonce):
         stream.sendall(b"\x05\x01\x00")
         if receive(stream, 2) != b"\x05\x00":
             raise AssertionError("SOCKS5 authentication negotiation failed")
-        stream.sendall(b"\x05\x01\x00\x01\x7f\x00\x00\x01" + struct.pack("!H", target_port))
+        stream.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.2") + struct.pack("!H", target_port))
         version, code, _, address_type = receive(stream, 4)
         if (version, code) != (5, 0):
             raise AssertionError(f"SOCKS5 CONNECT returned {code}")
@@ -89,7 +89,8 @@ def run_case(args, use_caddy):
     with tempfile.TemporaryDirectory(prefix="rvpn-endpoint-") as tmp, ExitStack() as stack:
         work = Path(tmp)
         listener = stack.enter_context(socket.socket())
-        listener.bind(("127.0.0.1", 0))
+        # A distinct target avoids the mandatory direct route for the VPN endpoint.
+        listener.bind(("127.0.0.2", 0))
         listener.listen()
         listener.settimeout(10)
         target_port = listener.getsockname()[1]
@@ -124,7 +125,7 @@ def run_case(args, use_caddy):
             caddyfile = work / "Caddyfile"
             caddyfile.write_text(
                 "{\n  admin off\n  auto_https disable_redirects\n}\n"
-                f"https://localhost:{public_port} {{\n"
+                f"https://:{public_port} {{\n"
                 "  bind 127.0.0.1\n"
                 f"  tls {cert} {key}\n"
                 f"  reverse_proxy 127.0.0.1:{server_port}\n"
@@ -137,7 +138,8 @@ def run_case(args, use_caddy):
             wait_port(public_port, caddy)
 
         client_config = {
-            "server_address": f"wss://localhost:{public_port}/api/v1/ws",
+            "server_address": f"wss://127.0.0.1:{public_port}/api/v1/ws",
+            "sni_hostname": "localhost",
             "identity_key_file": str(work / "client.key"),
             "prekey_bundle": str(work / "bundle.json"),
             "data_dir": str(work / "data"),

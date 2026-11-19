@@ -164,6 +164,7 @@ enum ProtocolType {
 /// Target address specification from client
 #[derive(Debug, Clone)]
 struct TargetAddress {
+    confirm_connect: bool,
     host: String,
     port: u16,
     protocol: ProtocolType,
@@ -414,7 +415,13 @@ impl VpnHandler {
         // 3. Connect to target based on protocol
         match target_addr.protocol {
             ProtocolType::Tcp => {
-                let target = match self.connect_to_target(&target_addr).await {
+                let connected = self.connect_to_target(&target_addr).await;
+                if target_addr.confirm_connect {
+                    let status = [u8::from(connected.is_err())];
+                    let frame = Self::encrypt_frame(&status, &mut ratchet)?;
+                    ws_write.send(Message::Binary(frame.into())).await?;
+                }
+                let target = match connected {
                     Ok(stream) => stream,
                     Err(e) => {
                         error!(
@@ -720,7 +727,11 @@ impl VpnHandler {
 
         // Try parsing as target address format first: [host_len: u8][host_bytes][port: u16]
         // If that fails, try parsing as raw IP packet (for iOS multiplexed mode)
-        let target_addr = if let Some(addr) = Self::parse_target_format(&plaintext) {
+        let target_addr = if let Some(command) = plaintext.strip_prefix(&[0]) {
+            let mut addr = Self::parse_target_format(command).context("Invalid confirmed TCP target")?;
+            addr.confirm_connect = true;
+            Some(addr)
+        } else if let Some(addr) = Self::parse_target_format(&plaintext) {
             Some(addr)
         } else if let Some((host, port, protocol)) =
             Self::parse_ip_packet_for_destination(&plaintext)
@@ -732,6 +743,7 @@ impl VpnHandler {
                 protocol
             );
             Some(TargetAddress {
+                confirm_connect: false,
                 host,
                 port,
                 protocol,
@@ -772,6 +784,7 @@ impl VpnHandler {
         let port = u16::from_be_bytes([plaintext[1 + host_len], plaintext[1 + host_len + 1]]);
 
         Some(TargetAddress {
+            confirm_connect: false,
             host,
             port,
             protocol: ProtocolType::Tcp,
@@ -852,7 +865,7 @@ impl VpnHandler {
     async fn resolve_and_cache(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         debug!("DNS lookup for {}:{}", host, port);
 
-        let mut addrs: Vec<SocketAddr> = lookup_host(format!("{}:{}", host, port)).await?.collect();
+        let mut addrs: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
 
         if addrs.is_empty() {
             return Err(anyhow::anyhow!("No addresses found for {}:{}", host, port));
@@ -3228,7 +3241,10 @@ where
                 );
 
                 // Use DNS cache to resolve and connect
-                let connect_target = format!("{}:{}", target, port);
+                let connect_target = match target.parse::<std::net::Ipv6Addr>() {
+                    Ok(ip) => SocketAddr::new(ip.into(), port).to_string(),
+                    Err(_) => format!("{target}:{port}"),
+                };
 
                 // Check connection pool first — avoids DNS + TCP connect overhead
                 // for repeated connections to the same CDN host (e.g. Instagram, YouTube)
@@ -3268,7 +3284,13 @@ where
                             "CONTROL: [CreateFlow] Starting DNS resolution and TCP connection for {}",
                             connect_target
                         );
-                        Self::connect_with_dns_cache(&connect_target, dns_cache, tun_config).await?
+                        match Self::connect_with_dns_cache(&connect_target, dns_cache, tun_config).await {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                control_tx.send(ControlMessage::FlowFailed { flow_id, error: error.to_string() }).await?;
+                                return Ok(());
+                            }
+                        }
                     }
                 };
 
@@ -3302,123 +3324,85 @@ where
                     });
                 }
 
-                match Ok::<_, anyhow::Error>(stream) {
-                    Ok(stream) => {
-                        info!(
-                            "CONTROL: [CreateFlow] TCP connection established for flow_id={}",
-                            flow_id
-                        );
-                        let (read_half, write_half) = stream.into_split();
+                info!(
+                    "CONTROL: [CreateFlow] TCP connection established for flow_id={}",
+                    flow_id
+                );
+                let (read_half, write_half) = stream.into_split();
 
-                        // Uplink (client → target) goes through a bounded
-                        // per-flow queue drained by a dedicated writer task,
-                        // so a slow target can never head-of-line-block the
-                        // WebSocket receive loop. The writer grants the
-                        // client WindowUpdate credits after each write.
-                        let (to_target_tx, to_target_rx) =
-                            tokio::sync::mpsc::channel::<Bytes>(FLOW_UPLINK_QUEUE_CAP);
-                        let send_credits = Arc::new(FlowSendCredits::new());
+                // Uplink (client → target) goes through a bounded
+                // per-flow queue drained by a dedicated writer task,
+                // so a slow target can never head-of-line-block the
+                // WebSocket receive loop. The writer grants the
+                // client WindowUpdate credits after each write.
+                let (to_target_tx, to_target_rx) =
+                    tokio::sync::mpsc::channel::<Bytes>(FLOW_UPLINK_QUEUE_CAP);
+                let send_credits = Arc::new(FlowSendCredits::new());
 
-                        // Spawn the flow's tasks FIRST so their abort handles
-                        // can be stored in the ServerFlow: every removal path
-                        // (CloseFlow, over-send, teardown) aborts them with
-                        // the flow via remove_flow.
-                        let writer_task = Self::spawn_flow_writer(
-                            flow_id,
-                            write_half,
-                            to_target_rx,
-                            flows.clone(),
-                            control_tx.clone(),
-                            peer_addr,
-                        );
-                        let relay_task = Self::spawn_flow_relay(
-                            flow_id,
-                            read_half,
-                            flows.clone(),
-                            tx.clone(),
-                            control_tx.clone(),
-                            Arc::clone(&send_credits),
-                            peer_addr,
-                        );
+                // Spawn the flow's tasks FIRST so their abort handles
+                // can be stored in the ServerFlow: every removal path
+                // (CloseFlow, over-send, teardown) aborts them with
+                // the flow via remove_flow.
+                // Reserve the ACK before publishing the flow. The receive loop can
+                // access the map as soon as the ACK reaches the client.
+                let ack = control_tx.reserve().await?;
+                let mut flows_guard = flows.lock().await;
+                let writer_task = Self::spawn_flow_writer(
+                    flow_id,
+                    write_half,
+                    to_target_rx,
+                    flows.clone(),
+                    control_tx.clone(),
+                    peer_addr,
+                );
+                let relay_task = Self::spawn_flow_relay(
+                    flow_id,
+                    read_half,
+                    flows.clone(),
+                    tx.clone(),
+                    control_tx.clone(),
+                    Arc::clone(&send_credits),
+                    peer_addr,
+                );
 
-                        // Store the flow
-                        let flow = Arc::new(ServerFlow {
-                            to_target_tx,
-                            send_credits,
-                            relay_task: relay_task.abort_handle(),
-                            writer_task: writer_task.abort_handle(),
-                        });
-                        let mut flows_guard = flows.lock().await;
-                        flows_guard.insert(flow_id, Arc::clone(&flow));
-                        let flow_count = flows_guard.len();
-                        drop(flows_guard);
+                // Store the flow
+                let flow = Arc::new(ServerFlow {
+                    to_target_tx,
+                    send_credits,
+                    relay_task: relay_task.abort_handle(),
+                    writer_task: writer_task.abort_handle(),
+                });
+                flows_guard.insert(flow_id, Arc::clone(&flow));
+                let flow_count = flows_guard.len();
+                ack.send(ControlMessage::FlowCreated { flow_id, local_port: None });
+                drop(flows_guard);
 
-                        info!(
-                            "CONTROL: [CreateFlow] Flow {} stored in map (total flows: {})",
-                            flow_id, flow_count
-                        );
+                info!(
+                    "CONTROL: [CreateFlow] Flow {} stored in map (total flows: {})",
+                    flow_id, flow_count
+                );
 
-                        // Send FlowCreated ACK
-                        if let Err(e) = control_tx
-                            .send(ControlMessage::FlowCreated {
-                                flow_id,
-                                local_port: None,
-                            })
-                            .await
-                        {
-                            error!(
-                                "CONTROL: [CreateFlow] Failed to send FlowCreated for flow_id={}: {}",
-                                flow_id, e
-                            );
-                        }
+                info!(
+                    "CONTROL: [CreateFlow] Flow {} created successfully for {}",
+                    flow_id, peer_addr
+                );
 
-                        info!(
-                            "CONTROL: [CreateFlow] Flow {} created successfully for {}",
-                            flow_id, peer_addr
-                        );
-
-                        // Flush any pending data that arrived before CreateFlow.
-                        // Only flush the first few frames to avoid blocking the receiver.
-                        // Remaining buffered frames will be dropped — TCP will retransmit if needed.
-                        const MAX_FLUSH_FRAMES: usize = 5;
-                        let pending_data = {
-                            let mut pending = pending_flows.lock().await;
-                            pending.remove(&flow_id)
-                        };
-                        if let Some(pending) = pending_data {
-                            let flushed = pending.len().min(MAX_FLUSH_FRAMES);
-                            if pending.len() > MAX_FLUSH_FRAMES {
-                                debug!(
-                                    "CONTROL: [CreateFlow] Dropping {} excess buffered frames for flow {}",
-                                    pending.len() - MAX_FLUSH_FRAMES, flow_id
-                                );
-                            }
-                            for (data, _frame_num, _elapsed) in pending.into_iter().take(MAX_FLUSH_FRAMES) {
-                                if let Err(e) = Self::handle_flow_data(flow_id, &data, flows, control_tx).await {
-                                    debug!("Failed to flush pending data for flow {}: {}", flow_id, e);
-                                }
-                            }
-                            if flushed > 0 {
-                                info!(
-                                    "CONTROL: [CreateFlow] Flushed {} pending data frames for flow {}",
-                                    flushed, flow_id
-                                );
-                            }
+                // Flush any pending data that arrived before CreateFlow.
+                let pending_data = {
+                    let mut pending = pending_flows.lock().await;
+                    pending.remove(&flow_id)
+                };
+                if let Some(pending) = pending_data {
+                    let flushed = pending.len();
+                    for (data, _frame_num, _elapsed) in pending {
+                        if let Err(e) = Self::handle_flow_data(flow_id, &data, flows, control_tx).await {
+                            debug!("Failed to flush pending data for flow {}: {}", flow_id, e);
                         }
                     }
-                    Err(e) => {
-                        error!(
-                            "CONTROL: [CreateFlow] Connection failed for flow_id={} to {}:{}: {}",
-                            flow_id, target, port, e
-                        );
-                        let err = ControlMessage::FlowFailed {
-                            flow_id,
-                            error: e.to_string(),
-                        };
-                        let _ = control_tx.send(err).await;
-                        error!(
-                            "CONTROL: [CreateFlow] FlowFailed sent for flow_id={}",
-                            flow_id
+                    if flushed > 0 {
+                        info!(
+                            "CONTROL: [CreateFlow] Flushed {} pending data frames for flow {}",
+                            flushed, flow_id
                         );
                     }
                 }
@@ -3873,8 +3857,9 @@ where
                 let bytes_read = if let Some(n) = read_result {
                     n
                 } else {
-                    let _ = control_tx
-                        .send(ControlMessage::CloseFlow { flow_id })
+                    // Queue EOF behind the last data frame for this flow.
+                    let _ = tx
+                        .send(MuxMessage::Control(ControlMessage::CloseFlow { flow_id }))
                         .await;
                     break;
                 };

@@ -562,6 +562,8 @@ cargo run --release --package rvpn-client -- --config client.toml
 
 This starts a SOCKS5 proxy on `127.0.0.1:1080`. Configure your browser or system to use it.
 
+Upgrade the server first when using legacy proxy mode. New desktop clients wait for an encrypted target-connection acknowledgement before granting SOCKS5 or HTTP CONNECT requests. Updated servers also accept the original legacy request format from older clients.
+
 ### Run the client (TUN mode, requires root)
 
 ```bash
