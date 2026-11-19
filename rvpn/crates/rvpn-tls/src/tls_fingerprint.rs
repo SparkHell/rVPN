@@ -14,12 +14,16 @@
 pub enum TlsFingerprint {
     /// Chrome 120+ fingerprint (most common)
     #[default]
+    #[serde(alias = "chrome")]
     Chrome,
     /// Firefox fingerprint
+    #[serde(alias = "firefox")]
     Firefox,
     /// Safari fingerprint
+    #[serde(alias = "safari")]
     Safari,
     /// No fingerprinting
+    #[serde(alias = "none")]
     None,
 }
 

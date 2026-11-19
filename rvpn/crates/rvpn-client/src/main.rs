@@ -53,7 +53,7 @@ const MAX_RECONNECT_DELAY_MS: u64 = 30000;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::id as process_id;
+use std::process::{id as process_id, ExitCode};
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -146,7 +146,7 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let mut args = Args::parse();
     // Relative CLI input paths are anchored to the executable, independently
     // of the shell or service manager's working directory on all platforms.
@@ -165,43 +165,42 @@ fn main() -> Result<()> {
                 && args.verbose == 0,
             "Service settings must be saved in the config file; CLI overrides are not persisted"
         );
-        return service::execute(action, &args.config);
+        service::execute(action, &args.config)?;
+        return Ok(ExitCode::SUCCESS);
     }
-    let result = tokio::runtime::Runtime::new()?.block_on(async_main(args));
-    // async_main recorded the full error and flushed the log worker. Avoid
-    // Rust's Result termination printing that error a second time on stderr.
-    if result.is_err() { std::process::exit(1); }
-    Ok(())
+    match tokio::runtime::Runtime::new()?.block_on(async_main(args)) {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            eprintln!("Client terminated: {error:#}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
-async fn async_main(args: Args) -> Result<()> {
-    let loaded = if args.config.exists() {
+async fn async_main(args: Args) -> Result<ExitCode> {
+    let config = if args.config.exists() {
         ClientConfig::load(&args.config)
+            .with_context(|| format!("Invalid client configuration: {}", args.config.display()))?
     } else if args.command.is_none() {
-        Err(anyhow::anyhow!("Client configuration not found: {}", args.config.display()))
+        anyhow::bail!("Client configuration not found: {}", args.config.display());
     } else {
-        Ok(ClientConfig::default())
+        ClientConfig::default()
     };
-    let settings = loaded.as_ref().map(|config| config.logging.clone()).unwrap_or_default();
-    // Keep the log writer alive until shutdown, including failed startup, so pending
-    // file messages are flushed in foreground and system-service mode alike.
-    let logging = std::sync::Arc::new(rvpn_logging::init_reloadable(
-        &settings, args.verbose, "rvpn-client",
-    )?);
-    let result = match loaded {
-        Ok(config) => run_client(args, config, logging.clone()).await,
+    let logging = rvpn_logging::init_client_startup(&config.logging, args.verbose, "rvpn-client")?;
+    match run_client(args, config, &logging).await {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(error) if logging.writes_to_file() => {
+            error!("Client terminated: {error:#}");
+            Ok(ExitCode::FAILURE)
+        }
         Err(error) => Err(error),
-    };
-    if let Err(error) = &result {
-        error!("Client terminated: {error:#}");
     }
-    result
 }
 
 async fn run_client(
     args: Args,
     config: ClientConfig,
-    logging: std::sync::Arc<rvpn_logging::ReloadableLogging>,
+    logging: &rvpn_logging::ReloadableLogging,
 ) -> Result<()> {
     info!("R-VPN Client v{}", env!("CARGO_PKG_VERSION"));
 
@@ -291,6 +290,12 @@ async fn run_socks5(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()
             .iter()
             .map(|e| parse_server_url(&e.address).0)
             .collect();
+        let doh_hosts = config
+            .dns_proxy
+            .nameservers
+            .iter()
+            .filter_map(|endpoint| rvpn_split_tunnel::dns_cache::doh_upstream_hostname(endpoint))
+            .collect();
 
         let dns_proxy = std::sync::Arc::new(dns_proxy::DnsProxy::new(
             dns_listen,
@@ -304,6 +309,7 @@ async fn run_socks5(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()
             proxy.dns_resolver(),
             nameservers,
             extra_server_hosts,
+            doh_hosts,
         ));
 
         let socket = tokio::net::UdpSocket::bind(dns_listen).await

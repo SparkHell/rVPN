@@ -916,7 +916,20 @@ footer > span:last-child {
   display: block;
   margin-top: 5px;
 }
+.field[data-disabled] {
+  opacity: 0.55;
+}
+.field :disabled {
+  cursor: not-allowed;
+}
+.switch-field .field-hint {
+  max-width: none;
+  margin: 0;
+  font-size: 12px;
+}
 .switch-field {
+  grid-column: 1 / -1;
+  gap: 24px;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -1381,4 +1394,121 @@ footer > span:last-child {
     transition: none !important;
     scroll-behavior: auto !important;
   }
+}
+
+.rule-actions,
+.dns-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.dns-metrics > div {
+  flex: 1 1 150px;
+  display: grid;
+  gap: 6px;
+}
+.dns-metrics span,
+.dns-activity p {
+  color: var(--muted, #a5adb7);
+}
+.dns-metrics progress {
+  width: 100%;
+  accent-color: #00b24b;
+}
+.dns-activity {
+  min-width: 0;
+}
+.dns-activity h3 {
+  margin: 24px 0 12px;
+}
+.dns-query-scroll {
+  overflow: auto;
+  max-height: 390px;
+}
+.dns-query-scroll table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.dns-query-scroll th,
+.dns-query-scroll td {
+  text-align: left;
+  padding: 8px;
+  border-bottom: 1px solid #383b42;
+}
+.dns-query-scroll td {
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
+
+.fields + .rule-actions {
+  margin-top: 16px;
+}
+.dns-metrics progress {
+  height: 6px;
+}
+
+.route-inspection .add-rule {
+  align-items: center;
+}
+.route-inspection .add-rule > input {
+  flex: 1 1 260px;
+  min-width: 0;
+  width: auto;
+}
+.route-inspection dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 18px;
+  margin-top: 16px;
+}
+.route-inspection dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.route-inspection dt,
+.rule-advanced p {
+  color: #a5adb7;
+}
+.rule-advanced {
+  margin-top: 24px;
+  border-top: 1px solid #383b42;
+  padding-top: 16px;
+}
+.rule-advanced summary {
+  cursor: pointer;
+}
+.rule-advanced p {
+  margin: 10px 0 16px;
+}
+
+.rule-import-heading {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.rule-import-policies {
+  padding: 14px 0;
+  margin-bottom: 18px;
+  border-block: 1px solid #383b42;
+}
+.rule-import-policies p {
+  color: #a5adb7;
+  margin: 6px 0 14px;
+}
+.rule-policy-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.rule-policy-field select {
+  width: 100%;
+  min-width: 0;
+  background: #1b1c1f;
+  border: 1px solid #383b42;
+  border-radius: 7px;
+  color: #e8eaf0;
+  min-height: 40px;
+  padding: 8px;
 }

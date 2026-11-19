@@ -241,7 +241,10 @@ def update(output_dir: Path) -> dict[str, int]:
     licenses = {name: fetch(url) for name, url in LICENSE_SOURCES.items()}
     decoded = {name: data.decode("utf-8") for name, data in raw.items()}
     ad_domains = parse_adguard_dns(decoded["adguard_dns"])
-    ad_domains.update(parse_adaway_hosts(decoded["adaway"]))
+    adaway_domains = parse_adaway_hosts(decoded["adaway"])
+    if len(ad_domains) < 50_000 or len(adaway_domains) < 1_000:
+        raise ValueError("AdGuard or AdAway did not pass minimum-count validation")
+    ad_domains.update(adaway_domains)
     china_domains = parse_china_domains(decoded["china_domains"])
     country_ips = parse_apnic(decoded["apnic"])
     gfw_files = gfwlist_files(raw["gfwlist"])
@@ -270,6 +273,8 @@ def update(output_dir: Path) -> dict[str, int]:
         },
     }
     files = {
+        "filter_1.txt": decoded["adguard_dns"],
+        "filter_2.txt": decoded["adaway"],
         "ad-domains.txt": "".join(f"{domain}\n" for domain in sorted(ad_domains)),
         "country-domains-cn.txt": "".join(f"{domain}\n" for domain in sorted(china_domains)),
         "country-ips.json": json.dumps(country_ips, separators=(",", ":")) + "\n",

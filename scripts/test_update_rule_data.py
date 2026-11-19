@@ -90,13 +90,13 @@ class RuleDataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(rules, "fetch", side_effect=fetch), \
              patch.object(rules, "parse_adguard_dns", return_value={f"ad{i}.example" for i in range(50001)}), \
-             patch.object(rules, "parse_adaway_hosts", return_value=set()), \
+             patch.object(rules, "parse_adaway_hosts", return_value={f"away{i}.example" for i in range(1001)}), \
              patch.object(rules, "parse_china_domains", return_value={f"site{i}.cn" for i in range(50001)}), \
              patch.object(rules, "parse_apnic", return_value={"CN": ["1.0.0.0/24"] * 1001}):
             output = Path(tmp)
             counts = rules.update(output)
             self.assertEqual(counts["gfwlist_proxy"], 1100)
-            for name in ["gfwlist.txt", "gfwlist-rules.json", "gfwlist-domains.txt", "gfwlist-source.json", "LICENSE-GFWList.txt"]:
+            for name in ["filter_1.txt", "filter_2.txt", "ad-domains.txt", "gfwlist.txt", "gfwlist-rules.json", "gfwlist-domains.txt", "gfwlist-source.json", "LICENSE-GFWList.txt"]:
                 self.assertTrue((output / name).is_file(), name)
             manifest = json.loads((output / "sources.json").read_text())
             self.assertEqual(manifest["sources"]["gfwlist"]["url"], rules.SOURCES["gfwlist"])

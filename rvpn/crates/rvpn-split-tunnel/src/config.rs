@@ -48,9 +48,22 @@ pub struct SplitTunnelConfig {
     #[serde(default, alias = "block_ads")]
     pub block_ads: bool,
 
+    #[serde(default = "default_gfwlist", alias = "gfwlist_enabled")]
+    pub gfwlist_enabled: bool,
+
+    #[serde(skip)]
+    pub subscriptions: Option<std::sync::Arc<crate::subscriptions::Subscriptions>>,
+
     /// Custom ad block list file (one domain per line)
     #[serde(default, alias = "ad_block_file")]
     pub ad_block_file: Option<PathBuf>,
+
+    #[serde(default, alias = "bypass_domains")]
+    pub bypass_domains: Vec<String>,
+    #[serde(default, alias = "tunnel_domains")]
+    pub tunnel_domains: Vec<String>,
+    #[serde(default, alias = "tunnel_networks")]
+    pub tunnel_networks: Vec<String>,
 
     /// Inline bypass networks (CIDR format)
     /// These are loaded in addition to bypass_networks_file
@@ -77,12 +90,19 @@ impl Default for SplitTunnelConfig {
             auto_reload_interval: 86400,                      // 24 hours
             builtin_bypass_countries: vec!["CN".to_string()], // Default to China
             block_ads: false,
+            gfwlist_enabled: true,
+            subscriptions: None,
             ad_block_file: None,
             bypass_networks: Vec::new(),
+            bypass_domains: Vec::new(),
+            tunnel_domains: Vec::new(),
+            tunnel_networks: Vec::new(),
             country_ips_file: None,
         }
     }
 }
+
+fn default_gfwlist() -> bool { true }
 
 fn default_reload_interval() -> u64 {
     86400

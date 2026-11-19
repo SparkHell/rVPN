@@ -1,7 +1,7 @@
-server_address = "wss://your.server.com/api/v1/ws"
+server_address = "wss://vpn.example.com/api/v1/ws"
 identity_key_file = "./identity.key"
 prekey_bundle = "./prekey-bundle.json"
-tls_fingerprint = "chrome"
+tls_fingerprint = "Chrome"
 
 [socks5]
 listen_address = "127.0.0.1:1080"
@@ -18,25 +18,24 @@ routes = [ "0.0.0.0/0" ]
 [dns_proxy]
 enabled = true
 listen_address = "127.0.0.1:53"
-nameservers = [ "https://223.6.6.6/dns-query", "223.5.5.5:53", "1.1.1.1:53", "8.8.8.8:53" ]
+nameservers = [ "https://223.6.6.6/dns-query", "https://223.5.5.5/dns-query" ]
 
 [split_tunnel]
 enabled = true
 builtin_bypass_countries = [ "CN" ]
 block_ads = true
+gfwlist_enabled = true
 
 [network]
-prefer_ipv4 = true
 dns_cache_enabled = true
-# Require ECH on desktop VPN connections. Set HTTPS-only endpoint DNS first.
+# Prefer ECH on desktop VPN connections, with standard TLS fallback.
 # require_ech = true
-# dns_servers = ["https://1.1.1.1/dns-query"]
 
 [server_identity]
 trust_on_first_use = true
 strict = true
 
-# 文件日志默认写在 rvpn 可执行文件旁，按 UTC 日期分文件。
+# 启动错误直接输出到终端。启动成功后，文件日志默认写在 rvpn 可执行文件旁，按 UTC 日期分文件。
 [logging]
 file_enabled = true
 level = "info"                 # off/error/warn/info/debug/trace；-v/-vv 可覆盖

@@ -11,9 +11,13 @@ use serde::{Serialize, Deserialize};
 #[serde(rename_all = "lowercase")]
 pub enum TlsFingerprint {
     #[default]
+    #[serde(alias = "Chrome")]
     Chrome,
+    #[serde(alias = "Firefox")]
     Firefox,
+    #[serde(alias = "Safari")]
     Safari,
+    #[serde(alias = "None")]
     None,
 }
 

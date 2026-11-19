@@ -42,13 +42,7 @@ use crate::builtin_ips::supported_countries;
 
 // Built-in domain lists (feature-gated)
 #[cfg(feature = "builtin-domains")]
-use crate::builtin_domains::matches_china_domain;
-#[cfg(feature = "builtin-domains")]
-#[allow(unused_imports)]
-use crate::builtin_domains::{matches_ad_domain, is_china_domain, is_ad_domain, matches_force_tunnel_domain};
-#[cfg(feature = "builtin-domains")]
-#[allow(unused_imports)]
-use crate::builtin_domains::get_country_domains;
+use crate::builtin_domains::matches_ad_domain;
 
 // Stub implementations when features are disabled
 #[cfg(not(feature = "builtin-ips"))]
@@ -58,16 +52,7 @@ fn get_country_ips(_country_code: &str) -> Option<&'static [&'static str]> {
 
 #[cfg(not(feature = "builtin-domains"))]
 #[allow(dead_code)]
-fn matches_china_domain(_domain: &str) -> bool { false }
-#[cfg(not(feature = "builtin-domains"))]
-#[allow(dead_code)]
 fn matches_ad_domain(_domain: &str) -> bool { false }
-#[cfg(not(feature = "builtin-domains"))]
-#[allow(dead_code)]
-fn matches_force_tunnel_domain(_domain: &str) -> bool { false }
-#[cfg(not(feature = "builtin-domains"))]
-#[allow(dead_code)]
-fn get_country_domains(_country_code: &str) -> Option<&'static [&'static str]> { None }
 
 /// Routing decision for a connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +71,6 @@ struct SplitTunnelData {
     bypass_networks: IpNetworkTable<bool>,
     /// Domains that should bypass VPN
     bypass_domains: HashSet<String>,
-    country_domains: HashSet<String>,
-    country_networks: HashMap<String, Vec<IpNetwork>>,
     /// Networks that must go through VPN
     tunnel_networks: IpNetworkTable<bool>,
     /// Domains that must go through VPN
@@ -128,8 +111,6 @@ impl Clone for SplitTunnelData {
         Self {
             bypass_networks,
             bypass_domains: self.bypass_domains.clone(),
-            country_domains: self.country_domains.clone(),
-            country_networks: self.country_networks.clone(),
             tunnel_networks,
             tunnel_domains: self.tunnel_domains.clone(),
             gfwlist: self.gfwlist.clone(),
@@ -144,8 +125,6 @@ impl Default for SplitTunnelData {
         Self {
             bypass_networks: IpNetworkTable::new(),
             bypass_domains: HashSet::new(),
-            country_domains: HashSet::new(),
-            country_networks: HashMap::new(),
             tunnel_networks: IpNetworkTable::new(),
             tunnel_domains: HashSet::new(),
             gfwlist: crate::gfwlist::Rules::default(),
@@ -217,153 +196,94 @@ impl SplitTunnel {
         Arc::clone(&self.dns_resolver)
     }
 
-    /// Make a routing decision for a host and its resolved IPs
-    ///
-    /// Priority order:
-    /// 1. tunnel_domains - Force through VPN
-    /// 2. bypass_domains - Route directly
-    /// 3. force_tunnel_domains (built-in) - Always VPN (overrides IP bypass)
-    /// 4. tunnel_networks - Force through VPN
-    /// 5. bypass_networks - Route directly
-    ///
-    /// If no match, defaults to Tunnel
-    #[allow(dead_code)]
+    /// Apply domain rules first, then the destination IP rules.
     pub async fn decide(&self, host: &str, ips: &[IpAddr]) -> RoutingDecision {
-        if !self.config.enabled {
-            return RoutingDecision::Tunnel;
+        if let Some((route, _, _)) = self.match_domain_rule(host).await {
+            return route;
         }
+        self.explain_ips(ips).await.0
+    }
 
-        let data = self.data.read().await;
-
-        // Check tunnel domains first (highest priority)
-        if Self::matches_domain(host, &data.tunnel_domains) {
-            debug!("Host {} matches tunnel domain list", host);
-            return RoutingDecision::Tunnel;
-        }
-
-        // Check bypass domains
-        if Self::matches_domain(host, &data.bypass_domains) {
-            debug!("Host {} matches bypass domain list", host);
-            return RoutingDecision::Bypass;
-        }
-
-        // Check built-in force tunnel domains (Google, Facebook, etc.)
-        // These override IP-based bypass decisions
-        if data.gfwlist.forces_proxy(host) || matches_force_tunnel_domain(host) {
-            debug!("Host {} matches force tunnel domain list", host);
-            return RoutingDecision::Tunnel;
-        }
-
-        // Check tunnel networks
-        for ip in ips {
-            if data.tunnel_networks.longest_match(*ip).is_some() {
-                debug!("IP {} matches tunnel network list", ip);
-                return RoutingDecision::Tunnel;
-            }
-        }
-
-        // Check bypass networks
-        for ip in ips {
-            if data.bypass_networks.longest_match(*ip).is_some() {
-                debug!("IP {} matches bypass network list", ip);
-                return RoutingDecision::Bypass;
-            }
-        }
-
-        // Default to tunnel if no match
-        RoutingDecision::Tunnel
+    fn gfwlist_match(&self, host: &str, data: &SplitTunnelData) -> bool {
+        self.config.gfwlist_enabled && self.config.subscriptions.as_ref()
+            .and_then(|s| s.matches(crate::subscriptions::Source::GfwList, host))
+            .unwrap_or_else(|| data.gfwlist.forces_proxy(host))
     }
 
     /// Make a routing decision for a host without resolved IPs
     /// This is useful when only the hostname is known
     pub async fn decide_by_host(&self, host: &str) -> RoutingDecision {
+        self.decide_dns(host).await.0
+    }
+
+    /// Returns the route and whether the GFWList rule selected it.
+    pub async fn decide_dns(&self, host: &str) -> (RoutingDecision, bool) {
+        let (route, gfwlist, _) = self.explain_dns(host).await;
+        (route, gfwlist)
+    }
+
+    pub async fn explain_dns(&self, host: &str) -> (RoutingDecision, bool, &'static str) {
+        self.match_domain_rule(host).await
+            .unwrap_or((RoutingDecision::Bypass, false, "未命中域名规则，DNS 默认使用本地上游"))
+    }
+
+    async fn match_domain_rule(&self, host: &str) -> Option<(RoutingDecision, bool, &'static str)> {
+        let host = host.trim_end_matches('.');
         if !self.config.enabled {
-            return RoutingDecision::Tunnel;
+            return Some((RoutingDecision::Tunnel, false, "分流已关闭"));
         }
 
         let data = self.data.read().await;
 
         // Check ad/tracker domains first (highest priority)
         if self.config.block_ads
-            && (Self::matches_domain(host, &data.block_domains) || matches_ad_domain(host))
+            && (Self::matches_domain(host, &data.block_domains) || self.config.subscriptions.as_ref().and_then(|s| s.matches(crate::subscriptions::Source::AdGuard, host)).unwrap_or_else(|| matches_ad_domain(host)))
         {
             debug!("Host {} matches ad/tracker domain list - blocking", host);
-            return RoutingDecision::Block;
+            return Some((RoutingDecision::Block, false, "命中广告过滤"));
         }
 
         // Check tunnel domains first (highest priority)
         if Self::matches_domain(host, &data.tunnel_domains) {
             debug!("Host {} matches tunnel domain list", host);
-            return RoutingDecision::Tunnel;
+            return Some((RoutingDecision::Tunnel, false, "命中隧道域名规则"));
         }
 
         // Check bypass domains from file
         if Self::matches_domain(host, &data.bypass_domains) {
             debug!("Host {} matches bypass domain list", host);
-            return RoutingDecision::Bypass;
+            return Some((RoutingDecision::Bypass, false, "命中直连域名规则"));
         }
 
-        if data.gfwlist.forces_proxy(host) {
+        if self.gfwlist_match(host, &data) {
             debug!("Host {} matches gfwlist proxy domain", host);
-            return RoutingDecision::Tunnel;
+            return Some((RoutingDecision::Tunnel, true, "命中 GFWList"));
         }
 
-        // Release the read guard before the CN branch below. That branch
-        // awaits DNS resolution (with retries, up to ~27s); if the guard were
-        // held across it, the config auto-reload writer would queue on the
-        // write-preferring RwLock and block ALL new readers for the duration
-        // of those retries — a periodic total DNS/routing stall.
-        let dynamic_cn_domain = Self::matches_domain(host, &data.country_domains);
-        drop(data);
-
-        // Check built-in force tunnel domains (Google, Facebook, etc.)
-        // These override China domain bypass
-        if matches_force_tunnel_domain(host) {
-            debug!("Host {} matches force tunnel domain list", host);
-            return RoutingDecision::Tunnel;
-        }
-
-        // Check built-in China domains if CN is in bypass countries
-        // SECURITY: Validate resolved IPs are in China before bypassing to prevent DNS rebinding
-        if self.config.builtin_bypass_countries.contains(&"CN".to_string())
-            && (matches_china_domain(host) || dynamic_cn_domain)
-        {
-            debug!("Host {} matches built-in China domain list, validating IPs", host);
-            if let Some(ip_addrs) = self.resolve_host_to_ips(host).await {
-                if self.ips_match_country(&ip_addrs, "CN").await {
-                    debug!("Host {} resolved IPs are in China, bypassing", host);
-                    return RoutingDecision::Bypass;
-                }
-                debug!("Host {} resolved IPs not in China, routing through tunnel", host);
-                return RoutingDecision::Tunnel;
-            }
-            // DNS resolution failed, don't bypass - route through tunnel instead
-            debug!("Host {} DNS resolution failed, routing through tunnel", host);
-            return RoutingDecision::Tunnel;
-        }
-
-        // Default to tunnel if no match
-        RoutingDecision::Tunnel
+        None
     }
 
-    /// Check if a domain matches any pattern in the set
-    /// Explicit tunnel decisions must not trigger client-side DNS probes.
+    /// Explicit tunnel decisions skip local DNS probing.
     pub async fn requires_tunnel(&self, host: &str) -> bool {
-        if !self.config.enabled { return true; }
-        let data = self.data.read().await;
-        if Self::matches_domain(host, &data.tunnel_domains) { return true; }
-        if Self::matches_domain(host, &data.bypass_domains) { return false; }
-        data.gfwlist.forces_proxy(host) || matches_force_tunnel_domain(host)
+        self.match_domain_rule(host).await.is_some_and(|(decision, _, _)| decision == RoutingDecision::Tunnel)
     }
 
-    /// Proxy traffic: definitive domain rules precede any local IP probe.
+    /// For a connection, use address rules only when no domain rule matched.
     pub async fn decide_for_connection(&self, host: &str) -> RoutingDecision {
-        let decision = self.decide_by_host(host).await;
-        if decision != RoutingDecision::Tunnel || self.requires_tunnel(host).await { return decision; }
-        match self.resolve_host_to_ips(host).await {
-            Some(ips) => self.decide(host, &ips).await,
-            None => RoutingDecision::Tunnel,
+        self.explain_connection(host).await.0
+    }
+
+    pub async fn explain_connection(&self, host: &str) -> (RoutingDecision, &'static str, Vec<IpAddr>) {
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            let (decision, reason) = self.explain_ips(&[ip]).await;
+            return (decision, reason, vec![ip]);
         }
+        if let Some((decision, _, reason)) = self.match_domain_rule(host).await {
+            return (decision, reason, Vec::new());
+        }
+        let ips = self.resolve_host_to_ips(host).await.unwrap_or_default();
+        let (decision, reason) = self.explain_ips(&ips).await;
+        (decision, reason, ips)
     }
 
     /// Check if a domain matches any pattern in the set
@@ -399,44 +319,28 @@ impl SplitTunnel {
         Some(addrs.into_iter().map(|a| a.ip()).collect())
     }
 
-    /// Check if any IP in the list belongs to the specified country CIDR ranges
-    async fn ips_match_country(&self, ips: &[IpAddr], country: &str) -> bool {
-        let data = self.data.read().await;
-        data.country_networks
-            .get(country)
-            .is_some_and(|networks| ips.iter().any(|ip| networks.iter().any(|network| network.contains(*ip))))
+    pub async fn decide_by_ip(&self, ip: IpAddr) -> RoutingDecision {
+        self.explain_ips(&[ip]).await.0
     }
 
-    /// Make a routing decision for a single IP address
-    /// This is used by the SOCKS5 server when the target is already an IP address
-    /// 
-    /// Priority:
-    /// 1. tunnel_networks - Force through VPN
-    /// 2. bypass_networks - Route directly
-    /// 
-    /// If no match, defaults to Tunnel
-    #[allow(dead_code)]
-    pub async fn decide_by_ip(&self, ip: IpAddr) -> RoutingDecision {
+    async fn explain_ips(&self, ips: &[IpAddr]) -> (RoutingDecision, &'static str) {
         if !self.config.enabled {
-            return RoutingDecision::Tunnel;
+            return (RoutingDecision::Tunnel, "分流已关闭");
         }
-
         let data = self.data.read().await;
-
-        // Check tunnel networks first (higher priority)
-        if data.tunnel_networks.longest_match(ip).is_some() {
-            debug!("IP {} matches tunnel network list", ip);
-            return RoutingDecision::Tunnel;
+        if ips.iter().any(|ip| data.tunnel_networks.longest_match(*ip).is_some()) {
+            return (RoutingDecision::Tunnel, "命中隧道 IP 网段");
         }
-
-        // Check bypass networks
-        if data.bypass_networks.longest_match(ip).is_some() {
-            debug!("IP {} matches bypass network list", ip);
-            return RoutingDecision::Bypass;
+        if ips.is_empty() {
+            return (RoutingDecision::Tunnel, "本地 DNS 未返回可用地址");
         }
-
-        // Default to tunnel if no match
-        RoutingDecision::Tunnel
+        if ips.iter().all(|ip| data.bypass_networks.longest_match(*ip).is_some()) {
+            return (RoutingDecision::Bypass, "目标地址均命中直连网段");
+        }
+        if self.config.builtin_bypass_countries.is_empty() {
+            return (RoutingDecision::Bypass, "未配置直连地区，未命中隧道规则");
+        }
+        (RoutingDecision::Tunnel, "至少一个目标地址未命中直连网段")
     }
 
     /// Manually trigger a reload of the configuration files
@@ -537,12 +441,11 @@ impl SplitTunnel {
             match Self::load_country_ips_file(path, &config.builtin_bypass_countries).await {
                 Ok(by_country) => {
                     let mut count = 0;
-                    for (country, cidrs) in by_country {
+                    for cidrs in by_country.into_values() {
                         count += cidrs.len();
                         for cidr in &cidrs {
                             data.bypass_networks.insert(cidr.clone(), true);
                         }
-                        data.country_networks.insert(country, cidrs);
                     }
                     info!("Loaded {} bypass IPs from country_ips_file {:?}", count, path);
                 }
@@ -558,12 +461,10 @@ impl SplitTunnel {
                 if let Some(ip_ranges) = get_country_ips(country_code) {
                     let mut loaded = 0;
                     let mut failed = 0;
-                    let mut networks = Vec::new();
                     for cidr in ip_ranges {
                         match cidr.parse::<IpNetwork>() {
                             Ok(network) => {
                                 data.bypass_networks.insert(network.clone(), true);
-                                networks.push(network);
                                 loaded += 1;
                             }
                             Err(e) => {
@@ -572,7 +473,6 @@ impl SplitTunnel {
                             }
                         }
                     }
-                    data.country_networks.insert(country_code.clone(), networks);
                     info!("Loaded {} built-in {} IP ranges ({} failed)", loaded, country_code, failed);
                 } else {
                     warn!("Unknown country code for built-in IPs: {}", country_code);
@@ -597,14 +497,10 @@ impl SplitTunnel {
         }
 
         // Load bypass domains
-        if let Some(ref path) = config.country_domains_file {
-            match Self::load_domains(path).await {
-                Ok(domains) => {
-                    info!("Loaded {} country domain candidates from {:?}", domains.len(), path);
-                    data.country_domains.extend(domains);
-                }
-                Err(e) => warn!("Failed to load country domains from {:?}: {}", path, e),
-            }
+        data.bypass_domains.extend(config.bypass_domains.iter().map(|v| v.trim().trim_end_matches('.').to_ascii_lowercase()));
+        data.tunnel_domains.extend(config.tunnel_domains.iter().map(|v| v.trim().trim_end_matches('.').to_ascii_lowercase()));
+        for cidr in &config.tunnel_networks {
+            data.tunnel_networks.insert(cidr.trim().parse::<IpNetwork>()?, true);
         }
 
         // Load unconditional bypass domains
@@ -844,7 +740,7 @@ mod tests {
     async fn builtin_gfwlist_works_with_existing_config_and_no_external_files() {
         let config:SplitTunnelConfig=toml::from_str("enabled = true\nauto_reload_interval = 0\n").unwrap();
         let fields=serde_json::to_value(&config).unwrap();
-        assert!(!fields.as_object().unwrap().keys().any(|key|key.to_lowercase().contains("gfwlist")));
+        assert_eq!(fields["gfwlistEnabled"], true);
         let blackhole=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let resolver=Arc::new(DnsResolver::new(true,300,1000,false,true,vec![])
             .with_nameservers(&[blackhole.local_addr().unwrap().to_string()]).unwrap());
@@ -852,8 +748,7 @@ mod tests {
         // Pick a domain supplied exclusively by GFWList, not the older short
         // force-tunnel list, so this cannot pass just because Google is built in.
         let domain=crate::gfwlist::builtin().proxy.iter().find(|domain| {
-            !matches_force_tunnel_domain(domain) && !matches_china_domain(domain)
-                && !matches_ad_domain(domain) && crate::gfwlist::builtin().forces_proxy(domain)
+            !matches_ad_domain(domain) && crate::gfwlist::builtin().forces_proxy(domain)
         }).unwrap();
         assert_eq!(tokio::time::timeout(Duration::from_millis(100),split.decide_for_connection(domain)).await.unwrap(),RoutingDecision::Tunnel);
     }
@@ -934,10 +829,10 @@ mod tests {
                 RoutingDecision::Bypass
             );
 
-            // Unknown domains should default to Tunnel
+            // Unknown domains should default to Bypass
             assert_eq!(
                 split_tunnel.decide_by_host("example.com").await,
-                RoutingDecision::Tunnel
+                RoutingDecision::Bypass
             );
         });
     }
@@ -981,7 +876,7 @@ mod tests {
                 RoutingDecision::Tunnel
             );
 
-            // Test unknown IP (should default to Tunnel)
+            // Test an IP outside configured direct ranges
             let unknown_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
             assert_eq!(
                 split_tunnel.decide("example.com", &[unknown_ip]).await,
@@ -1066,12 +961,12 @@ mod tests {
                 "IP {} should match tunnel network 8.8.8.0/24", tunnel_ip
             );
 
-            // Test unknown IP (should default to Tunnel)
+            // Test an IP outside configured direct ranges
             let unknown_ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
             assert_eq!(
                 split_tunnel.decide_by_ip(unknown_ip).await,
                 RoutingDecision::Tunnel,
-                "Unknown IP {} should default to Tunnel", unknown_ip
+                "IP {} outside the direct ranges should use the tunnel", unknown_ip
             );
 
             // Test IPv6 localhost
@@ -1105,7 +1000,7 @@ mod tests {
             assert_eq!(
                 split_tunnel.decide_by_ip(ip).await,
                 RoutingDecision::Tunnel,
-                "When disabled, IP should default to Tunnel"
+                "When disabled, IP should default to Bypass"
             );
         });
     }
@@ -1155,8 +1050,8 @@ mod tests {
             // Unrelated hosts are unaffected.
             assert_eq!(
                 split_tunnel.decide_by_host("example.org").await,
-                RoutingDecision::Tunnel,
-                "with no bypass rules everything else tunnels too"
+                RoutingDecision::Bypass,
+                "unmatched hosts connect directly"
             );
         });
 
@@ -1268,12 +1163,14 @@ mod tests {
             let enabled = SplitTunnel::new(config.clone(), Arc::clone(&resolver)).await.unwrap();
             assert_eq!(enabled.decide_by_host("sub.ads.example.org").await, RoutingDecision::Block);
             assert_eq!(enabled.decide_by_host("shop.example.cn").await, RoutingDecision::Bypass);
-            assert_eq!(enabled.decide_by_host("outside.example.cn").await, RoutingDecision::Tunnel);
+            assert_eq!(enabled.decide_by_host("outside.example.cn").await, RoutingDecision::Bypass);
+            assert_eq!(enabled.decide_for_connection("shop.example.cn").await, RoutingDecision::Bypass);
+            assert_eq!(enabled.decide_for_connection("outside.example.cn").await, RoutingDecision::Tunnel);
             assert_eq!(enabled.decide_by_ip("7.7.7.7".parse().unwrap()).await, RoutingDecision::Bypass);
 
             config.block_ads = false;
             let disabled = SplitTunnel::new(config, resolver).await.unwrap();
-            assert_eq!(disabled.decide_by_host("ads.example.org").await, RoutingDecision::Tunnel);
+            assert_eq!(disabled.decide_by_host("ads.example.org").await, RoutingDecision::Bypass);
         });
         std::fs::remove_dir_all(dir).unwrap();
     }

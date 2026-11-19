@@ -118,19 +118,14 @@ impl Socks5Proxy {
             );
         }
 
-        let nameserver_list = if config.network.dns_servers.is_empty() {
-            &config.dns_proxy.nameservers
-        } else {
-            &config.network.dns_servers
-        };
         let dns_resolver = Arc::new(DnsResolver::new(
             config.network.dns_cache_enabled,
             config.network.dns_cache_ttl,
             config.network.dns_cache_size,
             config.network.ipv6_enabled,
-            config.network.prefer_ipv4,
+            false, // Prefer IPv6 when enabled.
             vec![],
-        ).with_nameservers(nameserver_list)?);
+        ).with_nameservers(&config.dns_proxy.nameservers)?);
         dns_resolver.start_cleanup_task();
 
         let split_tunnel = match SplitTunnel::new(config.split_tunnel.clone(), Arc::clone(&dns_resolver)).await {

@@ -230,39 +230,42 @@ impl ReloadableLogging {
         *guard = prepared.guard;
         Ok(())
     }
+
+    pub fn use_runtime_settings(&self, config: &LoggingConfig) -> Result<()> {
+        match self.prepare(config) {
+            Ok(prepared) => self.apply(prepared),
+            Err(error) if config.file_enabled => {
+                let mut fallback = config.clone();
+                fallback.file_enabled = false;
+                self.apply(self.prepare(&fallback)?)?;
+                eprintln!("File logging unavailable; using console only: {error:#}");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn writes_to_file(&self) -> bool {
+        self.guard.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
 }
 
-pub fn init_reloadable(
+/// Start with console output. The client switches to its configured writer after readiness.
+pub fn init_client_startup(
     config: &LoggingConfig,
     verbose: u8,
     prefix: &str,
 ) -> Result<ReloadableLogging> {
-    let (prepared, warning) = match prepare_logging(config, verbose, prefix) {
-        Ok(prepared) => (prepared, None),
-        Err(error) if config.file_enabled => {
-            let mut fallback = config.clone();
-            fallback.file_enabled = false;
-            (prepare_logging(&fallback, verbose, prefix)?, Some(error))
-        }
-        Err(error) => return Err(error),
-    };
+    config.level(verbose)?;
+    let mut startup = config.clone();
+    startup.file_enabled = false;
+    if config.file_enabled {
+        startup.level = "warn".into();
+    }
+    let prepared = prepare_logging(&startup, verbose, prefix)?;
     let (layer, handle) = tracing_subscriber::reload::Layer::new(prepared.layer);
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
         .map_err(|error| anyhow::anyhow!("Failed to initialize logging: {error}"))?;
-    if let Some(error) = warning {
-        warn!("File logging unavailable; using console only: {error:#}");
-    } else if config.file_enabled {
-        let executable = std::env::current_exe()?;
-        let directory = config
-            .directory
-            .as_deref()
-            .unwrap_or(executable.parent().context("Executable has no parent")?);
-        info!(
-            "File logging enabled: {} (UTC daily rotation, up to {} files)",
-            directory.join(format!("{prefix}.YYYY-MM-DD.log")).display(),
-            config.max_files
-        );
-    }
     Ok(ReloadableLogging {
         handle,
         guard: std::sync::Mutex::new(prepared.guard),

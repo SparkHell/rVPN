@@ -47,11 +47,13 @@ const config = {
     dns_cache_ttl: 14400,
     dns_cache_size: 1000,
     dns_servers: [],
+    require_ech: false,
   },
   split_tunnel: {
     enabled: true,
     builtinBypassCountries: ['CN'],
     blockAds: true,
+    gfwlistEnabled: true,
     bypassNetworksFile: null,
     bypassDomainsFile: null,
     countryDomainsFile: null,
@@ -122,6 +124,8 @@ test.beforeEach(async ({ page }) => {
             dns_tunnel: 50,
             dns_bypass: 20,
             dns_block: 5,
+            dns_cache_hits: 15,
+            dns_gfwlist: 30,
           },
           buckets: [],
         },
@@ -129,6 +133,17 @@ test.beforeEach(async ({ page }) => {
     )
     ws.onMessage((data) => {
       const request = JSON.parse(String(data))
+      if (request.method === 'rules.update') {
+        ws.send(
+          JSON.stringify({
+            type: 'response',
+            id: request.id,
+            ok: true,
+            data: { domains: 1234 },
+          }),
+        )
+        return
+      }
       if (request.method === 'config.save') {
         if (request.config.server_address === 'wss://reject.invalid/ws') {
           ws.send(
@@ -178,13 +193,13 @@ test('overview displays live values and can navigate to all configuration sectio
   await expect(page.getByText('01:01:01')).toBeVisible()
   await expect(page.getByText('1.0 MB', { exact: false })).toBeVisible()
   for (const label of [
-    '连接与节点',
+    '服务器与路由',
     '本地代理',
     'DNS 与网络',
     '分流规则',
-    'TUN 网络',
-    '身份与安全',
-    '程序设置',
+    'TUN 虚拟网卡',
+    '身份验证',
+    '运行与管理',
   ]) {
     await page
       .locator('nav')
@@ -201,12 +216,26 @@ test('edits DoH and optional log directory, validates and applies without restar
     .locator('nav')
     .getByRole('button', { name: 'DNS 与网络', exact: true })
     .click()
+  const listener = page.getByLabel('监听地址')
+  await page.getByRole('switch', { name: '启用 DNS 代理' }).click()
+  await expect(listener).toBeDisabled()
+  await expect(page.getByLabel('DNS 上游')).toBeEnabled()
+  await page.getByRole('switch', { name: '启用 DNS 代理' }).click()
+  await expect(listener).toBeEnabled()
+  await page.getByRole('switch', { name: 'DNS 缓存' }).click()
+  await expect(page.getByLabel('最大缓存条数')).toBeDisabled()
+  await expect(
+    page.getByRole('switch', { name: '优先使用 ECH' }),
+  ).toHaveAccessibleDescription(/普通 TLS/)
+  await expect(page.locator('.config-sections')).not.toContainText(
+    /dns_cache_ttl|dns_servers|prefer_ipv4/,
+  )
   await page
     .getByLabel('DNS 上游')
     .fill('https://dns.example.com/dns-query\n1.1.1.1:53\n')
   await page
     .locator('nav')
-    .getByRole('button', { name: '程序设置', exact: true })
+    .getByRole('button', { name: '运行与管理', exact: true })
     .click()
   await page.getByLabel('日志目录').fill('./logs')
   await page.getByRole('button', { name: '校验配置', exact: true }).click()
@@ -232,7 +261,7 @@ test('supports node and routing forms, and protects unsaved changes', async ({
 }) => {
   await page
     .locator('nav')
-    .getByRole('button', { name: '连接与节点', exact: true })
+    .getByRole('button', { name: '服务器与路由', exact: true })
     .click()
   await page.getByRole('button', { name: '添加节点', exact: true }).click()
   await page.getByLabel('节点名称', { exact: false }).fill('office')
@@ -281,7 +310,7 @@ test('failed apply keeps the edited form available for correction', async ({
 }) => {
   await page
     .locator('nav')
-    .getByRole('button', { name: '连接与节点', exact: true })
+    .getByRole('button', { name: '服务器与路由', exact: true })
     .click()
   await page.getByLabel('服务器地址').fill('wss://reject.invalid/ws')
   await page.getByRole('button', { name: '保存并应用', exact: true }).click()
@@ -299,9 +328,9 @@ test('disabling the panel acknowledges success and stops reconnecting', async ({
 }) => {
   await page
     .locator('nav')
-    .getByRole('button', { name: '程序设置', exact: true })
+    .getByRole('button', { name: '运行与管理', exact: true })
     .click()
-  await page.getByRole('switch', { name: '启用', exact: true }).click()
+  await page.getByRole('switch', { name: '启用控制面板', exact: true }).click()
   await page.getByRole('button', { name: '保存并应用', exact: true }).click()
   await expect(page.getByRole('status')).toContainText('控制面板已关闭')
   await expect(page.getByText('面板已关闭', { exact: true })).toBeVisible()
@@ -321,7 +350,7 @@ test('changing the panel address navigates after the save acknowledgement', asyn
   )
   await page
     .locator('nav')
-    .getByRole('button', { name: '程序设置', exact: true })
+    .getByRole('button', { name: '运行与管理', exact: true })
     .click()
   await page.getByLabel('监听地址').fill('127.0.0.1:5174')
   await page.getByRole('button', { name: '保存并应用', exact: true }).click()
@@ -329,4 +358,121 @@ test('changing the panel address navigates after the save acknowledgement', asyn
   await expect(
     page.getByRole('heading', { name: '新控制面板地址' }),
   ).toBeVisible()
+})
+
+test('split rules expose independent switches, immediate updates and DNS ratios', async ({
+  page,
+}) => {
+  await page
+    .locator('nav')
+    .getByRole('button', { name: '分流规则', exact: true })
+    .click()
+  await page.getByRole('switch', { name: 'GFWList 代理规则' }).click()
+  await expect(
+    page.getByRole('switch', { name: 'AdGuard 广告过滤' }),
+  ).toBeChecked()
+  await page.getByRole('button', { name: '更新 GFWList', exact: true }).click()
+  await expect(page.getByRole('status')).toContainText(
+    'GFWList 更新完成，共 1234 条',
+  )
+  await expect(
+    page.getByRole('switch', { name: 'GFWList 代理规则' }),
+  ).not.toBeChecked()
+  await expect(page.locator('.dns-metrics')).toContainText('15 次 · 20.0%')
+  await expect(page.locator('.dns-metrics')).toContainText('30 次 · 40.0%')
+})
+
+test('imports a PAC and lets a newer SSRL move a rule before saving', async ({
+  page,
+}) => {
+  await page
+    .locator('nav')
+    .getByRole('button', { name: '分流规则', exact: true })
+    .click()
+  const input = page.getByLabel('选择规则文件')
+  const direct = page.getByRole('textbox', {
+    name: '直连域名 bypassDomains',
+    exact: true,
+  })
+  const tunnel = page.getByRole('textbox', {
+    name: '隧道域名 tunnelDomains',
+    exact: true,
+  })
+  await input.setInputFiles({
+    name: 'first.pac',
+    mimeType: 'application/x-ns-proxy-autoconfig',
+    buffer: Buffer.from(String.raw`function FindProxyForURL(url, host) {
+      if (/(?:^|\.)direct\.example\.com$/.test(host)) return "DIRECT";
+    }`),
+  })
+  await expect(direct).toHaveValue('direct.example.com')
+  await input.setInputFiles({
+    name: 'next.ssrl',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('[wildcard]\n@*://*.direct.example.com/*\n'),
+  })
+  await expect(page.getByRole('status')).toContainText('覆盖 1 条反向规则')
+  await expect(direct).toHaveValue('')
+  await expect(tunnel).toHaveValue('direct.example.com')
+  await page.getByRole('button', { name: '保存并应用', exact: true }).click()
+  await expect(page.getByRole('status')).toContainText('配置已保存')
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page
+    .getByRole('button', { name: '导入规则文件' })
+    .scrollIntoViewIfNeeded()
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true)
+})
+
+test('maps policies from V2Ray and Shadowrocket before merging their rules', async ({
+  page,
+}) => {
+  await page
+    .locator('nav')
+    .getByRole('button', { name: '分流规则', exact: true })
+    .click()
+  const input = page.getByLabel('选择规则文件')
+  await input.setInputFiles({
+    name: 'v2ray.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(
+      JSON.stringify({
+        routing: {
+          rules: [
+            {
+              type: 'field',
+              domain: ['domain:example.com'],
+              outboundTag: 'local-lane',
+            },
+          ],
+        },
+      }),
+    ),
+  })
+  await expect(
+    page.getByRole('heading', { name: '映射出站策略' }),
+  ).toBeVisible()
+  await page.getByLabel('local-lane').selectOption('direct')
+  await page.getByRole('button', { name: '加入草稿' }).click()
+  await expect(
+    page.getByRole('textbox', { name: '直连域名 bypassDomains', exact: true }),
+  ).toHaveValue('example.com')
+  await input.setInputFiles({
+    name: 'shadowrocket.conf',
+    mimeType: 'text/plain',
+    buffer: Buffer.from(
+      '[Rule]\nDOMAIN-SUFFIX,example.com,VPN Group\nIP-CIDR6,2001:db8::/32,DIRECT',
+    ),
+  })
+  await page.getByLabel('VPN Group').selectOption('proxy')
+  await page.getByRole('button', { name: '加入草稿' }).click()
+  await expect(
+    page.getByRole('textbox', { name: '隧道域名 tunnelDomains', exact: true }),
+  ).toHaveValue('example.com')
+  await expect(page.getByRole('status')).toContainText('覆盖 1 条反向规则')
+  await page.getByRole('button', { name: '保存并应用', exact: true }).click()
+  await expect(page.getByRole('status')).toContainText('配置已保存')
 })

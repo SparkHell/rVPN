@@ -183,6 +183,7 @@ async fn file_logging_keeps_only_panel_access_information_on_console() {
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
     assert!(stdout.contains(&format!("http://{panel}/")), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
+    assert!(logs.contains("R-VPN Client v") && logs.contains(" started"));
     assert!(logs.contains("Client configuration applied"));
     assert!(!logs.contains('\u{1b}'));
 }
@@ -242,7 +243,8 @@ async fn saves_apply_rebind_roll_back_and_move_panel_without_changing_pid() {
     config["http_proxy"]["listen_address"] = json!(http.to_string());
     config["dns_proxy"]["enabled"] = json!(true);
     config["dns_proxy"]["listen_address"] = json!(dns.to_string());
-    config["dns_proxy"]["nameservers"] = json!(["https://1.1.1.1/dns-query"]);
+    config["dns_proxy"]["nameservers"] = json!(["https://resolver.example/dns-query", "223.5.5.5:53"]);
+    config["network"]["require_ech"] = json!(true);
     assert_eq!(save(&mut socket, &mut current, config).await["ok"], true);
     assert_eq!(current["runtime"]["socks5"], next_socks.to_string());
     assert!(TcpStream::connect(socks).await.is_err());
@@ -323,14 +325,20 @@ async fn saves_apply_rebind_roll_back_and_move_panel_without_changing_pid() {
 
 #[tokio::test]
 async fn saving_repaired_configuration_recovers_a_stopped_network() {
-    let (_directory, mut child, panel, socks) = fixture(true);
+    let (directory, mut child, panel, socks) = fixture_logging(true, true);
     let pid = child.0.id();
     let (mut socket, mut current) = connect(panel).await;
     let mut config = current["config"].clone();
+    let mut invalid = config.clone();
+    invalid["logging"]["directory"] = json!("./logs");
+    assert_eq!(save(&mut socket, &mut current, invalid).await["ok"], false);
+    assert!(!directory.path().join("logs").exists());
     config["prekey_bundle"] = json!("./bundle.json");
+    config["logging"]["directory"] = json!("./logs");
     let saved = save(&mut socket, &mut current, config).await;
     assert_eq!(saved["ok"], true, "{saved}");
     assert_eq!(current["pending_changes"], false);
+    assert_eq!(std::fs::read_dir(directory.path().join("logs")).unwrap().count(), 1);
     assert!(TcpStream::connect(socks).await.is_ok());
     assert!(child.0.try_wait().unwrap().is_none());
     assert_eq!(child.0.id(), pid);

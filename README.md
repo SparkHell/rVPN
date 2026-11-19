@@ -252,10 +252,11 @@ Unix logs are available through `journalctl -u rvpn-client` (Linux) or
 
 ### Client and server file logs
 
-The client writes runtime messages to daily files by default; its console shows
-only the management-page URL. Disable file logging to print runtime messages to
-the console instead. The server writes to both the console and files.
-Startup errors are included. Files are stored beside the executable on Windows, Linux, and
+The client displays startup errors directly on the console and opens its daily
+log file once the network runtime is ready. The management-page URL also appears
+on the console. Disable file logging to print runtime messages to the console.
+The server writes startup errors and runtime messages to both the console and files.
+Files are stored beside the executable on Windows, Linux, and
 macOS, including when running as a service: `rvpn-client.YYYY-MM-DD.log` for the client
 and `rvpn-server.YYYY-MM-DD.log` for the server. Dates use UTC, restarts append,
 and up to seven matching log files are retained. Normal shutdown flushes queued
@@ -282,15 +283,22 @@ such as HTTP/2 libraries remain at WARN/ERROR. Successful per-flow handshakes an
 task completion are DEBUG, packet byte counts are TRACE, and ordinary heartbeat
 frames do not emit a log line. File logs never contain terminal color codes.
 
-### Built-in GFWList rules
+### AdGuard and GFWList subscriptions
 
-GFWList is a built-in proxy-domain source, automatically active when split
-routing is enabled. There are no GFWList-specific configuration fields or WebUI
-switches. Startup does not download a list or depend on external files.
+Open **分流规则** in the client panel to switch AdGuard domain filtering and GFWList
+proxy rules independently. With split routing enabled, unmatched DNS queries use the local upstream. For connections, target IPs in the configured direct ranges connect directly. If direct regions are configured, other addresses use the VPN. Explicit tunnel domains and CIDRs take precedence. Save to apply switches. Each update button downloads through the client’s active SOCKS5 listener. AdGuard updates fetch both Hostlists Registry lists (DNS filter and AdAway hosts), then merge and validate them before replacing the snapshot. Each successful update atomically replaces the
+snapshot under `data_dir/subscriptions`. Successful updates take effect on the
+next routing decision and survive restarts. The bundled rules work offline
+before the first update. AdGuard imports domain blocking and exception rules.
+The existing custom ad block file remains available with ad blocking enabled.
+
+DNS statistics count completed queries received by the local DNS proxy. The
+percentages use all completed queries as the denominator. The panel keeps the
+latest 64 results in process memory and displays up to six answers per query.
 
 CI downloads and validates the upstream GFWList during the shared rule-data
 build, converts its domain rules, then embeds `gfwlist-rules.json` into all
-platform binaries. The exact same data is included in every client archive's
+platform binaries. CI also embeds the merged advertising domains from both lists. The raw `filter_1.txt`, `filter_2.txt`, and GFWList source accompany the generated snapshots in every client artifact. The exact same data is included in every client archive's
 `rules/` directory: raw `gfwlist.txt`, normalized `gfwlist-rules.json`, plain
 `gfwlist-domains.txt`, source hashes/counts, and `LICENSE-GFWList.txt`. Publishing
 reuses that artifact instead of fetching a different list after compilation.
@@ -306,8 +314,7 @@ GFWList matches and return to normal routing, without forcing a direct route.
 Explicit user tunnel/bypass rules retain priority. The plain export omits
 parents overlapping exceptions; the embedded JSON retains both sets.
 
-SOCKS5/HTTP targets matching an explicit proxy domain, the built-in proxy list,
-or GFWList go straight to the tunnel, preserving the hostname for remote DNS.
+SOCKS5/HTTP targets matching an explicit proxy domain or GFWList go straight to the tunnel, preserving the hostname for remote DNS.
 They no longer perform a local IP probe first. DNS-proxy A queries use the tunnel
 too; VPN server hostnames retain local bootstrap resolution. The current DNS
 tunnel supports address lookups only: AAAA returns NODATA, and non-address types
@@ -329,39 +336,41 @@ chain so certificate failures remain visible.
 ### Client DNS over HTTPS
 
 DNS upstreams are configured directly in `dns_proxy.nameservers`. Use an
-IP address (optionally with a port) for UDP, or an HTTPS URL for DoH:
+IP address (optionally with a port) for UDP, or an HTTPS URL for DoH. Replace the example addresses below with your DNS
+provider's endpoints.
 
 ```toml
 [dns_proxy]
 enabled = true
 listen_address = "127.0.0.1:53"
-nameservers = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
+nameservers = ["https://dns.example.com/dns-query", "https://backup-dns.example.com/dns-query"]
 ```
 
 UDP and DoH entries can be mixed, for example
-`nameservers = ["https://1.1.1.1/dns-query", "223.5.5.5:53"]`.
+`nameservers = ["https://dns.example.com/dns-query", "192.0.2.53:53"]`.
 Upstreams are tried in configured order. To prevent plaintext fallback, list
 only DoH URLs. No extra UDP resolver or system resolver is used when a list
-containing DoH fails. DoH URLs must use IP addresses to avoid circular DNS
-resolution when the system DNS points at this proxy. HTTPS certificate
-validation stays enabled. Requests use wire format POST with HTTP/2 support,
-a five-second timeout, no redirects, and no environment HTTP proxy.
+containing DoH fails to resolve a requested name. DoH URLs accept IP addresses
+and hostnames. The OS resolver resolves the DoH server's hostname when opening
+a connection, while HTTPS verifies the original hostname. If the OS sends
+that lookup back to rVPN, the DNS proxy tries only configured IP-based
+upstreams for that lookup. Keep one reachable IP-based upstream in the list
+when using rVPN as the system DNS. Requests use wire format POST with HTTP/2
+support, a five-second timeout, no redirects, and no environment HTTP proxy.
 
 These nameservers also serve client-side split-tunnel, direct connection, and
-VPN endpoint lookups. A nonempty `network.dns_servers` overrides this list for
-those lookups and accepts the same UDP/DoH syntax. Existing UDP-only resolver
-behavior is preserved. No separate `[network.doh]` section is needed.
+VPN endpoint lookups. Legacy `network.dns_servers` and `network.prefer_ipv4`
+are ignored. Hostname lookups prefer IPv6 when enabled and keep IPv4 available
+as a fallback. Record TTLs take precedence over the fallback TTL used for
+system address lookups that return no record TTL.
 
-Set `[network].require_ech = true` to require Encrypted ClientHello on the
-desktop CLI's VPN WebSockets. Configure an HTTPS-only list of DoH upstreams
-for VPN endpoint resolution and use a DNS hostname as the VPN endpoint.
-Use the endpoint hostname as SNI. The endpoint must publish an HTTPS record
-with an ECH configuration usable by its TLS frontend. For Caddy deployments, Caddy accepts ECH on the public
-TLS listener. Missing HTTPS records, failed DNS lookups and rejected ECH
-handshakes without authenticated retry configs fail before WebSocket
-upgrade. The client retries once with a config authenticated by the TLS
-frontend. Each new dial refreshes the HTTPS record and performs a full
-TLS handshake.
+Set `[network].require_ech = true` to prefer Encrypted ClientHello on the
+desktop CLI's VPN WebSockets. The client reads the VPN endpoint's HTTPS and
+address records using the HTTPS entries in `dns_proxy.nameservers`. Use the
+VPN endpoint hostname as SNI. The TLS frontend can issue an authenticated
+ECH retry config. If HTTPS/ECH discovery or the ECH handshake fails, the
+client logs the reason and retries the original endpoint with standard TLS
+and certificate verification before upgrading to WebSocket.
 
 Run with `-v` for per-stage timing. The logs distinguish endpoint address
 and HTTPS lookups, TCP, TLS, WebSocket upgrade, X3DH and TUN address
@@ -490,7 +499,6 @@ Point `client.toml` at the generated files:
 enabled = true
 block_ads = true
 ad_block_file = "/var/lib/rvpn/rules/ad-domains.txt"
-country_domains_file = "/var/lib/rvpn/rules/country-domains-cn.txt"
 country_ips_file = "/var/lib/rvpn/rules/country-ips.json"
 builtin_bypass_countries = ["CN"]
 auto_reload_interval = 3600

@@ -57,6 +57,13 @@ fn merge_defaults(defaults: &mut Value, input: Value) {
     }
 }
 
+fn remove_retired_network_fields(config: &mut Value) {
+    if let Some(network) = config.get_mut("network").and_then(Value::as_object_mut) {
+        network.remove("dns_servers");
+        network.remove("prefer_ipv4");
+    }
+}
+
 fn without_nulls(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
@@ -70,12 +77,82 @@ fn without_nulls(value: Value) -> Value {
     }
 }
 
+fn route_target(input: &str) -> Result<url::Host> {
+    let input = input.trim().trim_end_matches('.');
+    if let Ok(ip) = input.parse::<std::net::IpAddr>() {
+        return Ok(match ip {
+            std::net::IpAddr::V4(ip) => url::Host::Ipv4(ip),
+            std::net::IpAddr::V6(ip) => url::Host::Ipv6(ip),
+        });
+    }
+    let host = url::Host::parse(input).context("请输入域名或 IP 地址")?;
+    if let url::Host::Domain(name) = &host {
+        anyhow::ensure!(name.len() <= 253 && name.split('.').all(|label|
+            !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-') &&
+            label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        ), "请输入域名或 IP 地址");
+    }
+    Ok(host)
+}
+
+async fn inspect_route(config: ClientConfig, input: &str) -> Result<Value> {
+    use rvpn_split_tunnel::{SplitTunnel, RoutingDecision};
+    use rvpn_split_tunnel::dns_cache::{DnsResolver, doh_upstream_hostname};
+    let target = route_target(input)?;
+    anyhow::ensure!(!config.tun.enabled, "此查询适用于 SOCKS5、HTTP 和本地 DNS 代理模式");
+    let mut rules = config.split_tunnel;
+    rules.auto_reload_interval = 0;
+    let resolver = Arc::new(DnsResolver::new(false, config.network.dns_cache_ttl,
+        config.network.dns_cache_size, config.network.ipv6_enabled, false, vec![])
+        .with_nameservers(&config.dns_proxy.nameservers)?);
+    let split = SplitTunnel::new(rules, resolver.clone()).await?;
+    let route = |route| match route {
+        RoutingDecision::Tunnel => "VPN 隧道",
+        RoutingDecision::Bypass => "直连",
+        RoutingDecision::Block => "拦截",
+    };
+    let host = match target {
+        url::Host::Domain(host) => host,
+        ip => {
+            let ip = ip.to_string();
+            let (decision, reason, _) = split.explain_connection(&ip).await;
+            return Ok(json!({"target":ip,"connection":route(decision),"reason":reason}));
+        }
+    };
+    let (dns, _, mut reason) = split.explain_dns(&host).await;
+    let (connection, connection_reason, addresses) = split.explain_connection(&host).await;
+    let bootstrap = std::iter::once(config.server_address.as_str())
+        .chain(config.extra_servers.iter().map(|s| s.address.as_str()))
+        .filter_map(|s| url::Url::parse(s).ok())
+        .any(|s| s.host_str().is_some_and(|s| s.trim_end_matches('.').eq_ignore_ascii_case(&host)))
+        || config.dns_proxy.nameservers.iter().filter_map(|s| doh_upstream_hostname(s))
+            .any(|s| s.eq_ignore_ascii_case(&host));
+    let dns = if bootstrap {
+        reason = "VPN 或 DoH 上游域名由本地 DNS 解析";
+        RoutingDecision::Bypass
+    } else { dns };
+    let (a, aaaa, other) = match dns {
+        RoutingDecision::Bypass => ("本地 DNS 上游", "本地 DNS 上游", "本地 DNS 上游"),
+        RoutingDecision::Block => ("拦截", "拦截", "拦截"),
+        RoutingDecision::Tunnel => ("VPN 隧道", "本地返回无记录", "本地 DNS 上游"),
+    };
+    Ok(json!({"target":host,"connection":route(connection),"reason":connection_reason,"dnsReason":reason,"dnsEnabled":config.dns_proxy.enabled,
+        "a":a,"aaaa":aaaa,"other":other,"addresses":addresses}))
+}
+
 fn validate(value: &Value) -> Result<ClientConfig> {
     let config: ClientConfig = serde_json::from_value(value.clone()).context("配置字段类型错误")?;
     anyhow::ensure!(
         config.performance.worker_threads > 0,
         "performance.worker_threads 必须大于 0"
     );
+    for domain in config.split_tunnel.bypass_domains.iter().chain(&config.split_tunnel.tunnel_domains) {
+        anyhow::ensure!(matches!(route_target(domain)?, url::Host::Domain(_)) && domain.trim().is_ascii(),
+            "自定义域名规则须填写 ASCII 域名：{domain}");
+    }
+    for cidr in config.split_tunnel.bypass_networks.iter().chain(&config.split_tunnel.tunnel_networks) {
+        cidr.trim().parse::<IpNetwork>().with_context(|| format!("无效网段：{cidr}"))?;
+    }
     let server = url::Url::parse(&config.server_address).context("server_address 不是有效地址")?;
     anyhow::ensure!(
         matches!(server.scheme(), "ws" | "wss") && server.host_str().is_some(),
@@ -190,6 +267,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_inspection_distinguishes_dns_and_connection_rules() {
+        let mut config = ClientConfig::default();
+        config.split_tunnel.enabled = true;
+        config.dns_proxy.enabled = true;
+        config.split_tunnel.tunnel_domains.push("example.test".into());
+        config.split_tunnel.tunnel_networks.push("192.0.2.0/24".into());
+        let domain = inspect_route(config.clone(), "A.Example.Test.").await.unwrap();
+        assert_eq!(domain["a"], "VPN 隧道");
+        assert_eq!(domain["reason"], "命中隧道域名规则");
+        assert_eq!(inspect_route(config, "192.0.2.9").await.unwrap()["connection"], "VPN 隧道");
+    }
+
+    #[tokio::test]
     async fn save_round_trips_toml_and_json_and_rejects_stale_revisions() {
         for extension in ["toml", "json"] {
             let directory = tempfile::tempdir().unwrap();
@@ -199,12 +289,16 @@ mod tests {
             config["prekey_bundle"] = json!("./bundle.json");
             config["logging"]["directory"] = json!("./logs");
             config["future_option"] = json!("preserve me");
+            config["network"]["dns_servers"] = json!(["ignored-legacy-value"]);
+            config["network"]["prefer_ipv4"] = json!(true);
             let request =
                 json!({"method":"config.save","revision":before["revision"],"config":config});
             let saved = panel.command(&request).await.unwrap();
             assert!(!saved["restart_required"].as_bool().unwrap());
             assert!(saved["pending_changes"].as_bool().unwrap());
             assert_eq!(saved["config"]["future_option"], "preserve me");
+            assert!(saved["config"]["network"].get("dns_servers").is_none());
+            assert!(saved["config"]["network"].get("prefer_ipv4").is_none());
             let loaded = ClientConfig::load(&panel.path).unwrap();
             assert_eq!(
                 loaded.prekey_bundle.unwrap(),
@@ -442,6 +536,7 @@ impl ControlPanel {
         let parsed: ClientConfig = serde_json::from_value(input.clone())?;
         let mut defaults = serde_json::to_value(parsed)?;
         let mut input = input;
+        remove_retired_network_fields(&mut input);
         if let Some(Value::Object(split)) = input.get_mut("split_tunnel") {
             let canonical = defaults["split_tunnel"]
                 .as_object()
@@ -487,6 +582,35 @@ impl ControlPanel {
 
     async fn command(&self, request: &Value) -> Result<Value> {
         match request["method"].as_str().unwrap_or("") {
+            "rules.inspect" => {
+                let config = self.active.read().unwrap_or_else(|e| e.into_inner()).0.clone();
+                tokio::time::timeout(Duration::from_secs(15),
+                    inspect_route(config, request["target"].as_str().unwrap_or("")))
+                    .await.context("分流查询超时，请检查 DNS 上游")?
+            }
+            "rules.update" => {
+                let _lock = self.writes.lock().await;
+                let source = rvpn_split_tunnel::subscriptions::Source::parse(request["source"].as_str().unwrap_or(""))?;
+                let config = self.active.read().unwrap_or_else(|e| e.into_inner()).0.clone();
+                anyhow::ensure!(!config.tun.enabled, "规则更新需要 SOCKS5 代理，请先切换到代理模式");
+                let mut endpoint: SocketAddr = config.socks5.listen_address.parse()?;
+                anyhow::ensure!(endpoint.port() != 0, "规则更新需要固定的 SOCKS5 监听端口");
+                if endpoint.ip().is_unspecified() {
+                    endpoint.set_ip(match endpoint.ip() {
+                        std::net::IpAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                        std::net::IpAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                    });
+                }
+                let mut proxy = url::Url::parse(&format!("socks5h://{endpoint}"))?;
+                if config.socks5.auth_enabled {
+                    proxy.set_username(config.socks5.auth_username.as_deref().context("SOCKS5 用户名缺失")?)
+                        .map_err(|_| anyhow::anyhow!("无效的 SOCKS5 用户名"))?;
+                    proxy.set_password(config.socks5.auth_password.as_deref())
+                        .map_err(|_| anyhow::anyhow!("无效的 SOCKS5 密码"))?;
+                }
+                let store = config.split_tunnel.subscriptions.context("规则订阅尚未初始化")?;
+                Ok(json!({"domains":store.update(source, proxy.as_str()).await?}))
+            }
             "config.get" => self.configuration(),
             "config.validate" => {
                 validate(&request["config"])?;
@@ -500,10 +624,12 @@ impl ControlPanel {
                     request["revision"].as_str() == Some(&current),
                     "配置已被其他页面或程序修改，请重新加载后再保存"
                 );
+                let mut config = request["config"].clone();
+                remove_retired_network_fields(&mut config);
                 let body = if self.path.extension().is_some_and(|ext| ext == "json") {
-                    serde_json::to_string_pretty(&request["config"])?
+                    serde_json::to_string_pretty(&config)?
                 } else {
-                    toml::to_string_pretty(&without_nulls(request["config"].clone()))?
+                    toml::to_string_pretty(&without_nulls(config))?
                 };
                 let previous = std::fs::read(&self.path)?;
                 // Preserve file permissions and replace atomically on every OS.

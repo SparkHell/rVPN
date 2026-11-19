@@ -121,13 +121,13 @@ pub async fn route_connection(
     let (target_host, target_port) = parse_target(target_addr)?;
 
     // Definitive domain rules go directly to the tunnel without local DNS.
-    let final_decision = proxy.split_tunnel.decide_for_connection(&target_host).await;
+    let (final_decision, _, addresses) = proxy.split_tunnel.explain_connection(&target_host).await;
 
     match final_decision {
         RoutingDecision::Bypass => {
             debug!("Bypassing VPN for {}:{}", target_host, target_port);
             crate::dashboard::record_conn_bypassed();
-            let result = handle_direct_connection(socket, &target_host, target_port).await;
+            let result = handle_direct_connection(socket, &target_host, target_port, &addresses).await;
             crate::dashboard::record_conn_completed();
             result?;
         }
@@ -159,9 +159,10 @@ async fn handle_direct_connection(
     mut socket: TcpStream,
     target_host: &str,
     target_port: u16,
+    addresses: &[std::net::IpAddr],
 ) -> Result<()> {
     let target_addr = format!("{}:{}", target_host, target_port);
-    let mut target = crate::websocket::connect_direct_tcp(target_host, target_port)
+    let mut target = crate::websocket::connect_direct_tcp(target_host, target_port, addresses)
         .await
         .with_context(|| format!("Failed to connect to {}", target_addr))?;
 

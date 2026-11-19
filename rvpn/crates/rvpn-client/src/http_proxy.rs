@@ -383,17 +383,7 @@ async fn handle_http_forward(
     // Reconstruct the request with relative path and filtered headers
     let request = build_request(method, &path, headers);
 
-    // Make split tunnel decision
-    let decision = proxy.split_tunnel.decide_by_host(&target_host).await;
-    let final_decision = match decision {
-        RoutingDecision::Bypass | RoutingDecision::Block => decision,
-        RoutingDecision::Tunnel => {
-            match proxy.split_tunnel.resolve_host_to_ips(&target_host).await {
-                Some(ips) => proxy.split_tunnel.decide(&target_host, &ips).await,
-                None => RoutingDecision::Tunnel,
-            }
-        }
-    };
+    let (final_decision, _, addresses) = proxy.split_tunnel.explain_connection(&target_host).await;
 
     match final_decision {
         RoutingDecision::Block => {
@@ -406,7 +396,7 @@ async fn handle_http_forward(
         }
         RoutingDecision::Bypass => {
             info!("Bypassing VPN for HTTP {}:{}", target_host, target_port);
-            let mut target = crate::websocket::connect_direct_tcp(&target_host, target_port)
+            let mut target = crate::websocket::connect_direct_tcp(&target_host, target_port, &addresses)
                 .await
                 .with_context(|| format!("Failed to connect to {}", target_addr))?;
 

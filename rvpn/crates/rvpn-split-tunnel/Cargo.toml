@@ -22,7 +22,9 @@ builtin-ips = []
 builtin-domains = []
 
 [dependencies]
-reqwest = { workspace = true, features = ["http2"] }
+base64.workspace = true
+tempfile.workspace = true
+reqwest = { workspace = true, features = ["http2", "socks"] }
 # Async
 tokio = { version = "1.35", default-features = false, features = ["sync", "fs", "rt", "rt-multi-thread", "time", "macros", "net"] }
 

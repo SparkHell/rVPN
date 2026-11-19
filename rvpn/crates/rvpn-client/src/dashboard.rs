@@ -161,6 +161,8 @@ pub struct DashboardState {
     pub dns_block: AtomicU64,
     /// Cumulative DNS cache hits.
     pub dns_cache_hits: AtomicU64,
+    dns_gfwlist: AtomicU64,
+    recent_dns: Mutex<VecDeque<serde_json::Value>>,
     /// Cumulative DNS latency, microseconds (all recorded queries).
     pub dns_latency_us_total: AtomicU64,
     /// Cumulative successful tunnel handshakes.
@@ -192,6 +194,8 @@ impl DashboardState {
             dns_bypass: AtomicU64::new(0),
             dns_block: AtomicU64::new(0),
             dns_cache_hits: AtomicU64::new(0),
+            dns_gfwlist: AtomicU64::new(0),
+            recent_dns: Mutex::new(VecDeque::with_capacity(64)),
             dns_latency_us_total: AtomicU64::new(0),
             handshakes_ok: AtomicU64::new(0),
             handshakes_fail: AtomicU64::new(0),
@@ -358,6 +362,26 @@ pub fn record_dns(decision: DnsDecision, cache_hit: bool, latency: Duration) {
             s.bump(&s.dns_cache_hits, 1);
         }
         s.bump(&s.dns_latency_us_total, latency.as_micros() as u64);
+    });
+}
+
+/// Keep only the most recent completed DNS requests in memory.
+pub fn record_dns_answer(domain: &str, qtype: u16, route: DnsDecision, cached: bool, gfwlist: bool, elapsed: Duration, wire: &[u8]) {
+    record_dns(route, cached, elapsed);
+    with_state(|state| {
+        if gfwlist { state.bump(&state.dns_gfwlist, 1); }
+        let message = hickory_proto::op::Message::from_vec(wire).ok();
+        let answers: Vec<String> = message.iter().flat_map(|m| m.answers())
+            .filter_map(|r| r.data()).take(6).map(|r| r.to_string().chars().take(128).collect()).collect();
+        let record = serde_json::json!({
+            "time":now_unix(), "domain":domain, "type":hickory_proto::rr::RecordType::from(qtype).to_string(),
+            "route":match route { DnsDecision::Block => "广告拦截", DnsDecision::Bypass => "本地", DnsDecision::Tunnel => "隧道" },
+            "cached":cached, "gfwlist":gfwlist, "ms":elapsed.as_millis(),
+            "rcode":message.map(|m| format!("{:?}", m.response_code())).unwrap_or_else(||"Invalid".into()), "answers":answers
+        });
+        let mut recent = state.recent_dns.lock().unwrap_or_else(|e| e.into_inner());
+        if recent.len() == 64 { recent.pop_back(); }
+        recent.push_front(record);
     });
 }
 
@@ -622,6 +646,7 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
         .collect();
 
     serde_json::json!({
+        "recent_dns": *state.recent_dns.lock().unwrap_or_else(|e| e.into_inner()),
         "uptime_secs": uptime,
         "counters": {
             "bytes_up": state.bytes_up.load(Ordering::Relaxed),
@@ -634,6 +659,7 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
             "dns_tunnel": state.dns_tunnel.load(Ordering::Relaxed),
             "dns_bypass": state.dns_bypass.load(Ordering::Relaxed),
             "dns_block": state.dns_block.load(Ordering::Relaxed),
+            "dns_gfwlist": state.dns_gfwlist.load(Ordering::Relaxed),
             "dns_cache_hits": state.dns_cache_hits.load(Ordering::Relaxed),
             "handshakes_ok": state.handshakes_ok.load(Ordering::Relaxed),
             "handshakes_fail": state.handshakes_fail.load(Ordering::Relaxed),

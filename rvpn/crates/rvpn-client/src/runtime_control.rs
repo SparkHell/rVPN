@@ -223,8 +223,9 @@ pub async fn run(
     mut config: ClientConfig,
     path: PathBuf,
     overrides: Overrides,
-    logging: Arc<rvpn_logging::ReloadableLogging>,
+    logging: &rvpn_logging::ReloadableLogging,
 ) -> Result<()> {
+    config.split_tunnel.subscriptions = Some(Arc::new(rvpn_split_tunnel::subscriptions::Subscriptions::open(&config.data_dir)));
     let panel = Arc::new(ControlPanel::new(path, config.clone())?);
     let (sender, mut requests) = mpsc::channel::<ApplyRequest>(8);
     panel.attach_applier(sender);
@@ -241,21 +242,26 @@ pub async fn run(
             None
         }
         Err(error) => {
-            tracing::warn!("{error:#}");
+            eprintln!("{error:#}");
             None
         }
     };
     let mut worker = match start_ready(config.clone()).await {
-        Ok(worker) => Some(worker),
+        Ok(worker) => {
+            logging.use_runtime_settings(&config.logging)?;
+            tracing::info!("R-VPN Client v{} started", env!("CARGO_PKG_VERSION"));
+            Some(worker)
+        }
         Err(error) => {
             if listener.is_none() {
                 return Err(error);
             }
-            tracing::error!("VPN stopped; control panel remains available: {error:#}");
+            eprintln!("VPN failed to start; control panel remains available: {error:#}");
             panel.set_runtime_error(format!("{error:#}"));
             None
         }
     };
+    let mut started = worker.is_some();
     let (shutdown, mut stopped) = watch::channel(false);
     let signals = tokio::spawn(crate::handle_signals(shutdown));
     let _signal_guard = crate::OnDrop::new(move || signals.abort());
@@ -271,10 +277,15 @@ pub async fn run(
             }
             Some(mut request) = requests.recv() => {
                 overrides.apply(&mut request.config);
-                let candidate = request.config;
+                let mut candidate = request.config;
+                candidate.split_tunnel.subscriptions = if candidate.data_dir == config.data_dir {
+                    config.split_tunnel.subscriptions.clone()
+                } else {
+                    Some(Arc::new(rvpn_split_tunnel::subscriptions::Subscriptions::open(&candidate.data_dir)))
+                };
                 let outcome = async {
-                    // Prepare fallible process resources before interrupting traffic.
-                    let prepared_log = logging.prepare(&candidate.logging)?;
+                    // Avoid creating files before the first successful network startup.
+                    let mut prepared_log = started.then(|| logging.prepare(&candidate.logging)).transpose()?;
                     let same_address = candidate.dashboard.enabled && listener.as_ref().is_some_and(|old| old.address == candidate.dashboard.listen_address);
                     // Wildcard/loopback changes on the same port overlap. Stop
                     // only the accept loop; accepted WebSockets stay alive to
@@ -293,7 +304,19 @@ pub async fn run(
                     if rebuild {
                         if let Some(old) = worker.take() { old.stop().await; }
                         match start_ready(candidate.clone()).await {
-                            Ok(new_worker) => worker = Some(new_worker),
+                            Ok(new_worker) => {
+                                if !started {
+                                    match logging.prepare(&candidate.logging) {
+                                        Ok(prepared) => prepared_log = Some(prepared),
+                                        Err(error) => {
+                                            new_worker.stop().await;
+                                            return Err(error);
+                                        }
+                                    }
+                                }
+                                worker = Some(new_worker);
+                            }
+                            Err(error) if !started => return Err(error),
                             Err(error) => {
                                 match start_ready(config.clone()).await {
                                     Ok(restored) => worker = Some(restored),
@@ -303,7 +326,10 @@ pub async fn run(
                             }
                         }
                     }
-                    logging.apply(prepared_log)?;
+                    if let Some(prepared_log) = prepared_log {
+                        logging.apply(prepared_log)?;
+                    }
+                    started = true;
                     if !same_address {
                         if let Some(old) = listener.take() { old.stop().await; }
                         listener = prepared_listener.map(|socket| serve_panel(socket, &candidate, state.clone(), panel.clone()));

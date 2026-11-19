@@ -76,9 +76,41 @@ impl DnsUpstreams {
     }
 
     pub async fn query(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.query_upstreams(query, None).await
+    }
+
+    /// If the system sends an upstream's address lookup back to this proxy,
+    /// use only upstreams reachable without another system hostname lookup.
+    pub async fn query_bootstrap(
+        &self,
+        query: &[u8],
+        listener: SocketAddr,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.query_upstreams(query, Some(listener)).await
+    }
+
+    async fn query_upstreams(
+        &self,
+        query: &[u8],
+        listener: Option<SocketAddr>,
+    ) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(query.len() >= 12, "Invalid DNS query");
         let mut last_error = None;
         for upstream in &self.0 {
+            if let Some(listener) = listener {
+                let recursive = match upstream {
+                    DnsUpstream::Doh(client) => doh_hostname(&client.url).is_some(),
+                    DnsUpstream::Udp(address) => {
+                        address.port() == listener.port()
+                            && (address.ip() == listener.ip()
+                                || address.ip().is_unspecified()
+                                || (listener.ip().is_unspecified() && address.ip().is_loopback()))
+                    }
+                };
+                if recursive {
+                    continue;
+                }
+            }
             let result = match upstream {
                 DnsUpstream::Doh(client) => client.query(query).await,
                 DnsUpstream::Udp(address) => {
@@ -115,8 +147,26 @@ impl DnsUpstreams {
                 Err(e) => last_error = Some(e),
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No DNS nameservers configured")))
+        Err(last_error.unwrap_or_else(|| {
+            if listener.is_some() {
+                anyhow::anyhow!("DoH hostname lookup needs an IP-based DNS upstream when system DNS points to rVPN")
+            } else {
+                anyhow::anyhow!("No DNS nameservers configured")
+            }
+        }))
     }
+}
+
+fn doh_hostname(url: &reqwest::Url) -> Option<&str> {
+    url.domain().map(|name| name.trim_end_matches('.'))
+}
+
+pub fn doh_upstream_hostname(endpoint: &str) -> Option<String> {
+    let url = reqwest::Url::parse(endpoint).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    doh_hostname(&url).map(str::to_owned)
 }
 
 #[derive(Debug, Clone)]
@@ -133,15 +183,13 @@ impl DohClient {
             url.username().is_empty() && url.password().is_none() && url.fragment().is_none(),
             "DoH URL must not contain credentials or a fragment"
         );
-        let host = url
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("DoH URL needs a host"))?;
+        anyhow::ensure!(url.has_host(), "DoH URL needs a host");
+        // reqwest resolves hostname endpoints through the OS. Keep the URL
+        // intact so TLS uses the configured name for SNI and verification.
         let builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5));
-        anyhow::ensure!(host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok(),
-            "DoH nameserver URL must contain an IP address to avoid DNS loops (e.g. https://1.1.1.1/dns-query)");
         Ok(Self {
             client: builder.build()?,
             url,
@@ -149,7 +197,7 @@ impl DohClient {
     }
 
     /// Forward any DNS record type without converting the DNS wire payload.
-    /// Fail closed: never fall back to UDP or the system resolver.
+    /// Send the DNS question over HTTPS. Only the upstream hostname uses system DNS.
     pub async fn query(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
             (12..=65535).contains(&query.len()),
@@ -274,8 +322,8 @@ mod doh_tests {
     fn nameservers_accept_udp_and_doh_and_reject_invalid_endpoints() {
         for endpoint in [
             "http://1.1.1.1/dns-query",
-            "https://resolver.example/dns-query",
             "https://user:pass@1.1.1.1/dns-query",
+            "https://resolver.example/dns-query#fragment",
             "bad-address",
         ] {
             assert!(DnsUpstreams::new(&[endpoint.into()]).is_err());
@@ -284,15 +332,42 @@ mod doh_tests {
             "https://1.1.1.1/dns-query".into(),
             "223.5.5.5:53".into(),
             "::1".into(),
+            "https://resolver.example/dns-query".into(),
         ])
         .unwrap();
         assert!(matches!(upstreams.0[0], DnsUpstream::Doh(_)));
         assert!(matches!(upstreams.0[1], DnsUpstream::Udp(_)));
         assert!(matches!(upstreams.0[2], DnsUpstream::Udp(_)));
+        assert!(matches!(&upstreams.0[3], DnsUpstream::Doh(client)
+            if client.url.host_str() == Some("resolver.example")));
     }
 
-    // Use HTTP only inside the test to inspect wire requests without external
-    // DNS/network dependencies. Production construction always requires HTTPS.
+    #[tokio::test]
+    async fn bootstrap_skips_hostname_upstreams_and_the_local_listener() {
+        let listener: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let query = build_dns_query_packet("resolver.example", 123);
+        let mut upstreams = DnsUpstreams::new(&[
+            "https://resolver.example/dns-query".into(),
+            listener.to_string(),
+        ]).unwrap();
+        let error = upstreams.query_bootstrap(&query, listener).await.unwrap_err();
+        assert!(error.to_string().contains("IP-based DNS upstream"));
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        upstreams.0.push(DnsUpstream::Udp(socket.local_addr().unwrap()));
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+            buf[2] |= 0x80;
+            socket.send_to(&buf[..len], peer).await.unwrap();
+        });
+        let response = upstreams.query_bootstrap(&query, listener).await.unwrap();
+        assert_eq!(response[..2], query[..2]);
+        responder.await.unwrap();
+    }
+
+    // Use loopback HTTP in tests to cover system hostname resolution and wire
+    // requests without external dependencies. Production requires HTTPS.
     async fn mock_doh(
         content_type: &str,
         status: &str,
@@ -341,7 +416,7 @@ mod doh_tests {
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .unwrap(),
-                url: format!("http://{addr}/dns-query").parse().unwrap(),
+                url: format!("http://localhost:{}/dns-query", addr.port()).parse().unwrap(),
             },
             task,
         )
@@ -536,14 +611,14 @@ impl DnsResolver {
                             entry.ttl.as_secs() - entry.cached_at.elapsed().as_secs()
                         ));
                     }
-                    let addrs: Vec<SocketAddr> = entry
+                    let addrs = self.order_addresses(entry
                         .ips
                         .iter()
                         .map(|ip| SocketAddr::new(*ip, port))
-                        .collect();
+                        .collect());
                     if !addrs.is_empty() {
                         debug!("DNS cache hit for {} ({} addresses)", host, addrs.len());
-                        return Ok(self.order_addresses(addrs));
+                        return Ok(addrs);
                     }
                 }
             }
@@ -563,14 +638,7 @@ impl DnsResolver {
                     return lookup(1).await;
                 }
                 let (a, aaaa) = tokio::join!(lookup(1), lookup(28));
-                match (a, aaaa) {
-                    (Ok((mut ips, ttl)), Ok((v6, ttl6))) => {
-                        ips.extend(v6);
-                        Ok((ips, ttl.min(ttl6)))
-                    }
-                    (Ok(result), Err(_)) | (Err(_), Ok(result)) => Ok(result),
-                    (Err(e), Err(_)) => Err(e),
-                }
+                merge_address_answers(a, aaaa)
             }
             .await;
             return match result {
@@ -590,33 +658,26 @@ impl DnsResolver {
         // Try custom nameservers first (direct UDP, bypasses system resolver)
         if !self.nameservers.is_empty() {
             for ns in &self.nameservers {
-                match query_nameserver_udp(*ns, host).await {
-                    Ok((mut ips, ttl_secs)) => {
-                        if !self.ipv6_enabled {
-                            let before = ips.len();
-                            ips.retain(|ip| matches!(ip, IpAddr::V4(_)));
-                            if before != ips.len() {
-                                debug!(
-                                    "Filtered {} IPv6 addresses for {}",
-                                    before - ips.len(),
-                                    host
-                                );
-                            }
-                        }
-                        if !ips.is_empty() {
-                            debug!(
-                                "DNS resolved {} via {} ({} addresses, TTL {}s)",
-                                host,
-                                ns,
-                                ips.len(),
-                                ttl_secs
-                            );
-                            let ttl = Duration::from_secs(ttl_secs as u64);
-                            let addrs: Vec<SocketAddr> =
-                                ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
-                            self.store_ips(host, ips, Some(ttl)).await;
-                            return Ok(self.order_addresses(addrs));
-                        }
+                let a = query_nameserver_udp(*ns, host, 1);
+                let result = if self.ipv6_enabled {
+                    let (a, aaaa) = tokio::join!(a, query_nameserver_udp(*ns, host, 28));
+                    merge_address_answers(a, aaaa)
+                } else {
+                    a.await
+                };
+                match result {
+                    Ok((ips, ttl_secs)) => {
+                        debug!(
+                            "DNS resolved {} via {} ({} addresses, TTL {}s)",
+                            host,
+                            ns,
+                            ips.len(),
+                            ttl_secs
+                        );
+                        let ttl = Duration::from_secs(ttl_secs as u64);
+                        let addrs = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
+                        self.store_ips(host, ips, Some(ttl)).await;
+                        return Ok(self.order_addresses(addrs));
                     }
                     Err(e) => {
                         debug!("Nameserver {} failed for {}: {}", ns, host, e);
@@ -635,7 +696,7 @@ impl DnsResolver {
 
         match lookup_result {
             Ok(addrs) => {
-                let addrs: Vec<SocketAddr> = addrs.collect();
+                let addrs = self.order_addresses(addrs.collect());
 
                 if addrs.is_empty() {
                     self.store_failure(host).await;
@@ -644,7 +705,7 @@ impl DnsResolver {
 
                 let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
                 self.store_ips(host, ips, None).await;
-                Ok(self.order_addresses(addrs))
+                Ok(addrs)
             }
             Err(e) => {
                 warn!("DNS lookup failed for {}: {}", host, e);
@@ -796,15 +857,12 @@ impl DnsResolver {
         });
     }
 
-    /// Order addresses based on preferences (IPv4 first if preferred)
+    /// Order usable addresses by the configured address-family preference.
     fn order_addresses(&self, mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
-        if self.prefer_ipv4 {
-            // Sort: IPv4 first, then IPv6
-            addrs.sort_by(|a, b| match (a.ip(), b.ip()) {
-                (IpAddr::V4(_), IpAddr::V6(_)) => std::cmp::Ordering::Less,
-                (IpAddr::V6(_), IpAddr::V4(_)) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            });
+        if !self.ipv6_enabled {
+            addrs.retain(SocketAddr::is_ipv4);
+        } else {
+            addrs.sort_by_key(|address| address.is_ipv6() == self.prefer_ipv4);
         }
         addrs
     }
@@ -852,15 +910,29 @@ impl DnsResolver {
 }
 
 // ---------------------------------------------------------------------------
-// Lightweight UDP DNS client (A-record only)
+// Lightweight UDP DNS client
 // ---------------------------------------------------------------------------
 
-/// Send a DNS A query via UDP to a specific nameserver and parse the response.
-/// Returns the resolved IPv4 addresses and the minimum TTL from the A records.
+fn merge_address_answers(
+    ipv4: anyhow::Result<(Vec<IpAddr>, u32)>,
+    ipv6: anyhow::Result<(Vec<IpAddr>, u32)>,
+) -> anyhow::Result<(Vec<IpAddr>, u32)> {
+    match (ipv4, ipv6) {
+        (Ok((mut ips, ttl)), Ok((v6, ttl6))) => {
+            ips.extend(v6);
+            Ok((ips, ttl.min(ttl6)))
+        }
+        (Ok(result), Err(_)) | (Err(_), Ok(result)) => Ok(result),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
+/// Resolve A or AAAA over UDP and retain the response's TTL.
 /// Retries up to 2 times on timeout to handle brief packet loss on congested networks.
 async fn query_nameserver_udp(
     nameserver: SocketAddr,
     domain: &str,
+    record_type: u16,
 ) -> anyhow::Result<(Vec<IpAddr>, u32)> {
     const MAX_RETRIES: usize = 2;
     const TIMEOUT_SECS: u64 = 3;
@@ -873,9 +945,12 @@ async fn query_nameserver_udp(
             tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
         }
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let bind = if nameserver.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let socket = UdpSocket::bind(bind).await?;
         let txid = DNS_TXID.fetch_add(1, Ordering::Relaxed);
-        let query = build_dns_query_packet(domain, txid);
+        let mut query = build_dns_query_packet(domain, txid);
+        let offset = query.len() - 4;
+        query[offset..offset + 2].copy_from_slice(&record_type.to_be_bytes());
 
         if let Err(e) = socket.send_to(&query, nameserver).await {
             last_error = Some(format!("send failed: {}", e));
@@ -891,7 +966,7 @@ async fn query_nameserver_udp(
         {
             Ok(Ok((len, _))) => {
                 let response = &buf[..len];
-                return parse_dns_a_response(response, txid);
+                return parse_dns_address_response(response, txid, record_type);
             }
             Ok(Err(e)) => last_error = Some(format!("recv error: {}", e)),
             Err(_) => last_error = Some(format!("timeout ({}s)", TIMEOUT_SECS)),
@@ -1283,5 +1358,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn udp_lookup_prefers_ipv6_and_keeps_ipv4() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = DnsResolver::new(true, 300, 1000, true, false, vec![upstream.local_addr().unwrap()]);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut buf = [0u8; 512];
+                let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
+                let record_type = buf[len - 3];
+                let address: &[u8] = if record_type == 1 {
+                    &[192, 0, 2, 1]
+                } else {
+                    assert_eq!(record_type, 28);
+                    &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+                };
+                let mut answer = buf[..len].to_vec();
+                answer[2] |= 0x80;
+                answer[7] = 1;
+                answer.extend_from_slice(&[0xc0, 0x0c, 0, record_type, 0, 1, 0, 0, 0, 60]);
+                answer.extend_from_slice(&(address.len() as u16).to_be_bytes());
+                answer.extend_from_slice(address);
+                upstream.send_to(&answer, peer).await.unwrap();
+            }
+        });
+        let addresses = resolver.resolve("dual-stack.example", 443).await.unwrap();
+        assert_eq!(addresses, ["[2001:db8::1]:443".parse().unwrap(), "192.0.2.1:443".parse().unwrap()]);
+        assert_eq!(resolver.resolve("dual-stack.example", 443).await.unwrap(), addresses);
+        server.await.unwrap();
     }
 }

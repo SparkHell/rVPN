@@ -52,8 +52,11 @@ fn xml(value: &str) -> String {
 
 #[cfg(any(target_os = "linux", test))]
 fn unit(exe: &str, config: &str, cwd: &str) -> String {
-    format!("[Unit]\nDescription=R-VPN Client\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} --config {}\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n",
-        systemd_quote(cwd), systemd_quote(exe).replace('$', "$$"), systemd_quote(config).replace('$', "$$"))
+    // WorkingDirectory consumes an unquoted path. A trailing slash keeps
+    // trailing whitespace or a backslash in the directory name literal.
+    let cwd = cwd.trim_end_matches('/').replace('%', "%%");
+    format!("[Unit]\nDescription=R-VPN Client\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory={cwd}/\nExecStart={} --config {}\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n",
+        systemd_quote(exe).replace('$', "$$"), systemd_quote(config).replace('$', "$$"))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -327,11 +330,12 @@ pub mod windows {
             args.command = None;
             tokio::runtime::Runtime::new()?.block_on(crate::async_main(args))
         })();
+        let success = result.as_ref().is_ok_and(|code| *code == std::process::ExitCode::SUCCESS);
         handle.set_service_status(status(
             ServiceState::Stopped,
-            ServiceExitCode::Win32(if result.is_ok() { 0 } else { 1 }),
+            ServiceExitCode::Win32(if success { 0 } else { 1 }),
         ))?;
-        result
+        result.map(|_| ())
     }
 }
 
@@ -362,8 +366,10 @@ mod tests {
 
     #[test]
     fn service_definitions_escape_paths() {
-        let text = unit("/opt/my vpn/rvpn", "/tmp/a%$\".toml", "/opt/my vpn");
+        let text = unit("/opt/my vpn/rvpn", "/tmp/a%$\".toml", "/opt/my vpn %\\ ");
+        assert!(text.lines().any(|line| line == "WorkingDirectory=/opt/my vpn %%\\ /"));
         assert!(text.contains("ExecStart=\"/opt/my vpn/rvpn\" --config \"/tmp/a%%$$\\\".toml\""));
+        assert!(unit("/bin/rvpn", "/client.toml", "/").lines().any(|line| line == "WorkingDirectory=/"));
         assert!(plist("/a&b", "/c<d", "/e").contains("<string>/a&amp;b</string>"));
     }
 }

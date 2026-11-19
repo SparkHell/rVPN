@@ -616,10 +616,6 @@ pub struct NetworkConfig {
     #[serde(default = "default_true")]
     pub ipv6_enabled: bool,
 
-    /// Prefer IPv4 over IPv6 (when both available)
-    #[serde(default = "default_true")]
-    pub prefer_ipv4: bool,
-
     /// Enable DNS caching
     #[serde(default = "default_true")]
     pub dns_cache_enabled: bool,
@@ -632,11 +628,7 @@ pub struct NetworkConfig {
     #[serde(default = "default_dns_cache_size")]
     pub dns_cache_size: usize,
 
-    /// Custom DNS servers (overrides system default)
-    #[serde(default)]
-    pub dns_servers: Vec<String>,
-
-    /// Require the VPN endpoint to accept TLS Encrypted ClientHello.
+    /// Prefer Encrypted ClientHello, with standard TLS fallback.
     #[serde(default)]
     pub require_ech: bool,
 }
@@ -645,11 +637,9 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             ipv6_enabled: true,
-            prefer_ipv4: true,
             dns_cache_enabled: true,
             dns_cache_ttl: 14400, // 4 hours — client-side cache can be aggressive since A-records rarely change
             dns_cache_size: 1000,
-            dns_servers: vec![],
             require_ech: false,
         }
     }
@@ -751,9 +741,8 @@ fn default_dns_proxy_listen() -> String {
 
 fn default_dns_proxy_nameservers() -> Vec<String> {
     vec![
-        "223.5.5.5:53".to_string(),   // AliDNS (China — fastest for CN users)
-        "1.1.1.1:53".to_string(),     // CloudFlare
-        "8.8.8.8:53".to_string(),     // Google
+        "https://223.6.6.6/dns-query".to_string(),
+        "https://223.5.5.5/dns-query".to_string(),
     ]
 }
 

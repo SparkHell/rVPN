@@ -38,12 +38,14 @@ const WS_CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone)]
 struct EndpointDns {
     resolver: Option<std::sync::Arc<crate::dns_cache::DnsResolver>>,
+    ech_resolver: Option<std::sync::Arc<crate::dns_cache::DnsResolver>>,
     require_ech: bool,
 }
 
 #[cfg(not(target_os = "android"))]
 static ENDPOINT_DNS: std::sync::RwLock<EndpointDns> = std::sync::RwLock::new(EndpointDns {
     resolver: None,
+    ech_resolver: None,
     require_ech: false,
 });
 
@@ -56,33 +58,42 @@ fn endpoint_dns() -> EndpointDns {
 }
 
 #[cfg(not(target_os = "android"))]
+fn doh_nameservers(servers: &[String]) -> Vec<String> {
+    servers.iter().filter(|server| {
+        server.split_once("://").is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+    }).cloned().collect()
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn configure_endpoint_dns(client_config: &crate::config::ClientConfig) -> Result<()> {
     let config = &client_config.network;
-    let nameservers = if config.dns_servers.is_empty() {
-        &client_config.dns_proxy.nameservers
-    } else {
-        &config.dns_servers
-    };
-    anyhow::ensure!(
-        !config.require_ech
-            || (!nameservers.is_empty() && nameservers.iter().all(|ns| ns.starts_with("https://"))),
-        "network.require_ech requires an HTTPS-only DNS upstream list"
-    );
-    let resolver = if nameservers.iter().any(|ns| ns.contains("://")) {
-        let resolver = crate::dns_cache::DnsResolver::new(
+    let nameservers = &client_config.dns_proxy.nameservers;
+    let build_resolver = |servers: &[String]| {
+        crate::dns_cache::DnsResolver::new(
             config.dns_cache_enabled,
             config.dns_cache_ttl,
             config.dns_cache_size,
             config.ipv6_enabled,
-            config.prefer_ipv4,
+            false, // Prefer IPv6 when enabled.
             vec![],
-        ).with_nameservers(nameservers)?;
-        Some(std::sync::Arc::new(resolver))
+        ).with_nameservers(servers).map(std::sync::Arc::new)
+    };
+    let resolver = build_resolver(nameservers)?;
+    let ech_resolver = if config.require_ech {
+        let servers = doh_nameservers(nameservers);
+        if servers.is_empty() {
+            None
+        } else if servers.len() == nameservers.len() {
+            Some(resolver.clone())
+        } else {
+            Some(build_resolver(&servers)?)
+        }
     } else {
         None
     };
     *ENDPOINT_DNS.write().unwrap_or_else(|e| e.into_inner()) = EndpointDns {
-        resolver,
+        resolver: Some(resolver),
+        ech_resolver,
         require_ech: config.require_ech,
     };
     Ok(())
@@ -115,12 +126,34 @@ where
 /// Direct connections use the configured DoH resolver too, avoiding a second
 /// hostname lookup by the OS after a split-tunnel decision.
 #[cfg(not(target_os = "android"))]
-pub async fn connect_direct_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream> {
+pub async fn connect_direct_tcp(
+    host: &str,
+    port: u16,
+    addresses: &[std::net::IpAddr],
+) -> Result<tokio::net::TcpStream> {
+    if !addresses.is_empty() {
+        let targets: Vec<_> = addresses.iter().map(|ip| std::net::SocketAddr::new(*ip, port)).collect();
+        return Ok(tokio::net::TcpStream::connect(targets.as_slice()).await?);
+    }
     if let Some(resolver) = endpoint_dns().resolver {
         let addresses = resolver.resolve(host, port).await?;
         Ok(tokio::net::TcpStream::connect(addresses.as_slice()).await?)
     } else {
         Ok(tokio::net::TcpStream::connect((host, port)).await?)
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+async fn with_ech_fallback<T>(
+    ech: impl std::future::Future<Output = Result<T>>,
+    ordinary_tls: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match ech.await {
+        Ok(connection) => Ok(connection),
+        Err(error) => {
+            tracing::warn!("ECH unavailable; retrying with standard TLS: {error:#}");
+            ordinary_tls.await
+        }
     }
 }
 
@@ -222,41 +255,30 @@ pub async fn connect_websocket(
     let limit = Duration::from_secs(10);
     let origin = host.trim_end_matches('.');
     let sni = sni_hostname.unwrap_or(host).trim_end_matches('.');
-    let (target, target_port, ech_config) = if dns.require_ech {
-        anyhow::ensure!(
-            sni.eq_ignore_ascii_case(origin),
-            "Required ECH uses the endpoint hostname as SNI"
-        );
-        let resolver = dns
-            .resolver
-            .as_ref()
-            .context("ECH requires configured DoH")?;
-        let (target, port, config) =
-            connect_stage("dns_https", limit, resolver.resolve_ech(host, port)).await?;
-        (target, port, Some(config))
-    } else {
-        (host.to_owned(), port, None)
+    let ordinary_tls = async {
+        let addresses = connect_stage("dns_address", limit, async {
+            let target = origin.trim_matches(['[', ']']);
+            if let Some(resolver) = &dns.resolver {
+                resolver.resolve(target, port).await
+            } else {
+                Ok(tokio::net::lookup_host((target, port)).await?.collect())
+            }
+        }).await?;
+        dial_tls(&addresses, fingerprint, sni, resumption, None).await
     };
-
-    let addresses = connect_stage("dns_address", limit, async {
-        let target = target.trim_matches(['[', ']']);
-        if let Some(resolver) = &dns.resolver {
-            resolver.resolve(target, target_port).await
-        } else {
-            Ok(tokio::net::lookup_host((target, target_port))
-                .await?
-                .collect())
-        }
-    })
-    .await?;
-    let tls_stream = dial_tls(
-        &addresses,
-        fingerprint,
-        sni,
-        resumption,
-        ech_config.as_deref(),
-    )
-    .await?;
+    let tls_stream = if dns.require_ech {
+        let ech = async {
+            anyhow::ensure!(sni.eq_ignore_ascii_case(origin), "ECH uses the endpoint hostname as SNI");
+            let resolver = dns.ech_resolver.as_ref().context("No DoH upstream configured for ECH")?;
+            let (target, target_port, config) =
+                connect_stage("dns_https", limit, resolver.resolve_ech(origin, port)).await?;
+            let addresses = connect_stage("dns_address", limit, resolver.resolve(&target, target_port)).await?;
+            dial_tls(&addresses, fingerprint, sni, resumption, Some(&config)).await
+        };
+        with_ech_fallback(ech, ordinary_tls).await?
+    } else {
+        ordinary_tls.await?
+    };
 
     // Build Chrome-like WebSocket upgrade request with 15 headers.
     // Real Chrome 131 sends these on WebSocket upgrade — matching this profile makes
@@ -499,6 +521,31 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn ech_uses_only_doh_from_the_shared_list() {
+        let doh = "https://resolver.example/dns-query";
+        let udp = "223.5.5.5:53";
+        assert_eq!(doh_nameservers(&[udp.into(), doh.into()]), [doh]);
+        assert!(doh_nameservers(&[udp.into()]).is_empty());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn ech_falls_back_to_tls_when_lookup_or_handshake_fails() {
+        for reason in ["missing HTTPS record", "ECH handshake rejected"] {
+            let connection = with_ech_fallback(async { anyhow::bail!(reason) }, async { Ok("TLS") }).await;
+            assert_eq!(connection.unwrap(), "TLS");
+        }
+        let connection = with_ech_fallback(async { Ok("ECH") }, async { panic!("ECH already succeeded") }).await;
+        assert_eq!(connection.unwrap(), "ECH");
+        let error = with_ech_fallback::<()>(
+            async { anyhow::bail!("missing HTTPS record") },
+            async { anyhow::bail!("ordinary TLS certificate rejected") },
+        ).await.unwrap_err();
+        assert_eq!(error.to_string(), "ordinary TLS certificate rejected");
+    }
 
     #[cfg(not(target_os = "android"))]
     #[tokio::test]

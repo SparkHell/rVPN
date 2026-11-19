@@ -93,6 +93,8 @@ pub struct DnsProxy {
     /// with any trailing dot stripped. Queries for these are always resolved
     /// locally — see the dispatch loop for why.
     server_hosts: Arc<Vec<String>>,
+    /// DoH endpoints whose system DNS lookups may come back to this proxy.
+    doh_hosts: Arc<Vec<String>>,
     /// TLS session resumption store for this proxy's server. Held for the
     /// proxy's lifetime so each WebSocket reconnect (`run_ws_manager` backoff
     /// loop) resumes the cached TLS 1.3 ticket instead of a full handshake.
@@ -114,6 +116,7 @@ impl DnsProxy {
         dns_resolver: Arc<DnsResolver>,
         nameservers: rvpn_split_tunnel::dns_cache::DnsUpstreams,
         extra_server_hosts: Vec<String>,
+        doh_hosts: Vec<String>,
     ) -> Self {
         // Derive DNS path from base WebSocket path, stripping any mux/tun suffix
         let base_path = server_path.trim_end_matches('/');
@@ -144,6 +147,7 @@ impl DnsProxy {
             dns_resolver,
             nameservers,
             server_hosts: Arc::new(server_hosts),
+            doh_hosts: Arc::new(doh_hosts),
             resumption: ResumptionStore::new(),
         }
     }
@@ -158,6 +162,7 @@ impl DnsProxy {
     }
 
     pub(crate) async fn run_with_socket(self: Arc<Self>, socket: UdpSocket) -> Result<()> {
+        let listener = socket.local_addr()?;
         let socket = Arc::new(socket);
 
         info!("DNS proxy listening on {}", self.listen_addr);
@@ -185,6 +190,7 @@ impl DnsProxy {
             let dns_resolver_clone = Arc::clone(&self.dns_resolver);
             let nameservers_clone = self.nameservers.clone();
             let server_hosts_clone = Arc::clone(&self.server_hosts);
+            let doh_hosts = Arc::clone(&self.doh_hosts);
             tokio::spawn(async move {
                 match parse_dns_query(&data) {
                     Ok((dns_txid, domain, qtype)) => {
@@ -198,24 +204,26 @@ impl DnsProxy {
                         // queries wait for the tunnel while the tunnel waits
                         // for DNS, and the client never recovers. Resolve them
                         // locally via the same path as bypass domains.
-                        let is_server_host = {
-                            let q = domain.trim_end_matches('.').to_ascii_lowercase();
-                            server_hosts_clone.iter().any(|h| *h == q)
-                        };
-                        let decision = if is_server_host {
-                            debug!("DNS proxy: {} is a VPN server host, resolving locally", domain);
-                            RoutingDecision::Bypass
+                        let host = domain.trim_end_matches('.');
+                        let is_doh_host = doh_hosts.iter().any(|name| name.eq_ignore_ascii_case(host));
+                        let is_server_host = server_hosts_clone.iter().any(|name| name.eq_ignore_ascii_case(host));
+                        let (decision, gfwlist) = if is_doh_host || is_server_host {
+                            (RoutingDecision::Bypass, false)
                         } else {
-                            split_tunnel_clone.decide_by_host(&domain).await
+                            split_tunnel_clone.decide_dns(&domain).await
                         };
 
-                        let wire = match decision {
+                        let mut cache_hit = false;
+                        let wire = 'answer: { match decision {
                             RoutingDecision::Bypass => {
                                 // Resolve locally — bypass domain should not go through tunnel
                                 debug!("DNS proxy: resolving {} locally (bypass)", domain);
-                                let wire = match resolve_locally(
-                                    &data, &nameservers_clone
-                                ).await {
+                                let result = if is_doh_host {
+                                    nameservers_clone.query_bootstrap(&data, listener).await
+                                } else {
+                                    resolve_locally(&data, &nameservers_clone).await
+                                };
+                                let wire = match result {
                                     Ok(wire) => {
                                         // Parse and cache successful bypass responses
                                         if let Ok((ips, ttl_secs)) = crate::dns_cache::parse_dns_a_response(&wire, dns_txid) {
@@ -229,21 +237,11 @@ impl DnsProxy {
                                         build_dns_servfail(&data, dns_txid)
                                     }
                                 };
-                                crate::dashboard::record_dns(
-                                    crate::dashboard::DnsDecision::Bypass,
-                                    false,
-                                    query_start.elapsed(),
-                                );
                                 wire
                             }
                             RoutingDecision::Block => {
                                 // Return NXDOMAIN — treat blocked ad/tracker as non-existent
                                 debug!("DNS proxy: blocking {} (ad/tracker)", domain);
-                                crate::dashboard::record_dns(
-                                    crate::dashboard::DnsDecision::Block,
-                                    false,
-                                    query_start.elapsed(),
-                                );
                                 build_dns_nxdomain(&data, dns_txid)
                             }
                             RoutingDecision::Tunnel => {
@@ -266,11 +264,6 @@ impl DnsProxy {
                                             build_dns_servfail(&data, dns_txid)
                                         }
                                     };
-                                    crate::dashboard::record_dns(
-                                        crate::dashboard::DnsDecision::Bypass,
-                                        false,
-                                        query_start.elapsed(),
-                                    );
                                     wire
                                 } else {
 
@@ -290,10 +283,7 @@ impl DnsProxy {
                                         error: None,
                                     };
                                     let wire = build_dns_response(&data, dns_txid, &response);
-                                    if let Err(e) = socket_clone.send_to(&wire, src).await {
-                                        debug!("DNS proxy: failed to send AAAA NODATA to {}: {}", src, e);
-                                    }
-                                    return;
+                                    break 'answer wire;
                                 }
 
                                 // Check local cache before forwarding through tunnel.
@@ -320,15 +310,8 @@ impl DnsProxy {
                                             error: None,
                                         };
                                         let wire = build_dns_response(&data, dns_txid, &response);
-                                        crate::dashboard::record_dns(
-                                            crate::dashboard::DnsDecision::Tunnel,
-                                            true,
-                                            query_start.elapsed(),
-                                        );
-                                        if let Err(e) = socket_clone.send_to(&wire, src).await {
-                                            debug!("DNS proxy: failed to send cached response to {}: {}", src, e);
-                                        }
-                                        return;
+                                        cache_hit = true;
+                                        break 'answer wire;
                                     }
                                 }
 
@@ -352,16 +335,17 @@ impl DnsProxy {
                                     Ok(Ok(Some(r))) if r.success => build_dns_response(&data, dns_txid, &r),
                                     _ => build_dns_servfail(&data, dns_txid),
                                 };
-                                crate::dashboard::record_dns(
-                                    crate::dashboard::DnsDecision::Tunnel,
-                                    false,
-                                    query_start.elapsed(),
-                                );
                                 wire
                                 }
                             }
+                        }};
+                        use crate::dashboard::DnsDecision;
+                        let route = match decision {
+                            RoutingDecision::Block => DnsDecision::Block,
+                            RoutingDecision::Tunnel if qtype == 1 => DnsDecision::Tunnel,
+                            _ => DnsDecision::Bypass,
                         };
-
+                        crate::dashboard::record_dns_answer(&domain, qtype, route, cache_hit, gfwlist, query_start.elapsed(), &wire);
                         if let Err(e) = socket_clone.send_to(&wire, src).await {
                             debug!("DNS proxy: failed to send response to {}: {}", src, e);
                         }

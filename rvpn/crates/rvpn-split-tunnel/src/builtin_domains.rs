@@ -701,7 +701,9 @@ pub fn get_china_domains() -> &'static HashSet<&'static str> {
 pub fn get_ad_domains() -> &'static HashSet<&'static str> {
     static DOMAINS: OnceLock<HashSet<&str>> = OnceLock::new();
     DOMAINS.get_or_init(|| {
-        AD_DOMAINS.iter().copied().collect()
+        AD_DOMAINS.iter().copied()
+            .chain(include_str!("../data/ad-domains.txt").lines().filter(|line| !line.is_empty() && !line.starts_with('#')))
+            .collect()
     })
 }
 

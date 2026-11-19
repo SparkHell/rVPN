@@ -2,7 +2,7 @@
 //! access or additional settings.
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct Rules {
     pub proxy: HashSet<String>,
     pub exceptions: HashSet<String>,

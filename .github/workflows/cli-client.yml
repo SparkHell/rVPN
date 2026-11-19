@@ -196,6 +196,7 @@ jobs:
         run: |
           Copy-Item -LiteralPath ../config/client.toml.example -Destination target/release/client.toml.example
           Copy-Item -LiteralPath ../config/server.toml.example -Destination target/release/server.toml.example
+          Copy-Item -LiteralPath crates/rvpn-split-tunnel/data -Destination target/release/rules -Recurse -Force
 
       - name: Upload Windows client
         uses: actions/upload-artifact@v7
@@ -205,6 +206,7 @@ jobs:
             rvpn/target/release/rvpn.exe
             rvpn/target/release/rvpn.exe.sha256
             rvpn/target/release/client.toml.example
+            rvpn/target/release/rules/
           if-no-files-found: error
           compression-level: 0
 
@@ -352,6 +354,8 @@ jobs:
         run: |
           cp ../config/client.toml.example target/release/client.toml.example
           cp ../config/server.toml.example target/release/server.toml.example
+          mkdir -p target/release/rules
+          cp -R crates/rvpn-split-tunnel/data/. target/release/rules/
 
       - name: Upload client
         uses: actions/upload-artifact@v7
@@ -361,6 +365,7 @@ jobs:
             rvpn/target/release/rvpn
             rvpn/target/release/rvpn.sha256
             rvpn/target/release/client.toml.example
+            rvpn/target/release/rules/
           if-no-files-found: error
           compression-level: 0
 
@@ -398,12 +403,6 @@ jobs:
           pattern: rvpn-*
           path: downloads
 
-      - name: Download the same rules embedded in the binaries
-        uses: actions/download-artifact@v7
-        with:
-          name: routing-rules
-          path: generated-rules
-
       - name: Package release assets
         shell: bash
         run: |
@@ -426,7 +425,7 @@ jobs:
               binary="${binary}.exe"
               (cd "$dir" && sha256sum -c "${binary}.sha256")
               if [[ "$name" == rvpn-client-* ]]; then
-                cp -R generated-rules "$dir/rules"
+                [[ -s "$dir/rules/filter_1.txt" && -s "$dir/rules/filter_2.txt" && -s "$dir/rules/gfwlist.txt" ]]
                 (cd "$dir" && zip -q -r "${GITHUB_WORKSPACE}/dist/${name}.zip" "$binary" "${binary}.sha256" "$config" rules)
               else
                 (cd "$dir" && zip -q -j "${GITHUB_WORKSPACE}/dist/${name}.zip" "$binary" "${binary}.sha256" "$config")
@@ -435,7 +434,7 @@ jobs:
               (cd "$dir" && sha256sum -c "${binary}.sha256")
               chmod +x "$dir/$binary"
               if [[ "$name" == rvpn-client-* ]]; then
-                cp -R generated-rules "$dir/rules"
+                [[ -s "$dir/rules/filter_1.txt" && -s "$dir/rules/filter_2.txt" && -s "$dir/rules/gfwlist.txt" ]]
                 tar -czf "dist/${name}.tar.gz" -C "$dir" "$binary" "${binary}.sha256" "$config" rules
               else
                 tar -czf "dist/${name}.tar.gz" -C "$dir" "$binary" "${binary}.sha256" "$config"

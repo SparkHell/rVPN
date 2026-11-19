@@ -2820,6 +2820,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "hickory-proto",
  "ip_network",
  "ip_network_table",
  "lazy_static",
@@ -2993,11 +2994,13 @@ name = "rvpn-split-tunnel"
 version = "1.3.6"
 dependencies = [
  "anyhow",
+ "base64 0.21.7",
  "ip_network",
  "ip_network_table",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

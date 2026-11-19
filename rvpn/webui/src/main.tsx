@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useState } from 'react'
+import React, { useEffect, useId, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   Activity,
@@ -40,6 +40,8 @@ import {
 } from './model'
 import type { Config, Session, Stats } from './model'
 import { useControl } from './useControl'
+import { prepareRuleImport } from './ruleImport'
+import type { RouteAction, RuleFormat } from './ruleImport'
 import './style.css'
 
 const icons = {
@@ -52,30 +54,127 @@ const icons = {
   settings: Settings2,
 }
 
+const hiddenNetworkFields = new Set([
+  'dns_cache_ttl',
+  'dns_servers',
+  'prefer_ipv4',
+])
+
+const fieldOrder: Record<string, string[]> = {
+  dns_proxy: ['enabled', 'listen_address', 'nameservers'],
+  network: [
+    'dns_cache_enabled',
+    'dns_cache_size',
+    'ipv6_enabled',
+    'require_ech',
+  ],
+  socks5: [
+    'listen_address',
+    'auth_enabled',
+    'auth_username',
+    'auth_password',
+    'udp_associate',
+    'mode',
+    'multiplex',
+    'mux_path',
+  ],
+  http_proxy: [
+    'enabled',
+    'listen_address',
+    'auth_enabled',
+    'auth_username',
+    'auth_password',
+    'multiplex',
+    'mux_path',
+  ],
+  logging: ['file_enabled', 'directory', 'max_files', 'level'],
+  dashboard: ['enabled', 'listen_address', 'allow_cidrs'],
+  split_tunnel: ['enabled', 'blockAds', 'adBlockFile', 'gfwlistEnabled'],
+  tun: ['enabled', 'interface_name', 'mtu', 'routes', 'dns_servers'],
+}
+
+function fieldRank(section: string, name: string) {
+  const index = fieldOrder[section]?.indexOf(name) ?? -1
+  return index < 0 ? Infinity : index
+}
+
+function fieldDisabled(section: string, name: string, settings: Config) {
+  if (name === 'enabled') return false
+  if (
+    settings.enabled === false &&
+    !(section === 'dns_proxy' && name === 'nameservers')
+  )
+    return true
+  if (name === 'auth_username' || name === 'auth_password')
+    return settings.auth_enabled === false
+  if (name === 'dns_cache_size') return settings.dns_cache_enabled === false
+  if (section === 'logging' && ['directory', 'max_files'].includes(name))
+    return settings.file_enabled === false
+  if (section === 'split_tunnel' && name === 'adBlockFile')
+    return settings.blockAds === false
+  if (section === 'socks5') {
+    if (name === 'multiplex') return Boolean(settings.mode)
+    if (
+      [
+        'pool_size',
+        'pool_max',
+        'max_flows_per_conn',
+        'rotate_after_secs',
+        'rotate_after_mb',
+        'rotation_jitter',
+      ].includes(name)
+    )
+      return settings.mode !== 'pooled'
+  }
+  if (section === 'socks5' && name === 'mux_path')
+    return (
+      (settings.mode || (settings.multiplex ? 'multiplex' : 'legacy')) ===
+      'legacy'
+    )
+  return false
+}
+
 function Field({
   name,
   value,
   onChange,
+  disabled = false,
+  section,
 }: {
+  disabled?: boolean
+  section?: string
   name: string
   value: unknown
   onChange: (value: unknown) => void
 }) {
   const id = useId()
-  const caption = labels[name] || name
+  const caption =
+    name === 'enabled' && section
+      ? '启用' +
+        (/^[A-Z]/.test(labels[section] || '') ? ' ' : '') +
+        (labels[section] || section)
+      : labels[name] || name
+  const switchHint = hints[name]
   if (typeof value === 'boolean')
     return (
-      <div className="field switch-field">
+      <div className="field switch-field" data-disabled={disabled || undefined}>
         <label htmlFor={id}>
           <strong>{caption}</strong>
-          <span>{name}</span>
+
+          {switchHint && (
+            <small className="field-hint" id={`${id}-hint`}>
+              {switchHint}
+            </small>
+          )}
         </label>
         <button
           id={id}
+          disabled={disabled}
           type="button"
           role="switch"
           aria-label={caption}
           aria-checked={value}
+          aria-describedby={switchHint ? `${id}-hint` : undefined}
           className={`switch ${value ? 'on' : ''}`}
           onClick={() => onChange(!value)}
         >
@@ -85,7 +184,7 @@ function Field({
     )
   if (value && typeof value === 'object' && !Array.isArray(value))
     return (
-      <fieldset className="nested">
+      <fieldset className="nested" disabled={disabled}>
         <legend>{caption}</legend>
         <div className="fields">
           {Object.entries(value).map(([key, v]) => (
@@ -121,7 +220,10 @@ function Field({
     ].includes(name)
   const list = Array.isArray(value)
   return (
-    <div className={`field ${list ? 'wide' : ''}`}>
+    <div
+      className={`field ${list || name === 'listen_address' ? 'wide' : ''}`}
+      data-disabled={disabled || undefined}
+    >
       <label htmlFor={id}>
         {caption}
         <small>{name}</small>
@@ -129,6 +231,7 @@ function Field({
       {options[name] ? (
         <select
           id={id}
+          disabled={disabled}
           value={String(value ?? '')}
           onChange={(e) => onChange(e.target.value || null)}
         >
@@ -141,6 +244,7 @@ function Field({
       ) : list ? (
         <textarea
           id={id}
+          disabled={disabled}
           rows={Math.min(6, Math.max(3, value.length + 1))}
           placeholder="每行一条"
           value={value.join('\n')}
@@ -149,6 +253,7 @@ function Field({
       ) : (
         <input
           id={id}
+          disabled={disabled}
           type={
             typeof value === 'number'
               ? 'number'
@@ -612,8 +717,8 @@ function Overview({
               </div>
             ))}
           </div>
-          <button className="text-link" onClick={() => navigate('dns')}>
-            管理 DNS 上游
+          <button className="text-link" onClick={() => navigate('split')}>
+            查看分流规则与查询统计
             <ArrowUpRight size={14} />
           </button>
         </section>
@@ -643,6 +748,194 @@ function Overview({
   )
 }
 
+function RouteInspection({
+  request,
+  connected,
+}: {
+  request: (
+    method: string,
+    payload: Record<string, unknown>,
+  ) => Promise<unknown>
+  connected: boolean
+}) {
+  const [target, setTarget] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [result, setResult] = useState<{
+    target: string
+    connection: string
+    reason: string
+    dnsReason?: string
+    dnsEnabled?: boolean
+    a?: string
+    aaaa?: string
+    other?: string
+    addresses?: string[]
+  }>()
+  return (
+    <section className="panel config-panel route-inspection">
+      <div className="panel-heading">
+        <div>
+          <h2>检查分流路径</h2>
+          <p>
+            使用已应用的配置检查连接和 DNS 路径。修改规则后，请先保存再检查。
+          </p>
+        </div>
+      </div>
+      <form
+        className="add-rule rule-actions"
+        onSubmit={async (event) => {
+          event.preventDefault()
+          if (busy || !target.trim()) return
+          setBusy(true)
+          setError('')
+          setResult(undefined)
+          try {
+            setResult(
+              (await request('rules.inspect', {
+                target: target.trim(),
+              })) as typeof result,
+            )
+          } catch (error) {
+            setError((error as Error).message)
+          } finally {
+            setBusy(false)
+          }
+        }}
+      >
+        <input
+          aria-label="待检查的域名或 IP"
+          placeholder="example.com 或 1.1.1.1"
+          value={target}
+          onChange={(event) => setTarget(event.target.value)}
+          required
+        />
+        <button
+          className="button tertiary"
+          disabled={busy || !connected || !target.trim()}
+        >
+          {busy ? '检查中…' : '检查路径'}
+        </button>
+      </form>
+      {error && <p role="alert">{error}</p>}
+      {result && (
+        <dl aria-live="polite">
+          <dt>目标</dt>
+          <dd>{result.target}</dd>
+          <dt>代理连接</dt>
+          <dd>{result.connection}</dd>
+          <dt>连接判定</dt>
+          <dd>{result.reason}</dd>
+          {result.a &&
+            (result.dnsEnabled ? (
+              <>
+                <dt>DNS 判定</dt>
+                <dd>{result.dnsReason}</dd>
+                <dt>IPv4 查询（A）</dt>
+                <dd>{result.a}</dd>
+                <dt>IPv6 查询（AAAA）</dt>
+                <dd>{result.aaaa}</dd>
+                <dt>其他 DNS 记录</dt>
+                <dd>{result.other}</dd>
+                {!!result.addresses?.length && (
+                  <>
+                    <dt>本地解析地址</dt>
+                    <dd>{result.addresses.join('、')}</dd>
+                  </>
+                )}
+              </>
+            ) : (
+              <>
+                <dt>DNS 代理</dt>
+                <dd>已关闭</dd>
+              </>
+            ))}
+        </dl>
+      )}
+    </section>
+  )
+}
+
+function DnsActivity({ stats }: { stats: Stats | null | undefined }) {
+  const counters = stats?.counters || {}
+  const total =
+    (counters.dns_tunnel || 0) +
+    (counters.dns_bypass || 0) +
+    (counters.dns_block || 0)
+  const metrics = [
+    ['缓存命中', counters.dns_cache_hits || 0],
+    ['广告拦截', counters.dns_block || 0],
+    ['GFWList 命中', counters.dns_gfwlist || 0],
+  ] as const
+  return (
+    <section className="panel config-panel dns-activity">
+      <div className="panel-heading">
+        <div>
+          <h2>DNS 查询统计</h2>
+          <p>
+            本次运行累计 {total} 次查询，各项占比以已完成的 DNS 查询为基数。
+          </p>
+        </div>
+      </div>
+      <div className="dns-metrics">
+        {metrics.map(([label, count]) => (
+          <div key={label}>
+            <strong>{label}</strong>
+            <span>
+              {count} 次 · {total ? ((100 * count) / total).toFixed(1) : '0'}%
+            </span>
+            <progress
+              aria-label={label}
+              value={count}
+              max={Math.max(total, 1)}
+            />
+          </div>
+        ))}
+      </div>
+      <h3>最近解析</h3>
+      {stats?.recent_dns?.length ? (
+        <div className="dns-query-scroll">
+          <table>
+            <thead>
+              <tr>
+                {['时间', '域名', '类型', '处理方式', '解析结果', '耗时'].map(
+                  (h) => (
+                    <th key={h}>{h}</th>
+                  ),
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {stats.recent_dns.map((r, index) => (
+                <tr key={index}>
+                  <td>{new Date(r.time * 1000).toLocaleTimeString()}</td>
+                  <td>{r.domain}</td>
+                  <td>{r.type}</td>
+                  <td>
+                    {[r.route, r.cached && '缓存', r.gfwlist && 'GFWList']
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </td>
+                  <td>
+                    {r.answers.length
+                      ? r.answers.join('、')
+                      : r.rcode === 'NoError'
+                        ? '无记录'
+                        : r.rcode}
+                  </td>
+                  <td>{r.ms} ms</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p>等待本地 DNS 代理接收查询。</p>
+      )}
+    </section>
+  )
+}
+
 function App() {
   const {
     connected,
@@ -654,6 +947,14 @@ function App() {
     pause,
     pausedReason,
   } = useControl()
+  const ruleFile = useRef<HTMLInputElement>(null)
+  const [pendingImport, setPendingImport] = useState<ReturnType<
+    typeof prepareRuleImport
+  > | null>(null)
+  const [importChoices, setImportChoices] = useState(
+    new Map<string, RouteAction>(),
+  )
+
   const [page, setPage] = useState('overview')
   const [draft, setDraft] = useState<Config | null>(null)
   const [base, setBase] = useState<Session | null>(null)
@@ -691,6 +992,65 @@ function App() {
     setSearch('')
     setMobile(false)
     setNotice(null)
+  }
+  async function updateRules(source: 'adguard' | 'gfwlist') {
+    setBusy(true)
+    const name = source === 'adguard' ? 'AdGuard' : 'GFWList'
+    setNotice({ text: `正在下载 ${name} 规则…` })
+    try {
+      const result = (await request('rules.update', { source })) as {
+        domains: number
+      }
+      setNotice({ text: `${name} 更新完成，共 ${result.domains} 条域名规则。` })
+    } catch (error) {
+      setNotice({
+        text: `${name} 更新失败：${(error as Error).message}`,
+        error: true,
+      })
+    } finally {
+      setBusy(false)
+    }
+  }
+  function applyRuleImport(
+    prepared: ReturnType<typeof prepareRuleImport>,
+    choices?: ReadonlyMap<string, RouteAction>,
+  ) {
+    if (!draft) return
+    const summary = prepared.merge(draft.split_tunnel as Config, choices)
+    setDraft(
+      setPath(draft, ['split_tunnel'], {
+        ...(draft.split_tunnel as Config),
+        ...summary.rules,
+      }),
+    )
+    setPendingImport(null)
+    setNotice({
+      text: `已导入 ${summary.imported} 条，覆盖 ${summary.replaced} 条反向规则，忽略 ${summary.duplicates} 条重复规则，跳过 ${summary.skipped} 条。检查后点击「保存并应用」。`,
+    })
+  }
+
+  async function importRuleFile(file: File) {
+    try {
+      if (file.size > 1024 * 1024) throw new Error('规则文件不能超过 1 MiB。')
+      const formats: Record<string, RuleFormat> = {
+        ssrl: 'ssrl',
+        pac: 'pac',
+        conf: 'shadowrocket',
+        json: 'v2ray',
+      }
+      const format = formats[file.name.split('.').at(-1)?.toLowerCase() ?? '']
+      if (!format)
+        throw new Error('请选择 PAC、SSRL、小火箭 CONF 或 V2Ray JSON 文件。')
+      const prepared = prepareRuleImport(await file.text(), format)
+      if (prepared.policies.size > 0) {
+        setImportChoices(new Map(prepared.policies))
+        setPendingImport(prepared)
+      } else {
+        applyRuleImport(prepared)
+      }
+    } catch (error) {
+      setNotice({ text: (error as Error).message, error: true })
+    }
   }
   async function reload() {
     setBusy(true)
@@ -871,9 +1231,6 @@ function App() {
         <main>
           <div className="page-heading">
             <div>
-              <div className="eyebrow">
-                RVPN / {page === 'overview' ? 'WORKSPACE' : 'CONFIGURATION'}
-              </div>
               <h2>
                 {page === 'overview'
                   ? '网络概览'
@@ -881,7 +1238,7 @@ function App() {
               </h2>
               <p>
                 {page === 'overview'
-                  ? '让连接清晰可见。'
+                  ? '查看代理状态、流量与连接记录。'
                   : activeSection?.sub || '配置文件中的附加设置'}
               </p>
             </div>
@@ -964,6 +1321,72 @@ function App() {
                 </button>
               </div>
               <div className="config-sections">
+                {page === 'split' && !search && (
+                  <>
+                    <section className="panel config-panel">
+                      <div className="panel-heading">
+                        <div>
+                          <h2>规则订阅</h2>
+                          <p>
+                            AdGuard 命中时拦截，GFWList 命中时连接走
+                            VPN。其余域名先用本地 DNS 上游解析，再按 IP
+                            分流。规则更新立即生效，开关修改需保存。
+                          </p>
+                        </div>
+                      </div>
+                      <div className="fields">
+                        {['enabled', 'blockAds', 'gfwlistEnabled'].map(
+                          (name) => {
+                            const settings = draft.split_tunnel as
+                              Config | undefined
+                            if (
+                              !settings ||
+                              typeof settings[name] !== 'boolean'
+                            )
+                              return null
+                            return (
+                              <Field
+                                key={name}
+                                section="split_tunnel"
+                                name={name}
+                                value={settings[name]}
+                                disabled={fieldDisabled(
+                                  'split_tunnel',
+                                  name,
+                                  settings,
+                                )}
+                                onChange={(value) =>
+                                  setDraft(
+                                    setPath(
+                                      draft,
+                                      ['split_tunnel', name],
+                                      value,
+                                    ),
+                                  )
+                                }
+                              />
+                            )
+                          },
+                        )}
+                      </div>
+                      <div className="rule-actions">
+                        {(['adguard', 'gfwlist'] as const).map((source) => (
+                          <button
+                            key={source}
+                            className="button tertiary"
+                            disabled={busy || !connected}
+                            onClick={() => void updateRules(source)}
+                          >
+                            <RefreshCw size={15} />
+                            更新 {source === 'adguard' ? 'AdGuard' : 'GFWList'}
+                          </button>
+                        ))}
+                      </div>
+                    </section>
+                    <RouteInspection request={request} connected={connected} />
+                  </>
+                )}
+
                 {(page === 'other' ? unknownKeys : keys)
                   .filter((key) => key in draft)
                   .map((key) => {
@@ -979,17 +1402,171 @@ function App() {
                       !Array.isArray(value) &&
                       key !== 'routing'
                     const entries = object
-                      ? Object.entries(value).filter(
-                          ([name]) => filter(key) || filter(name),
-                        )
+                      ? Object.entries(value)
+                          .filter(
+                            ([name]) =>
+                              (key !== 'network' ||
+                                !hiddenNetworkFields.has(name)) &&
+                              (key !== 'split_tunnel' ||
+                                search ||
+                                ![
+                                  'enabled',
+                                  'blockAds',
+                                  'gfwlistEnabled',
+                                ].includes(name)) &&
+                              (filter(key) || filter(name)),
+                          )
+                          .sort(
+                            ([a], [b]) => fieldRank(key, a) - fieldRank(key, b),
+                          )
                       : []
+                    if (key === 'split_tunnel' && !search && object) {
+                      const settings = value as Config
+                      const directFields = [
+                        'bypassDomains',
+                        'tunnelDomains',
+                        'bypassNetworks',
+                        'tunnelNetworks',
+                      ]
+                      const render = ([name, fieldValue]: [
+                        string,
+                        unknown,
+                      ]) => (
+                        <Field
+                          key={name}
+                          name={name}
+                          value={fieldValue}
+                          section={key}
+                          disabled={fieldDisabled(key, name, settings)}
+                          onChange={(next) =>
+                            setDraft(setPath(draft, [key, name], next))
+                          }
+                        />
+                      )
+                      return (
+                        <section className="panel config-panel" key={key}>
+                          <div className="panel-heading rule-import-heading">
+                            <div>
+                              <h2>自定义分流规则</h2>
+                              <p>
+                                每行一条，直接添加、修改或删除。域名匹配包含子域。域名规则优先于
+                                IP 网段，隧道规则优先于同类直连规则。
+                              </p>
+                              <p>
+                                支持 ZeroOmega PAC、SSRL、V2Ray JSON 和小火箭
+                                CONF。同一目标以后导入的规则为准。
+                              </p>
+                              <p>
+                                SSRL 普通规则走 VPN，例外规则直连。V2Ray
+                                和小火箭可导入域名后缀与 IP
+                                网段，导入后按本面板的规则优先级执行。
+                              </p>
+                            </div>
+                            <input
+                              ref={ruleFile}
+                              type="file"
+                              accept=".pac,.ssrl,.json,.conf"
+                              hidden
+                              aria-label="选择规则文件"
+                              onChange={(event) => {
+                                const file = event.target.files?.[0]
+                                event.target.value = ''
+                                if (file) void importRuleFile(file)
+                              }}
+                            />
+                            <button
+                              type="button"
+                              className="button tertiary"
+                              disabled={busy}
+                              onClick={() => ruleFile.current?.click()}
+                            >
+                              导入规则文件
+                            </button>
+                          </div>
+                          {pendingImport && (
+                            <div className="rule-import-policies">
+                              <h3>映射出站策略</h3>
+                              <p>
+                                为每个出站标签或策略组选择去向。选择跳过时，该标签的规则不会加入草稿。
+                              </p>
+                              <div className="fields">
+                                {Array.from(
+                                  importChoices,
+                                  ([policy, choice]) => (
+                                    <label
+                                      className="rule-policy-field"
+                                      key={policy}
+                                    >
+                                      <span>{policy}</span>
+                                      <select
+                                        value={choice}
+                                        onChange={(event) => {
+                                          const value = event.target
+                                            .value as RouteAction
+                                          setImportChoices((current) =>
+                                            new Map(current).set(policy, value),
+                                          )
+                                        }}
+                                      >
+                                        <option value="skip">跳过</option>
+                                        <option value="direct">直连</option>
+                                        <option value="proxy">VPN</option>
+                                      </select>
+                                    </label>
+                                  ),
+                                )}
+                              </div>
+                              <div className="rule-actions">
+                                <button
+                                  type="button"
+                                  className="button primary"
+                                  onClick={() =>
+                                    applyRuleImport(
+                                      pendingImport,
+                                      importChoices,
+                                    )
+                                  }
+                                >
+                                  加入草稿
+                                </button>
+                                <button
+                                  type="button"
+                                  className="button tertiary"
+                                  onClick={() => setPendingImport(null)}
+                                >
+                                  取消导入
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                          <div className="fields">
+                            {directFields.map((name) =>
+                              render([name, settings[name] ?? []]),
+                            )}
+                          </div>
+                          <details className="rule-advanced">
+                            <summary>高级设置与规则文件</summary>
+                            <p>
+                              已有规则文件可继续使用，程序会合并文件和上方输入的规则。相对路径从配置文件所在目录计算。
+                            </p>
+                            <div className="fields">
+                              {entries
+                                .filter(
+                                  ([name]) => !directFields.includes(name),
+                                )
+                                .map(render)}
+                            </div>
+                          </details>
+                        </section>
+                      )
+                    }
                     if (search && !filter(key) && !entries.length) return null
                     return (
                       <section className="panel config-panel" key={key}>
                         <div className="panel-heading">
                           <div>
                             <h2>{labels[key] || key}</h2>
-                            <p>{hints[key] || key}</p>
+                            {object && hints[key] && <p>{hints[key]}</p>}
                           </div>
                           <SlidersHorizontal size={18} />
                         </div>
@@ -1014,6 +1591,12 @@ function App() {
                                 key={name}
                                 name={name}
                                 value={v}
+                                section={key}
+                                disabled={fieldDisabled(
+                                  key,
+                                  name,
+                                  value as Config,
+                                )}
                                 onChange={(next) =>
                                   setDraft(setPath(draft, [key, name], next))
                                 }
@@ -1032,6 +1615,7 @@ function App() {
                       </section>
                     )
                   })}
+                {page === 'split' && !search && <DnsActivity stats={stats} />}
               </div>
               <div className="save-bar">
                 <div>
