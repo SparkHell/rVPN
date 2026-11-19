@@ -107,7 +107,7 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 base64 = "0.21"
 data-encoding = "2"
 hex = "0.4"
-rand = "0.10"
+rand = "0.8"
 regex = "1.10"
 url = "2.5"
 lazy_static = "1.4"
