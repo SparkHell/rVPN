@@ -4,6 +4,7 @@
 //! the VPN tunnel or directly (bypass), based on IP ranges and domain lists.
 //!
 //! Priority order (highest to lowest):
+//! 0. VPN transport endpoint exemptions - Always route directly
 //! 1. tunnel_domains - Force through VPN
 //! 2. bypass_domains - Route directly
 //! 3. tunnel_networks - Force through VPN
@@ -143,6 +144,28 @@ pub struct SplitTunnel {
     data: Arc<RwLock<SplitTunnelData>>,
     /// DNS resolver with caching
     dns_resolver: Arc<DnsResolver>,
+    /// Transport endpoints are always direct, independently of user rules.
+    /// Keep these outside reloadable data so rule-file reloads cannot erase them.
+    server_bypass: RwLock<ServerBypass>,
+}
+
+#[derive(Debug, Default)]
+struct ServerBypass {
+    hosts: HashSet<String>,
+    ips: HashSet<IpAddr>,
+    resolved: HashMap<String, HashSet<IpAddr>>,
+}
+
+impl ServerBypass {
+    fn contains_ip(&self, ip: &IpAddr) -> bool {
+        self.ips.contains(ip) || self.resolved.values().any(|ips| ips.contains(ip))
+    }
+}
+
+const SERVER_BYPASS_REASON: &str = "VPN 服务端地址自动直连（防止循环代理）";
+
+fn normalize_server_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').trim_matches(['[', ']']).to_ascii_lowercase()
 }
 
 impl SplitTunnel {
@@ -158,6 +181,7 @@ impl SplitTunnel {
             config,
             data: Arc::new(RwLock::new(data)),
             dns_resolver,
+            server_bypass: RwLock::default(),
         };
 
         // Start auto-reload task if enabled
@@ -181,6 +205,7 @@ impl SplitTunnel {
             config: SplitTunnelConfig::default(),
             data: Arc::new(RwLock::new(SplitTunnelData::default())),
             dns_resolver: Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+            server_bypass: RwLock::default(),
         }
     }
 
@@ -196,8 +221,43 @@ impl SplitTunnel {
         Arc::clone(&self.dns_resolver)
     }
 
+    /// Exact endpoint hostnames, not suffix rules: unrelated subdomains must
+    /// retain their configured routing. Literal IPv4/IPv6 endpoints also bypass.
+    pub async fn set_server_endpoints(&self, hosts: &[String]) {
+        let mut bypass = ServerBypass::default();
+        for host in hosts {
+            let host = normalize_server_host(host);
+            if let Ok(ip) = host.parse() { bypass.ips.insert(ip); }
+            bypass.hosts.insert(host);
+        }
+        *self.server_bypass.write().await = bypass;
+    }
+
+    /// Called before dialing the transport, including DNS refresh / ECH targets.
+    pub async fn set_server_ips(&self, host: &str, ips: &[IpAddr]) {
+        let host = normalize_server_host(host);
+        let mut bypass = self.server_bypass.write().await;
+        if bypass.hosts.contains(&host) {
+            bypass.resolved.insert(host, ips.iter().copied().collect());
+        }
+    }
+
+    async fn is_server_host(&self, host: &str) -> bool {
+        let host = normalize_server_host(host);
+        let bypass = self.server_bypass.read().await;
+        bypass.hosts.contains(&host)
+            || host.parse::<IpAddr>().is_ok_and(|ip| bypass.contains_ip(&ip))
+    }
+
+    async fn are_server_ips(&self, ips: &[IpAddr]) -> bool {
+        if ips.is_empty() { return false; }
+        let bypass = self.server_bypass.read().await;
+        ips.iter().all(|ip| bypass.contains_ip(ip))
+    }
+
     /// Apply domain rules first, then the destination IP rules.
     pub async fn decide(&self, host: &str, ips: &[IpAddr]) -> RoutingDecision {
+        if self.are_server_ips(ips).await { return RoutingDecision::Bypass; }
         if let Some((route, _, _)) = self.match_domain_rule(host).await {
             return route;
         }
@@ -228,6 +288,9 @@ impl SplitTunnel {
     }
 
     async fn match_domain_rule(&self, host: &str) -> Option<(RoutingDecision, bool, &'static str)> {
+        if self.is_server_host(host).await {
+            return Some((RoutingDecision::Bypass, false, SERVER_BYPASS_REASON));
+        }
         let host = host.trim_end_matches('.');
         if !self.config.enabled {
             return Some((RoutingDecision::Tunnel, false, "分流已关闭"));
@@ -316,7 +379,9 @@ impl SplitTunnel {
                 return None;
             }
         };
-        Some(addrs.into_iter().map(|a| a.ip()).collect())
+        let ips: Vec<_> = addrs.into_iter().map(|a| a.ip()).collect();
+        if self.is_server_host(host).await { self.set_server_ips(host, &ips).await; }
+        Some(ips)
     }
 
     pub async fn decide_by_ip(&self, ip: IpAddr) -> RoutingDecision {
@@ -324,6 +389,7 @@ impl SplitTunnel {
     }
 
     async fn explain_ips(&self, ips: &[IpAddr]) -> (RoutingDecision, &'static str) {
+        if self.are_server_ips(ips).await { return (RoutingDecision::Bypass, SERVER_BYPASS_REASON); }
         if !self.config.enabled {
             return (RoutingDecision::Tunnel, "分流已关闭");
         }
@@ -686,6 +752,7 @@ impl SplitTunnel {
             config: config.clone(),
             data: Arc::new(RwLock::new(data)),
             dns_resolver: Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+            server_bypass: RwLock::default(),
         })
     }
 }
@@ -735,6 +802,65 @@ async fn auto_reload_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn server_endpoints_bypass_even_when_split_tunneling_is_disabled() {
+        let split = SplitTunnel::new(
+            SplitTunnelConfig { enabled: false, ..Default::default() },
+            Arc::new(DnsResolver::new(true, 300, 1000, true, false, vec![])),
+        ).await.unwrap();
+        split.set_server_endpoints(&["VPN.Example.".into(), "203.0.113.10".into(), "[2001:db8::10]".into()]).await;
+        for host in ["vpn.example", "VPN.EXAMPLE.", "203.0.113.10", "[2001:db8::10]"] {
+            assert_eq!(split.decide_by_host(host).await, RoutingDecision::Bypass);
+            assert_eq!(split.decide_for_connection(host).await, RoutingDecision::Bypass);
+            assert!(!split.requires_tunnel(host).await);
+        }
+        assert_eq!(split.decide_by_host("sub.vpn.example").await, RoutingDecision::Tunnel);
+        assert_eq!(split.decide_by_ip("203.0.113.11".parse().unwrap()).await, RoutingDecision::Tunnel);
+    }
+
+    #[tokio::test]
+    async fn server_endpoints_override_block_and_tunnel_rules_and_survive_rule_reload() {
+        let split = SplitTunnel::new(
+            SplitTunnelConfig { enabled: true, block_ads: true, auto_reload_interval: 0,
+                tunnel_domains: vec!["example".into()], tunnel_networks: vec!["0.0.0.0/0".into(), "::/0".into()], ..Default::default() },
+            Arc::new(DnsResolver::new(true, 300, 1000, true, false, vec![])),
+        ).await.unwrap();
+        split.set_server_endpoints(&["vpn.example".into()]).await;
+        split.data.write().await.block_domains.insert("example".into());
+        let ips = ["203.0.113.10".parse().unwrap(), "2001:db8::10".parse().unwrap()];
+        split.set_server_ips("vpn.example", &ips).await;
+        assert_eq!(split.explain_dns("vpn.example").await.2, SERVER_BYPASS_REASON);
+        assert_eq!(split.decide_by_host("vpn.example").await, RoutingDecision::Bypass);
+        assert_eq!(split.decide_by_host("other.example").await, RoutingDecision::Block);
+        for ip in ips { assert_eq!(split.decide_by_ip(ip).await, RoutingDecision::Bypass); }
+        assert_eq!(split.decide("other.example", &ips).await, RoutingDecision::Bypass);
+        split.reload().await.unwrap();
+        assert_eq!(split.decide_by_host("vpn.example").await, RoutingDecision::Bypass);
+        assert_eq!(split.decide_by_ip(ips[0]).await, RoutingDecision::Bypass);
+        assert_eq!(split.decide_by_host("other.example").await, RoutingDecision::Tunnel);
+    }
+
+    #[tokio::test]
+    async fn server_dns_changes_and_endpoint_replacement_remove_obsolete_exemptions() {
+        let split = SplitTunnel::new(
+            SplitTunnelConfig { enabled: false, ..Default::default() },
+            Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+        ).await.unwrap();
+        split.set_server_endpoints(&["vpn.example".into()]).await;
+        let old = "203.0.113.10".parse().unwrap();
+        let new = "203.0.113.11".parse().unwrap();
+        split.set_server_ips("vpn.example", &[old]).await;
+        assert_eq!(split.decide_by_ip(old).await, RoutingDecision::Bypass);
+        split.set_server_ips("vpn.example", &[new]).await;
+        assert_eq!(split.decide_by_ip(old).await, RoutingDecision::Tunnel);
+        assert_eq!(split.decide_by_ip(new).await, RoutingDecision::Bypass);
+        assert_eq!(split.decide("other.example", &[new, old]).await, RoutingDecision::Tunnel);
+        split.set_server_ips("unknown.example", &[old]).await;
+        assert_eq!(split.decide_by_ip(old).await, RoutingDecision::Tunnel);
+        split.set_server_endpoints(&["backup.example".into()]).await;
+        assert_eq!(split.decide_by_host("vpn.example").await, RoutingDecision::Tunnel);
+        assert_eq!(split.decide_by_ip(new).await, RoutingDecision::Tunnel);
+    }
     #[cfg(feature = "builtin-domains")]
     #[tokio::test]
     async fn builtin_gfwlist_works_with_existing_config_and_no_external_files() {
@@ -807,6 +933,7 @@ mod tests {
                 },
                 data: Arc::new(RwLock::new(data)),
                 dns_resolver: Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+                server_bypass: RwLock::default(),
             };
 
             // Tunnel domains should return Tunnel
@@ -859,6 +986,7 @@ mod tests {
                 },
                 data: Arc::new(RwLock::new(data)),
                 dns_resolver: Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+                server_bypass: RwLock::default(),
             };
 
             // Test bypass network
@@ -906,6 +1034,7 @@ mod tests {
                 },
                 data: Arc::new(RwLock::new(data)),
                 dns_resolver: Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+                server_bypass: RwLock::default(),
             };
 
             // Domain match should take priority over network
@@ -943,6 +1072,7 @@ mod tests {
                 },
                 data: Arc::new(RwLock::new(data)),
                 dns_resolver: Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+                server_bypass: RwLock::default(),
             };
 
             // Test bypass network (192.168.x.x)
@@ -993,6 +1123,7 @@ mod tests {
                 },
                 data: Arc::new(RwLock::new(data)),
                 dns_resolver: Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+                server_bypass: RwLock::default(),
             };
 
             // When disabled, all traffic should tunnel

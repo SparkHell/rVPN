@@ -174,7 +174,7 @@ fn resolve_identity(
 /// Parse a server URL into `(host, port, path)`. Mirrors the helper in
 /// `main.rs` / `socks5.rs`; duplicated here to avoid pulling the caller
 /// into this module's dependency graph.
-fn parse_server_url(url: &str) -> (String, u16, String) {
+pub(crate) fn parse_server_url(url: &str) -> (String, u16, String) {
     let url = url
         .strip_prefix("wss://")
         .or_else(|| url.strip_prefix("ws://"))

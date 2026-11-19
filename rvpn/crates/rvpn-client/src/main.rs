@@ -186,8 +186,16 @@ async fn async_main(args: Args) -> Result<ExitCode> {
     } else {
         ClientConfig::default()
     };
-    let logging = rvpn_logging::init_client_startup(&config.logging, args.verbose, "rvpn-client")?;
-    match run_client(args, config, &logging).await {
+    let logging = rvpn_logging::init_client_startup(&config.logging, args.verbose, "rvpn-client")
+        .map_err(|error| {
+            let _ = service::report_startup(None, Some(format!("{error:#}")));
+            error
+        })?;
+    let result = run_client(args, config.clone(), &logging).await;
+    if let Err(error) = &result {
+        let _ = service::report_startup(None, Some(format!("{error:#}")));
+    }
+    match result {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(error) if logging.writes_to_file() => {
             error!("Client terminated: {error:#}");

@@ -135,13 +135,17 @@ impl Socks5Proxy {
                 Arc::new(SplitTunnel::disabled())
             }
         };
+        let server_hosts = crate::split_tunnel::server_endpoint_hosts(config);
+        crate::split_tunnel::configure_server_bypass(&split_tunnel, &server_hosts).await;
+        crate::websocket::set_server_bypass(&split_tunnel);
+        info!("VPN 服务端自动直连（防止循环代理）：{}", server_hosts.join(", "));
 
         if config.split_tunnel.enabled {
             let stats = split_tunnel.get_stats().await;
             info!("Split tunnel enabled: {} bypass networks, {} bypass domains",
                   stats.bypass_networks_count, stats.bypass_domains_count);
         } else {
-            info!("Split tunnel disabled - all traffic will go through VPN");
+            info!("Split tunnel disabled - traffic uses VPN except server endpoint exemptions");
         }
 
         Ok(Self {

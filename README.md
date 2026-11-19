@@ -226,8 +226,9 @@ inconsistent complete key sets cause an explicit error. The `keygen` and
 ### Client system service
 
 The CLI supports systemd on Linux, Windows Service Control Manager, and a
-system LaunchDaemon on macOS. Run these commands as root (Unix) or from an
-administrator terminal (Windows):
+system LaunchDaemon on macOS. Run these commands as root (Unix, for example with
+`sudo`). Windows automatically requests UAC authorization for install, uninstall,
+start, and stop when the terminal is not elevated:
 
 ```text
 rvpn --config /absolute/path/client.toml service install
@@ -240,6 +241,12 @@ rvpn service uninstall
 On Windows use a Windows path, for example
 `rvpn.exe --config C:\rvpn\client.toml service install`.
 Installation enables startup at boot; use `service start` to start immediately.
+Install, uninstall, start, and stop print a confirmation on success; errors are
+shown in the invoking terminal, including after Windows UAC elevation. Start
+waits for client initialization and prints the actual WebUI URL when enabled
+(including an automatically assigned port). If WebUI is disabled, it prints how
+to enable it. VPN startup failures are shown even if WebUI remains available to
+repair the configuration. Failed commands return a nonzero exit code.
 Linux requires systemd. Service names are `rvpn-client` (Linux/Windows) and
 `com.rvpn.client` (macOS). Installation does not copy the executable, config,
 or keys: keep them at their installed paths. Relative paths in the configuration
@@ -314,7 +321,14 @@ GFWList matches and return to normal routing, without forcing a direct route.
 Explicit user tunnel/bypass rules retain priority. The plain export omits
 parents overlapping exceptions; the embedded JSON retains both sets.
 
-SOCKS5/HTTP targets matching an explicit proxy domain or GFWList go straight to the tunnel, preserving the hostname for remote DNS.
+VPN endpoints from `server_address` and every `[[server]].address` automatically
+use direct routing in SOCKS5/HTTP/DNS modes, even when split tunneling is disabled
+or a tunnel/block rule would otherwise match. This covers exact endpoint
+hostnames and IPv4/IPv6 addresses; resolved endpoint IPs are refreshed before
+transport connections. Rule-file reloads retain these exemptions, and changing
+server configuration rebuilds them. No manual bypass-list entry is needed.
+
+Other SOCKS5/HTTP targets matching an explicit proxy domain or GFWList go straight to the tunnel, preserving the hostname for remote DNS.
 They no longer perform a local IP probe first. DNS-proxy A queries use the tunnel
 too; VPN server hostnames retain local bootstrap resolution. The current DNS
 tunnel supports address lookups only: AAAA returns NODATA, and non-address types

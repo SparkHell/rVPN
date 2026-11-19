@@ -198,6 +198,64 @@ async fn idle_flow(address: SocketAddr) -> TcpStream {
 }
 
 #[tokio::test]
+async fn server_endpoints_use_direct_socks_and_http_after_configuration_reload() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (_directory, _child, panel, socks) = fixture(false);
+        let (mut socket, mut current) = connect(panel).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let http = address();
+        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong";
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut marker = [0; 4];
+                stream.read_exact(&mut marker).await.unwrap();
+                assert_eq!(&marker, b"ping", "SOCKS flow must reach the endpoint without TLS/VPN wrapping");
+                stream.write_all(b"pong").await.unwrap();
+                drop(stream);
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                assert!(request.starts_with(b"GET /probe HTTP/1.1\r\n"));
+                stream.write_all(reply).await.unwrap();
+            }
+        });
+        for enabled in [false, true] {
+            let mut config = current["config"].clone();
+            config["server_address"] = json!(format!("wss://{target}/ws"));
+            config["socks5"]["mode"] = json!("legacy");
+            config["http_proxy"]["enabled"] = json!(true);
+            config["http_proxy"]["listen_address"] = json!(http.to_string());
+            config["split_tunnel"]["enabled"] = json!(enabled);
+            config["split_tunnel"]["tunnelNetworks"] = json!(["0.0.0.0/0"]);
+            let saved = save(&mut socket, &mut current, config).await;
+            assert_eq!(saved["ok"], true, "{saved}");
+            let mut flow = idle_flow(socks).await;
+            let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+            request.extend_from_slice(&target.port().to_be_bytes());
+            flow.write_all(&request).await.unwrap();
+            let mut status = [0; 10];
+            flow.read_exact(&mut status).await.unwrap();
+            assert_eq!(status[1], 0);
+            flow.write_all(b"ping").await.unwrap();
+            let mut response = [0; 4];
+            flow.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"pong");
+            drop(flow);
+            let mut flow = TcpStream::connect(http).await.unwrap();
+            flow.write_all(format!("GET http://{target}/probe HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let mut response = vec![0; reply.len()];
+            flow.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, reply);
+        }
+        server.await.unwrap();
+    }).await.expect("endpoint bypass test timed out");
+}
+
+#[tokio::test]
 async fn saves_apply_rebind_roll_back_and_move_panel_without_changing_pid() {
     let (directory, mut child, panel, socks) = fixture(false);
     let pid = child.0.id();

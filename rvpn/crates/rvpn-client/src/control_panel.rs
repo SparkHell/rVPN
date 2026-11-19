@@ -100,12 +100,14 @@ async fn inspect_route(config: ClientConfig, input: &str) -> Result<Value> {
     use rvpn_split_tunnel::dns_cache::{DnsResolver, doh_upstream_hostname};
     let target = route_target(input)?;
     anyhow::ensure!(!config.tun.enabled, "此查询适用于 SOCKS5、HTTP 和本地 DNS 代理模式");
+    let server_hosts = crate::split_tunnel::server_endpoint_hosts(&config);
     let mut rules = config.split_tunnel;
     rules.auto_reload_interval = 0;
     let resolver = Arc::new(DnsResolver::new(false, config.network.dns_cache_ttl,
         config.network.dns_cache_size, config.network.ipv6_enabled, false, vec![])
         .with_nameservers(&config.dns_proxy.nameservers)?);
     let split = SplitTunnel::new(rules, resolver.clone()).await?;
+    crate::split_tunnel::configure_server_bypass(&split, &server_hosts).await;
     let route = |route| match route {
         RoutingDecision::Tunnel => "VPN 隧道",
         RoutingDecision::Bypass => "直连",
@@ -277,6 +279,19 @@ mod tests {
         assert_eq!(domain["a"], "VPN 隧道");
         assert_eq!(domain["reason"], "命中隧道域名规则");
         assert_eq!(inspect_route(config, "192.0.2.9").await.unwrap()["connection"], "VPN 隧道");
+    }
+
+    #[tokio::test]
+    async fn route_inspection_explains_automatic_server_bypass() {
+        let mut config = ClientConfig::default();
+        config.server_address = "wss://192.0.2.9:443/ws".into();
+        config.split_tunnel.enabled = true;
+        config.split_tunnel.tunnel_networks.push("0.0.0.0/0".into());
+        let result = inspect_route(config.clone(), "192.0.2.9").await.unwrap();
+        assert_eq!(result["connection"], "直连");
+        assert!(result["reason"].as_str().unwrap().contains("防止循环代理"));
+        config.split_tunnel.enabled = false;
+        assert_eq!(inspect_route(config, "192.0.2.9").await.unwrap()["connection"], "直连");
     }
 
     #[tokio::test]

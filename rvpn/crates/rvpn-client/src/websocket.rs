@@ -40,6 +40,7 @@ struct EndpointDns {
     resolver: Option<std::sync::Arc<crate::dns_cache::DnsResolver>>,
     ech_resolver: Option<std::sync::Arc<crate::dns_cache::DnsResolver>>,
     require_ech: bool,
+    bypass: Option<std::sync::Weak<crate::split_tunnel::SplitTunnel>>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -47,6 +48,7 @@ static ENDPOINT_DNS: std::sync::RwLock<EndpointDns> = std::sync::RwLock::new(End
     resolver: None,
     ech_resolver: None,
     require_ech: false,
+    bypass: None,
 });
 
 #[cfg(not(target_os = "android"))]
@@ -95,8 +97,21 @@ pub fn configure_endpoint_dns(client_config: &crate::config::ClientConfig) -> Re
         resolver: Some(resolver),
         ech_resolver,
         require_ech: config.require_ech,
+        bypass: None,
     };
     Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn set_server_bypass(split: &std::sync::Arc<crate::split_tunnel::SplitTunnel>) {
+    ENDPOINT_DNS.write().unwrap_or_else(|e| e.into_inner()).bypass = Some(std::sync::Arc::downgrade(split));
+}
+
+#[cfg(not(target_os = "android"))]
+async fn remember_server_addresses(dns: &EndpointDns, host: &str, addresses: &[std::net::SocketAddr]) {
+    if let Some(split) = dns.bypass.as_ref().and_then(std::sync::Weak::upgrade) {
+        split.set_server_ips(host, &addresses.iter().map(|address| address.ip()).collect::<Vec<_>>()).await;
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -135,8 +150,10 @@ pub async fn connect_direct_tcp(
         let targets: Vec<_> = addresses.iter().map(|ip| std::net::SocketAddr::new(*ip, port)).collect();
         return Ok(tokio::net::TcpStream::connect(targets.as_slice()).await?);
     }
-    if let Some(resolver) = endpoint_dns().resolver {
+    let dns = endpoint_dns();
+    if let Some(resolver) = &dns.resolver {
         let addresses = resolver.resolve(host, port).await?;
+        remember_server_addresses(&dns, host, &addresses).await;
         Ok(tokio::net::TcpStream::connect(addresses.as_slice()).await?)
     } else {
         Ok(tokio::net::TcpStream::connect((host, port)).await?)
@@ -264,6 +281,7 @@ pub async fn connect_websocket(
                 Ok(tokio::net::lookup_host((target, port)).await?.collect())
             }
         }).await?;
+        remember_server_addresses(&dns, origin, &addresses).await;
         dial_tls(&addresses, fingerprint, sni, resumption, None).await
     };
     let tls_stream = if dns.require_ech {
@@ -273,6 +291,7 @@ pub async fn connect_websocket(
             let (target, target_port, config) =
                 connect_stage("dns_https", limit, resolver.resolve_ech(origin, port)).await?;
             let addresses = connect_stage("dns_address", limit, resolver.resolve(&target, target_port)).await?;
+            remember_server_addresses(&dns, origin, &addresses).await;
             dial_tls(&addresses, fingerprint, sni, resumption, Some(&config)).await
         };
         with_ech_fallback(ech, ordinary_tls).await?
@@ -521,6 +540,25 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn dial_time_dns_refresh_updates_server_bypass_addresses() {
+        use crate::split_tunnel::{SplitTunnel, SplitTunnelConfig, RoutingDecision};
+        let split = std::sync::Arc::new(SplitTunnel::new(
+            SplitTunnelConfig { enabled: false, ..Default::default() },
+            std::sync::Arc::new(crate::dns_cache::DnsResolver::new(true, 300, 1000, true, false, vec![])),
+        ).await.unwrap());
+        split.set_server_endpoints(&["vpn.example".into()]).await;
+        let dns = EndpointDns { resolver: None, ech_resolver: None, require_ech: false, bypass: Some(std::sync::Arc::downgrade(&split)) };
+        let old = "192.0.2.1:443".parse::<std::net::SocketAddr>().unwrap();
+        let new = "[2001:db8::1]:8443".parse::<std::net::SocketAddr>().unwrap();
+        remember_server_addresses(&dns, "VPN.EXAMPLE.", &[old]).await;
+        assert_eq!(split.decide_by_ip(old.ip()).await, RoutingDecision::Bypass);
+        remember_server_addresses(&dns, "vpn.example", &[new]).await;
+        assert_eq!(split.decide_by_ip(new.ip()).await, RoutingDecision::Bypass);
+        assert_eq!(split.decide_by_ip(old.ip()).await, RoutingDecision::Tunnel);
+    }
 
     #[cfg(not(target_os = "android"))]
     #[test]

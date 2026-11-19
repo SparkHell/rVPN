@@ -130,6 +130,15 @@ jobs:
       - name: Test configuration and relative paths
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn config::tests --timings
 
+      - name: Test service commands and startup reporting
+        run: "cargo test --profile ci-test --locked --package rvpn-client --bin rvpn service:: --timings"
+
+      - name: Test automatic VPN server bypass
+        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn split_tunnel::endpoint_tests --timings
+
+      - name: Test WebUI startup addresses
+        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn runtime_control::tests --timings
+
       - name: Test WebSocket control panel
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn control_panel::tests --timings
 
@@ -283,6 +292,15 @@ jobs:
 
       - name: Test configuration and relative paths
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn config::tests --timings
+
+      - name: Test service commands and startup reporting
+        run: "cargo test --profile ci-test --locked --package rvpn-client --bin rvpn service:: --timings"
+
+      - name: Test automatic VPN server bypass
+        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn split_tunnel::endpoint_tests --timings
+
+      - name: Test WebUI startup addresses
+        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn runtime_control::tests --timings
 
       - name: Test WebSocket control panel
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn control_panel::tests --timings

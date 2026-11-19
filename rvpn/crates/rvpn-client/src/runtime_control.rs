@@ -119,6 +119,7 @@ impl Drop for Worker {
 struct PanelListener {
     task: tokio::task::JoinHandle<()>,
     address: String,
+    local_address: Option<std::net::SocketAddr>,
 }
 
 impl PanelListener {
@@ -174,10 +175,11 @@ fn serve_panel(
     PanelListener {
         task: tokio::spawn(crate::control_panel::serve(listener, state, allow, panel)),
         address: config.dashboard.listen_address.clone(),
+        local_address: local,
     }
 }
 
-fn panel_url(mut address: std::net::SocketAddr) -> String {
+pub(crate) fn panel_url(mut address: std::net::SocketAddr) -> String {
     if address.ip().is_unspecified() {
         address.set_ip(if address.is_ipv4() {
             std::net::Ipv4Addr::LOCALHOST.into()
@@ -235,6 +237,7 @@ pub async fn run(
     }
     let sampler = tokio::spawn(dashboard::run_sampler(state.clone()));
     let _sampler_guard = crate::OnDrop::new(move || sampler.abort());
+    let mut startup_error = None;
     let mut listener = match bind_panel(&config).await {
         Ok(Some(socket)) => Some(serve_panel(socket, &config, state.clone(), panel.clone())),
         Ok(None) => {
@@ -243,6 +246,7 @@ pub async fn run(
         }
         Err(error) => {
             eprintln!("{error:#}");
+            startup_error = Some(format!("WebUI 启动失败：{error:#}"));
             None
         }
     };
@@ -254,14 +258,22 @@ pub async fn run(
         }
         Err(error) => {
             if listener.is_none() {
+                let _ = crate::service::report_startup(None, Some(format!("{error:#}")));
                 return Err(error);
             }
             eprintln!("VPN failed to start; control panel remains available: {error:#}");
             panel.set_runtime_error(format!("{error:#}"));
+            startup_error = Some(format!("VPN 启动失败，WebUI 仍可用于修复配置：{error:#}"));
             None
         }
     };
     let mut started = worker.is_some();
+    crate::service::report_startup(
+        listener.as_ref().and_then(|panel| panel.local_address),
+        startup_error,
+    )?;
+    #[cfg(windows)]
+    crate::service::windows::ready()?;
     let (shutdown, mut stopped) = watch::channel(false);
     let signals = tokio::spawn(crate::handle_signals(shutdown));
     let _signal_guard = crate::OnDrop::new(move || signals.abort());
@@ -273,6 +285,7 @@ pub async fn run(
                 let error = match completed { Ok(Err(error)) => error, _ => "VPN network runtime stopped".into() };
                 if listener.is_none() { anyhow::bail!(error) }
                 tracing::error!("{error}");
+                let _ = crate::service::report_startup(listener.as_ref().and_then(|panel| panel.local_address), Some(error.clone()));
                 panel.set_runtime_error(error);
             }
             Some(mut request) = requests.recv() => {
@@ -336,6 +349,9 @@ pub async fn run(
                     }
                     config = candidate;
                     panel.set_active(config.clone(), request.revision);
+                    if let Err(error) = crate::service::report_startup(listener.as_ref().and_then(|panel| panel.local_address), None) {
+                        tracing::warn!("Could not update service startup report: {error:#}");
+                    }
                     tracing::info!("Client configuration applied without process restart (network rebuilt: {rebuild})");
                     Ok::<(),anyhow::Error>(())
                 }.await;

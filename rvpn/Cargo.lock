@@ -2824,6 +2824,7 @@ dependencies = [
  "ip_network",
  "ip_network_table",
  "lazy_static",
+ "libc",
  "lru",
  "mimalloc",
  "parking_lot",
@@ -2855,6 +2856,7 @@ dependencies = [
  "url",
  "uuid",
  "windows-service",
+ "windows-sys 0.61.2",
  "x25519-dalek",
 ]
 
