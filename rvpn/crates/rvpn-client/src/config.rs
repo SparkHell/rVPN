@@ -635,6 +635,10 @@ pub struct NetworkConfig {
     /// Custom DNS servers (overrides system default)
     #[serde(default)]
     pub dns_servers: Vec<String>,
+
+    /// Require the VPN endpoint to accept TLS Encrypted ClientHello.
+    #[serde(default)]
+    pub require_ech: bool,
 }
 
 impl Default for NetworkConfig {
@@ -646,6 +650,7 @@ impl Default for NetworkConfig {
             dns_cache_ttl: 14400, // 4 hours — client-side cache can be aggressive since A-records rarely change
             dns_cache_size: 1000,
             dns_servers: vec![],
+            require_ech: false,
         }
     }
 }

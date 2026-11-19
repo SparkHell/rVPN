@@ -42,7 +42,7 @@ pub use resumption::ResumptionStore;
 pub use tls_boring::{connect_chrome_like, ChromeTlsStream};
 
 #[cfg(all(feature = "boring", not(target_os = "android")))]
-pub use tls_boring::connect_chrome_like_with_resumption;
+pub use tls_boring::{connect_boring_over_tcp, connect_chrome_like_with_resumption};
 
 #[cfg(feature = "rustls")]
 pub use tls_rustls::{

@@ -28,6 +28,9 @@ block_ads = true
 [network]
 prefer_ipv4 = true
 dns_cache_enabled = true
+# Require ECH on desktop VPN connections. Set HTTPS-only endpoint DNS first.
+# require_ech = true
+# dns_servers = ["https://1.1.1.1/dns-query"]
 
 [server_identity]
 trust_on_first_use = true

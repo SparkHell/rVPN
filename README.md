@@ -352,6 +352,33 @@ VPN endpoint lookups. A nonempty `network.dns_servers` overrides this list for
 those lookups and accepts the same UDP/DoH syntax. Existing UDP-only resolver
 behavior is preserved. No separate `[network.doh]` section is needed.
 
+Set `[network].require_ech = true` to require Encrypted ClientHello on the
+desktop CLI's VPN WebSockets. Configure an HTTPS-only list of DoH upstreams
+for VPN endpoint resolution and use a DNS hostname as the VPN endpoint.
+Use the endpoint hostname as SNI. The endpoint must publish an HTTPS record
+with an ECH configuration usable by its TLS frontend. For Caddy deployments, Caddy accepts ECH on the public
+TLS listener. Missing HTTPS records, failed DNS lookups and rejected ECH
+handshakes without authenticated retry configs fail before WebSocket
+upgrade. The client retries once with a config authenticated by the TLS
+frontend. Each new dial refreshes the HTTPS record and performs a full
+TLS handshake.
+
+Run with `-v` for per-stage timing. The logs distinguish endpoint address
+and HTTPS lookups, TCP, TLS, WebSocket upgrade, X3DH and TUN address
+assignment. TUN and SOCKS5 also report time to the first inbound data. The
+dashboard handshake counters continue to report authentication outcomes.
+
+To run the local SOCKS5 regression against built client and server binaries:
+
+```sh
+python3 scripts/test_endpoint_roundtrip.py --client rvpn/target/ci-test/rvpn \
+  --server rvpn/target/ci-test/rvpn-server --caddy /path/to/caddy
+```
+
+The script uses temporary credentials and a loopback echo server. It checks
+the returned payload, then stops and restarts the server and checks
+recovery. Omit `--caddy` to run the direct case only.
+
 The optional local `[dns_proxy]` listener still accepts UDP queries from apps;
 DoH changes its local upstream transport. Tunnel-routed A/AAAA queries keep
 the existing encrypted WebSocket DNS path. In TUN mode, tunneled DNS packets

@@ -6,6 +6,7 @@
 //! - IPv4 preference ordering
 //! - Optional custom nameservers (direct UDP, bypassing system resolver)
 
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -232,6 +233,44 @@ mod doh_tests {
     }
 
     #[test]
+    fn https_record_selects_ech_without_plain_or_h3_only_fallback() {
+        let mut query = build_dns_query_packet("vpn.example", 42);
+        let qtype = query.len() - 4;
+        query[qtype + 1] = 65;
+        let mut response = query.clone();
+        response[2] |= 0x80;
+        response[7] = 2;
+        let add = |response: &mut Vec<u8>, priority: u16, params: &[u8]| {
+            response.extend([0xc0, 0x0c, 0, 65, 0, 1, 0, 0, 0, 60]);
+            response.extend((3 + params.len() as u16).to_be_bytes());
+            response.extend(priority.to_be_bytes());
+            response.push(0); // ServiceMode target "."
+            response.extend(params);
+        };
+        add(&mut response, 1, &[]); // No ECH.
+        add(
+            &mut response,
+            2,
+            &[0, 1, 0, 3, 2, b'h', b'3', 0, 2, 0, 0, 0, 5, 0, 2, 0, 0],
+        );
+        assert!(parse_ech_service(&response, &query, "vpn.example").is_err());
+        response[7] = 3;
+        add(
+            &mut response,
+            3,
+            &[0, 3, 0, 2, 0x20, 0xfb, 0, 5, 0, 3, 0, 1, 42],
+        );
+        let service = parse_ech_service(&response, &query, "vpn.example").unwrap();
+        assert!(
+            matches!(service, EchAnswer::Service { target, port: Some(8443), config }
+            if target.is_empty() && config == [0, 1, 42])
+        );
+        assert!(parse_ech_service(&response, &query, "unrelated.example").is_err());
+        response.pop();
+        assert!(parse_ech_service(&response, &query, "vpn.example").is_err());
+    }
+
+    #[test]
     fn nameservers_accept_udp_and_doh_and_reject_invalid_endpoints() {
         for endpoint in [
             "http://1.1.1.1/dns-query",
@@ -414,6 +453,66 @@ impl DnsResolver {
             cleanup_started: AtomicBool::new(false),
             upstreams: None,
         }
+    }
+
+    /// Discover an HTTP/1.1-compatible HTTPS service with ECH over the
+    /// configured encrypted resolver. Refresh at each dial so key rotation
+    /// can recover on reconnect.
+    pub async fn resolve_ech(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> anyhow::Result<(String, u16, Vec<u8>)> {
+        let upstreams = self
+            .upstreams
+            .as_ref()
+            .context("ECH requires configured DoH")?;
+        anyhow::ensure!(
+            upstreams
+                .0
+                .iter()
+                .all(|ns| matches!(ns, DnsUpstream::Doh(_))),
+            "ECH requires exclusively DoH upstreams"
+        );
+        let host = host.trim_end_matches('.');
+        anyhow::ensure!(
+            host.parse::<IpAddr>().is_err(),
+            "ECH requires a DNS hostname"
+        );
+        let mut owner = if port == 443 {
+            host.to_owned()
+        } else {
+            format!("_{port}._https.{host}")
+        };
+        for _ in 0..8 {
+            anyhow::ensure!(
+                owner.len() <= 253
+                    && owner.split('.').all(|label| {
+                        (1..=63).contains(&label.len())
+                            && label
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                    }),
+                "Invalid HTTPS record owner"
+            );
+            let txid = DNS_TXID.fetch_add(1, Ordering::Relaxed);
+            let mut query = build_dns_query_packet(&owner, txid);
+            let offset = query.len() - 4;
+            query[offset..offset + 2].copy_from_slice(&65u16.to_be_bytes());
+            let response = upstreams.query(&query).await?;
+            match parse_ech_service(&response, &query, &owner)? {
+                EchAnswer::Alias(target) => owner = target,
+                EchAnswer::Service {
+                    target,
+                    port: service_port,
+                    config,
+                } => {
+                    let target = if target.is_empty() { owner } else { target };
+                    return Ok((target, service_port.unwrap_or(port), config));
+                }
+            }
+        }
+        anyhow::bail!("Too many HTTPS or CNAME redirects")
     }
 
     /// Resolve a hostname to IP addresses.
@@ -923,6 +1022,216 @@ fn parse_dns_address_response(
     // Cap TTL to a reasonable maximum (4 hours) to avoid stale data from misconfigured servers
     let ttl = min_ttl.min(14400);
     Ok((ips, ttl))
+}
+
+enum EchAnswer {
+    Alias(String),
+    Service {
+        target: String,
+        port: Option<u16>,
+        config: Vec<u8>,
+    },
+}
+
+fn read_dns_name(data: &[u8], pos: &mut usize, compression: bool) -> anyhow::Result<String> {
+    let mut name = String::new();
+    let mut offset = *pos;
+    let mut jumped = false;
+    let mut pointer_hops = 0;
+    loop {
+        let len = *data.get(offset).context("Truncated DNS name")?;
+        offset += 1;
+        if compression && len & 0xc0 == 0xc0 {
+            pointer_hops += 1;
+            anyhow::ensure!(pointer_hops <= 32, "Too many DNS compression pointers");
+            let low = *data.get(offset).context("Truncated DNS pointer")?;
+            let target = (usize::from(len & 0x3f) << 8) | usize::from(low);
+            anyhow::ensure!(target < offset - 1, "Invalid DNS pointer");
+            if !jumped {
+                *pos = offset + 1;
+                jumped = true;
+            }
+            offset = target;
+            continue;
+        }
+        if len == 0 {
+            if !jumped {
+                *pos = offset;
+            }
+            return Ok(name);
+        }
+        anyhow::ensure!(len <= 63, "Invalid DNS label length");
+        let end = offset + usize::from(len);
+        let label = data.get(offset..end).context("Truncated DNS label")?;
+        anyhow::ensure!(
+            label
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+            "Invalid DNS label"
+        );
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(std::str::from_utf8(label)?);
+        anyhow::ensure!(name.len() <= 253, "DNS name too long");
+        offset = end;
+    }
+}
+
+fn parse_ech_service(data: &[u8], query: &[u8], owner: &str) -> anyhow::Result<EchAnswer> {
+    anyhow::ensure!(
+        data.len() >= 12
+            && data[..2] == query[..2]
+            && data[2] & 0xfa == 0x80
+            && data[3] & 0x0f == 0
+            && data[4..6] == [0, 1],
+        "Invalid HTTPS DNS response"
+    );
+    let mut offset = 12;
+    let question = read_dns_name(data, &mut offset, true)?;
+    anyhow::ensure!(
+        question.eq_ignore_ascii_case(owner)
+            && data.get(offset..offset + 4) == Some(&[0, 65, 0, 1]),
+        "HTTPS DNS question mismatch"
+    );
+    offset += 4;
+    let mut alias = None;
+    let mut selected: Option<(u16, EchAnswer)> = None;
+    for _ in 0..u16::from_be_bytes([data[6], data[7]]) {
+        let name = read_dns_name(data, &mut offset, true)?;
+        let header = data
+            .get(offset..offset + 10)
+            .context("Truncated DNS answer")?;
+        let kind = u16::from_be_bytes([header[0], header[1]]);
+        let start = offset + 10;
+        offset = start + usize::from(u16::from_be_bytes([header[8], header[9]]));
+        let rdata = data
+            .get(start..offset)
+            .context("Truncated DNS answer data")?;
+        if !name.eq_ignore_ascii_case(owner) || header[2..4] != [0, 1] {
+            continue;
+        }
+        if kind == 5 {
+            let mut pos = start;
+            let target = read_dns_name(data, &mut pos, true)?;
+            anyhow::ensure!(pos == offset && !target.is_empty(), "Invalid CNAME target");
+            alias = Some(target);
+        } else if kind == 65 {
+            let priority = u16::from_be_bytes(
+                rdata
+                    .get(..2)
+                    .context("Missing HTTPS service priority")?
+                    .try_into()?,
+            );
+            let mut pos = 2;
+            let target = read_dns_name(rdata, &mut pos, false)?;
+            if priority == 0 {
+                anyhow::ensure!(
+                    !target.is_empty(),
+                    "HTTPS alias indicates unavailable service"
+                );
+                alias = Some(target);
+            } else if selected
+                .as_ref()
+                .map_or(true, |(current, _)| priority < *current)
+            {
+                if let Some((port, config)) = parse_ech_params(&rdata[pos..])? {
+                    selected = Some((
+                        priority,
+                        EchAnswer::Service {
+                            target,
+                            port,
+                            config,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    alias
+        .map(EchAnswer::Alias)
+        .or_else(|| selected.map(|(_, record)| record))
+        .context("No compatible HTTPS record with ECH for HTTP/1.1")
+}
+
+fn parse_ech_params(mut bytes: &[u8]) -> anyhow::Result<Option<(Option<u16>, Vec<u8>)>> {
+    let (mut previous, mut port, mut config) = (None, None, None);
+    let (mut alpn, mut no_default_alpn) = (None, false);
+    let mut present = 0u8;
+    let mut mandatory = 0u8;
+    while !bytes.is_empty() {
+        let [a, b, c, d]: [u8; 4] = bytes
+            .get(..4)
+            .context("Truncated HTTPS parameter")?
+            .try_into()?;
+        let key = u16::from_be_bytes([a, b]);
+        anyhow::ensure!(
+            previous.map_or(true, |prior| prior < key),
+            "Unordered HTTPS parameters"
+        );
+        previous = Some(key);
+        let len = usize::from(u16::from_be_bytes([c, d]));
+        let value = bytes
+            .get(4..4 + len)
+            .context("Truncated HTTPS parameter value")?;
+        bytes = &bytes[4 + len..];
+        if key <= 5 {
+            present |= 1 << key;
+        }
+        match key {
+            0 => {
+                let keys = value.chunks_exact(2);
+                anyhow::ensure!(
+                    !value.is_empty() && keys.remainder().is_empty(),
+                    "Invalid HTTPS mandatory list"
+                );
+                let mut previous = 0;
+                for key in keys {
+                    let key = u16::from_be_bytes([key[0], key[1]]);
+                    anyhow::ensure!(key > previous, "Unordered HTTPS mandatory list");
+                    previous = key;
+                    // This client does not use address hints or unknown keys.
+                    if !matches!(key, 1 | 2 | 3 | 5) {
+                        return Ok(None);
+                    }
+                    mandatory |= 1 << key;
+                }
+            }
+            1 => {
+                let mut protocols = value;
+                let mut http11 = false;
+                while let Some((&len, rest)) = protocols.split_first() {
+                    anyhow::ensure!(
+                        len != 0 && usize::from(len) <= rest.len(),
+                        "Invalid HTTPS ALPN list"
+                    );
+                    let (protocol, remaining) = rest.split_at(usize::from(len));
+                    http11 |= protocol == b"http/1.1";
+                    protocols = remaining;
+                }
+                alpn = Some(http11);
+            }
+            2 => {
+                anyhow::ensure!(value.is_empty(), "Invalid no-default-alpn parameter");
+                no_default_alpn = true;
+            }
+            3 => {
+                let parsed = u16::from_be_bytes(value.try_into().context("Invalid HTTPS port")?);
+                anyhow::ensure!(parsed != 0, "Invalid HTTPS port");
+                port = Some(parsed);
+            }
+            5 if !value.is_empty() => config = Some(value.to_vec()),
+            _ => {}
+        }
+    }
+    if mandatory & !present != 0 {
+        return Ok(None);
+    }
+    Ok(if alpn.unwrap_or(false) || !no_default_alpn {
+        config.map(|value| (port, value))
+    } else {
+        None
+    })
 }
 
 /// Skip a DNS name (labels or pointer compression) and return the position after it.

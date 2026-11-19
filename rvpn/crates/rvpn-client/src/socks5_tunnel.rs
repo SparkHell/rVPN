@@ -218,14 +218,18 @@ impl Socks5Tunnel {
 
         let (mut ws_reader, ws_writer, ws_tasks) = split_websocket(ws_stream);
 
-        let ratchet = Self::perform_handshake(
-            &mut ws_reader,
-            &ws_writer,
-            identity_key,
-            server_bundle,
-            host,
-            port,
-            server_identity_config,
+        let ratchet = crate::websocket::connect_stage(
+            "x3dh_handshake",
+            std::time::Duration::from_secs(15),
+            Self::perform_handshake(
+                &mut ws_reader,
+                &ws_writer,
+                identity_key,
+                server_bundle,
+                host,
+                port,
+                server_identity_config,
+            ),
         )
         .await?;
 
@@ -959,6 +963,7 @@ pub async fn handle_multiplexed_connection(
         .ok_or_else(|| anyhow::anyhow!("Invalid target format"))?;
     let port: u16 = port.parse().map_err(|_| anyhow::anyhow!("Invalid port"))?;
 
+    let mut flow_started = Some(std::time::Instant::now());
     let mut flow = tunnel
         .open_flow(host, port)
         .await
@@ -990,6 +995,13 @@ pub async fn handle_multiplexed_connection(
                     Some(d) => {
                         crate::dashboard::record_bytes_down(d.len() as u64);
                         if client_write.write_all(&d).await.is_err() { break; }
+                        if let Some(started) = flow_started.take() {
+                            tracing::debug!(
+                                stage = "mux_flow_first_inbound_data",
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "VPN connection stage completed"
+                            );
+                        }
                         // Flow control: grant the server credits for the
                         // bytes just handed to the local application socket.
                         tunnel.send_window_update(flow_id, d.len() as u32).await;

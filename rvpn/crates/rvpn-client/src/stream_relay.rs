@@ -29,6 +29,7 @@ use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketRea
 ///
 /// Manages a single WebSocket connection with X3DH + Double Ratchet encryption.
 pub struct StreamRelay {
+    connect_started: std::time::Instant,
     /// Double Ratchet state for encryption/decryption
     ratchet: DoubleRatchet,
 }
@@ -68,6 +69,7 @@ impl StreamRelay {
         // Times the handshake; records handshake_fail on any early error
         // return, handshake_ok on success (dashboard no-ops when disabled).
         let probe = crate::dashboard::HandshakeProbe::start();
+        let connect_started = std::time::Instant::now();
 
         // Step 1: Establish WebSocket connection
         let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname, resumption)
@@ -82,21 +84,28 @@ impl StreamRelay {
         // Step 3: Perform X3DH handshake and initialize Double Ratchet.
         // If the handshake fails, `ws_tasks` drops here and its Drop impl
         // signals the reader/writer/ping helper tasks to stop.
-        let ratchet = Self::perform_handshake(
-            &mut ws_reader,
-            &mut ws_writer,
-            identity_key,
-            server_bundle,
-            host,
-            port,
-            server_identity_config,
+        let ratchet = crate::websocket::connect_stage(
+            "x3dh_handshake",
+            std::time::Duration::from_secs(15),
+            Self::perform_handshake(
+                &mut ws_reader,
+                &mut ws_writer,
+                identity_key,
+                server_bundle,
+                host,
+                port,
+                server_identity_config,
+            ),
         )
         .await?;
 
         debug!("StreamRelay X3DH handshake completed successfully");
         probe.success();
 
-        let relay = Self { ratchet };
+        let relay = Self {
+            ratchet,
+            connect_started,
+        };
 
         Ok((relay, ws_reader, ws_writer, ws_tasks))
     }
@@ -533,11 +542,19 @@ impl StreamRelay {
 
         // Task 3: Write decrypted data to local
         let write_task = async move {
+            let mut connect_started = Some(self.connect_started);
             while let Some(data) = rx.recv().await {
                 crate::dashboard::record_bytes_down(data.len() as u64);
                 if let Err(e) = local_write.write_all(&data).await {
                     warn!("Error writing to local: {}", e);
                     return Err(e.into());
+                }
+                if let Some(started) = connect_started.take() {
+                    tracing::debug!(
+                        stage = "proxy_first_inbound_data",
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "VPN connection stage completed"
+                    );
                 }
                 tracing::trace!("Relayed {} bytes remote->local", data.len());
             }
@@ -641,7 +658,10 @@ mod tests {
 
         let secret = [7u8; 32];
         let ratchet = DoubleRatchet::init_alice(secret, [0u8; 32]);
-        let relay = StreamRelay { ratchet };
+        let relay = StreamRelay {
+            ratchet,
+            connect_started: std::time::Instant::now(),
+        };
 
         let relay_task = tokio::spawn(async move {
             let result = relay.relay(local_stream, ws_reader, ws_writer).await;

@@ -331,6 +331,20 @@ pub async fn connect_chrome_like_with_resumption(
     let tcp = TcpStream::connect(&addr)
         .await
         .with_context(|| format!("Failed to connect to {}", addr))?;
+    let sni = sni_hostname.unwrap_or(host);
+    connect_boring_over_tcp(tcp, fingerprint, sni, resumption, None).await
+}
+
+/// Establish TLS over an already connected socket. When an ECHConfigList is
+/// provided, only an ECH-accepted handshake may return a stream.
+#[cfg(not(target_os = "android"))]
+pub async fn connect_boring_over_tcp(
+    tcp: TcpStream,
+    fingerprint: TlsFingerprint,
+    sni: &str,
+    resumption: Option<&ResumptionStore>,
+    ech_config: Option<&[u8]>,
+) -> Result<ChromeTlsStream> {
     let tcp = enable_tcp_keepalive(tcp).context("Failed to enable TCP keepalive")?;
 
     if fingerprint == TlsFingerprint::None {
@@ -338,15 +352,19 @@ pub async fn connect_chrome_like_with_resumption(
             debug!("TLS resumption store ignored for TlsFingerprint::None");
         }
         // Standard TLS without fingerprinting
-        return connect_standard(tcp, host, sni_hostname).await;
+        return connect_standard(tcp, sni, ech_config).await;
     }
 
-    // Determine actual SNI hostname for the TLS handshake
-    let sni = sni_hostname.unwrap_or(host);
+    // Keep ECH sessions separate from ordinary sessions and from rotated keys.
+    // Required ECH connections currently perform a full handshake on each dial.
+    if let Some(ech_config) = ech_config {
+        let connector = build_chrome_connector(sni, None)?;
+        return handshake(&connector, tcp, sni, None, Some(ech_config)).await;
+    }
 
     match resumption {
         None => {
-            let connector = build_chrome_connector(host, sni_hostname)?;
+            let connector = build_chrome_connector(sni, None)?;
             connect_with_connector(&connector, tcp, sni, None).await
         }
         Some(store) => {
@@ -355,7 +373,7 @@ pub async fn connect_chrome_like_with_resumption(
             // the same `SslContext` (the `set_session` safety contract).
             let slot = store.boring_connector_slot();
             if slot.get().is_none() {
-                let connector = build_chrome_connector_ext(host, sni_hostname, Some(store), None)?;
+                let connector = build_chrome_connector_ext(sni, None, Some(store), None)?;
                 // If another thread raced us, keep the winner's instance.
                 let _ = slot.set(connector);
             }
@@ -374,8 +392,72 @@ async fn connect_with_connector(
     sni: &str,
     resumption: Option<&ResumptionStore>,
 ) -> Result<ChromeTlsStream> {
-    // Configure SSL with SNI
+    handshake(connector, tcp, sni, resumption, None).await
+}
+
+#[cfg(not(target_os = "android"))]
+async fn handshake(
+    connector: &SslConnector,
+    tcp: TcpStream,
+    sni: &str,
+    resumption: Option<&ResumptionStore>,
+    ech_config: Option<&[u8]>,
+) -> Result<ChromeTlsStream> {
+    let peer = if ech_config.is_some() {
+        Some(tcp.peer_addr()?)
+    } else {
+        None
+    };
+    let result = handshake_once(connector, tcp, sni, resumption, ech_config).await;
+    if let (Some(peer), Err(error)) = (peer, &result) {
+        if let Some(retry) = authenticated_ech_retry(error) {
+            debug!("Retrying ECH once with the server's authenticated configuration");
+            let tcp = enable_tcp_keepalive(TcpStream::connect(peer).await?)?;
+            return handshake_once(connector, tcp, sni, None, Some(retry))
+                .await
+                .context("ECH retry failed");
+        }
+    }
+    result
+}
+
+#[cfg(not(target_os = "android"))]
+fn authenticated_ech_retry(error: &anyhow::Error) -> Option<&[u8]> {
+    use std::error::Error as _;
+
+    let handshake = error.downcast_ref::<tokio_boring::HandshakeError<TcpStream>>()?;
+    let ssl_error = handshake.source()?.downcast_ref::<boring::ssl::Error>()?;
+    // BoringSSL exposes retry configs only after authenticating the public
+    // name and signalling ECH_REJECTED. The accessor must not be called for
+    // other TLS errors, including certificate verification failures.
+    if !ssl_error
+        .ssl_error()?
+        .errors()
+        .iter()
+        .any(|item| item.reason() == Some("ECH_REJECTED"))
+    {
+        return None;
+    }
+    handshake
+        .ssl()?
+        .get_ech_retry_configs()
+        .filter(|config| !config.is_empty())
+}
+
+#[cfg(not(target_os = "android"))]
+async fn handshake_once(
+    connector: &SslConnector,
+    tcp: TcpStream,
+    sni: &str,
+    resumption: Option<&ResumptionStore>,
+    ech_config: Option<&[u8]>,
+) -> Result<ChromeTlsStream> {
     let mut config = connector.configure().context("Failed to configure SSL")?;
+    if let Some(ech_config) = ech_config {
+        config
+            .set_ech_config_list(&supported_ech_config(ech_config)?)
+            .context("Invalid ECHConfigList")?;
+    }
 
     if let Some(store) = resumption {
         if let Some(session) = store.boring_take_session(sni) {
@@ -402,24 +484,109 @@ async fn connect_with_connector(
     // Connect with domain (this performs the TLS handshake)
     let stream = tokio_boring::connect(config, sni, tcp)
         .await
-        .context("TLS handshake failed")?;
+        .with_context(|| {
+            if ech_config.is_some() {
+                "Required ECH handshake failed"
+            } else {
+                "TLS handshake failed"
+            }
+        })?;
+    anyhow::ensure!(
+        ech_config.is_none() || stream.ssl().ech_accepted(),
+        "Server did not accept required ECH"
+    );
 
     debug!(
-        "TLS handshake completed successfully (session_reused={})",
-        stream.ssl().session_reused()
+        session_reused = stream.ssl().session_reused(),
+        ech_accepted = stream.ssl().ech_accepted(),
+        "TLS handshake completed successfully"
     );
 
     Ok(ChromeTlsStream::new(stream))
 }
 
+// BoringSSL accepts well-formed lists with no usable config and sends an
+// ordinary ClientHello in that case. For required ECH, pass only a config
+// known to satisfy the pinned backend's selection rules before any TLS I/O.
+fn supported_ech_config(input: &[u8]) -> Result<Vec<u8>> {
+    fn take<'a>(input: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+        let value = input.get(..len)?;
+        *input = &input[len..];
+        Some(value)
+    }
+
+    fn take_vec<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let len = u16::from_be_bytes(take(input, 2)?.try_into().ok()?);
+        take(input, usize::from(len))
+    }
+
+    fn supported(mut contents: &[u8]) -> Option<()> {
+        // The locked BoringSSL backend supports X25519 + HKDF-SHA256.
+        if take(&mut contents, 3)?.get(1..)? != [0, 0x20] {
+            return None;
+        }
+        if take_vec(&mut contents)?.len() != 32 {
+            return None;
+        }
+        let cipher_suites = take_vec(&mut contents)?.chunks_exact(4);
+        if !cipher_suites.remainder().is_empty()
+            || !cipher_suites
+                .into_iter()
+                .any(|suite| matches!(suite, [0, 1, 0, 1..=3]))
+        {
+            return None;
+        }
+        let name_len = usize::from(*take(&mut contents, 2)?.get(1)?);
+        let public_name = take(&mut contents, name_len)?;
+        let mut labels = public_name.rsplit(|&byte| byte == b'.');
+        let last = labels.next()?;
+        if !last.first()?.is_ascii_alphabetic()
+            || !std::iter::once(last).chain(labels).all(|label| {
+                (1..=63).contains(&label.len())
+                    && label
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+                    && !label.starts_with(b"-")
+                    && !label.ends_with(b"-")
+            })
+        {
+            return None;
+        }
+        let mut extensions = take_vec(&mut contents)?;
+        while !extensions.is_empty() {
+            // The backend ignores optional extensions and skips configs with
+            // unrecognized mandatory extensions.
+            if take(&mut extensions, 2)?[0] & 0x80 != 0 {
+                return None;
+            }
+            take_vec(&mut extensions)?;
+        }
+        contents.is_empty().then_some(())
+    }
+
+    let mut remainder = input;
+    let mut configs = take_vec(&mut remainder).context("Invalid ECHConfigList length")?;
+    anyhow::ensure!(remainder.is_empty(), "Trailing bytes in ECHConfigList");
+    while !configs.is_empty() {
+        let start = configs;
+        let version = take(&mut configs, 2).context("Missing ECHConfig version")?;
+        let contents = take_vec(&mut configs).context("Invalid ECHConfig length")?;
+        if version == [0xfe, 0x0d] && supported(contents).is_some() {
+            let encoded = &start[..start.len() - configs.len()];
+            let mut list = (encoded.len() as u16).to_be_bytes().to_vec();
+            list.extend_from_slice(encoded);
+            return Ok(list);
+        }
+    }
+    anyhow::bail!("No ECHConfig supported by this TLS backend")
+}
+
 /// Standard TLS connection without fingerprinting
 async fn connect_standard(
     tcp: TcpStream,
-    host: &str,
-    sni_hostname: Option<&str>,
+    sni: &str,
+    ech_config: Option<&[u8]>,
 ) -> Result<ChromeTlsStream> {
-    let tcp = enable_tcp_keepalive(tcp).context("Failed to enable TCP keepalive")?;
-
     let method = SslMethod::tls();
     let mut builder = SslConnector::builder(method).context("Failed to create SSL connector")?;
 
@@ -429,9 +596,6 @@ async fn connect_standard(
 
     // ALPN: http/1.1 only (must match build_chrome_connector — see comment there)
     builder.set_alpn_protos(b"\x08http/1.1")?;
-
-    // SNI is set via tokio_boring::connect(config, sni, tcp)
-    let sni = sni_hostname.unwrap_or(host);
 
     // Certificate verification — same iOS/non-iOS split as build_chrome_connector.
     #[cfg(target_os = "ios")]
@@ -445,19 +609,7 @@ async fn connect_standard(
             .context("Failed to install system TLS trust store")?;
     }
 
-    let connector = builder.build();
-    let config = connector.configure()?;
-
-    debug!(
-        "Standard TLS config created with ALPN: http/1.1, TLS 1.3 only, SNI: {}",
-        sni
-    );
-
-    let stream = tokio_boring::connect(config, sni, tcp).await?;
-
-    debug!("Standard TLS handshake completed successfully");
-
-    Ok(ChromeTlsStream::new(stream))
+    handshake(&builder.build(), tcp, sni, None, ech_config).await
 }
 
 /// Connect with specific TLS fingerprint (legacy function for compatibility)
@@ -516,8 +668,17 @@ mod tests {
         /// tickets per connection by default. Returns the address and the
         /// self-signed certificate (for the client's trust store).
         async fn spawn_test_server() -> (SocketAddr, X509) {
-            let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                .expect("self-signed cert");
+            spawn_test_server_with_ech(None).await
+        }
+
+        async fn spawn_test_server_with_ech(
+            ech: Option<&boring::ssl::SslEchKeys>,
+        ) -> (SocketAddr, X509) {
+            let certified = rcgen::generate_simple_self_signed(vec![
+                "localhost".to_string(),
+                "public.example".to_string(),
+            ])
+            .expect("self-signed cert");
             let cert = X509::from_der(certified.cert.der().as_ref()).expect("parse cert");
             let pkey =
                 PKey::private_key_from_der(&certified.key_pair.serialize_der()).expect("parse key");
@@ -533,6 +694,9 @@ mod tests {
             builder.set_certificate(&cert).unwrap();
             builder.set_private_key(&pkey).unwrap();
             builder.check_private_key().unwrap();
+            if let Some(ech) = ech {
+                builder.set_ech_keys(ech).unwrap();
+            }
             let acceptor = Arc::new(builder.build());
 
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -564,6 +728,111 @@ mod tests {
                 }
             });
             (addr, cert)
+        }
+
+        fn generate_ech_keys() -> (boring::ssl::SslEchKeys, Vec<u8>) {
+            use boring::{hpke::HpkeKey, ssl::SslEchKeys};
+
+            let private = PKey::generate(boring::pkey::Id::X25519).unwrap();
+            let mut public_bytes = [0; 32];
+            let public = private.raw_public_key(&mut public_bytes).unwrap();
+            let mut contents = vec![1, 0, 0x20]; // config_id, DHKEM(X25519, HKDF-SHA256)
+            contents.extend((public.len() as u16).to_be_bytes());
+            contents.extend(public);
+            contents.extend([0, 4, 0, 1, 0, 1]); // HKDF-SHA256 and AES-128-GCM
+            let name = b"public.example";
+            contents.extend([0, name.len() as u8]); // max name length, public name length
+            contents.extend(name);
+            contents.extend([0, 0]); // Empty extensions vector
+            let mut config = vec![0xfe, 0x0d];
+            config.extend((contents.len() as u16).to_be_bytes());
+            config.extend(contents);
+
+            let mut private_bytes = [0; 32];
+            let key =
+                HpkeKey::dhkem_p256_sha256(private.raw_private_key(&mut private_bytes).unwrap())
+                    .unwrap();
+            let mut keys = SslEchKeys::builder().unwrap();
+            keys.add_key(true, &config, key).unwrap();
+            let mut list = (config.len() as u16).to_be_bytes().to_vec();
+            list.extend(config);
+            (keys.build(), list)
+        }
+
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        #[tokio::test]
+        async fn required_ech_rejects_unknown_config_version_before_tls_io() {
+            let (_, mut config) = generate_ech_keys();
+            config[3] = 0;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tcp = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let error = connect_boring_over_tcp(
+                tcp,
+                TlsFingerprint::Chrome,
+                "localhost",
+                None,
+                Some(&config),
+            )
+            .await
+            .err()
+            .expect("unsupported config must fail");
+            assert!(error.to_string().contains("No ECHConfig supported"));
+            let mut hello = [0u8; 1];
+            let received = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut hello))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, 0, "unsupported ECH must send no TLS bytes");
+        }
+
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        #[tokio::test]
+        async fn required_ech_accepts_current_key_and_retries_authenticated_rotation() {
+            let (_, stale_config) = generate_ech_keys();
+            let (keys, config) = generate_ech_keys();
+            let (addr, cert) = spawn_test_server_with_ech(Some(&keys)).await;
+            let trust = trust_store_from_der([cert.to_der().unwrap().as_slice()]).unwrap();
+            let connector =
+                build_chrome_connector_ext("localhost", None, None, Some(trust)).unwrap();
+
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let error = handshake_once(&connector, tcp, "localhost", None, Some(&stale_config))
+                .await
+                .err()
+                .expect("stale ECH key must fail the first handshake");
+            assert_eq!(authenticated_ech_retry(&error), Some(config.as_slice()));
+
+            for config in [&stale_config, &config] {
+                let tcp = TcpStream::connect(addr).await.unwrap();
+                let mut stream = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    handshake(&connector, tcp, "localhost", None, Some(config)),
+                )
+                .await
+                .unwrap()
+                .expect("ECH must succeed with the current or authenticated retry config");
+                assert!(stream.inner.ssl().ech_accepted());
+                let mut data = [0];
+                stream.read_exact(&mut data).await.unwrap();
+                assert_eq!(data, *b"x");
+            }
+
+            let untrusted = build_chrome_connector_ext(
+                "localhost",
+                None,
+                None,
+                Some(X509StoreBuilder::new().unwrap().build()),
+            )
+            .unwrap();
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let error = handshake(&untrusted, tcp, "localhost", None, Some(&stale_config))
+                .await
+                .err()
+                .expect("the retry certificate must be trusted");
+            assert!(authenticated_ech_retry(&error).is_none());
         }
 
         #[cfg(not(any(target_os = "ios", target_os = "android")))]

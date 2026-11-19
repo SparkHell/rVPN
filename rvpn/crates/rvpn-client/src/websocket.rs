@@ -20,9 +20,7 @@ use tracing::trace;
 pub use tungstenite::Message;
 
 #[cfg(not(target_os = "android"))]
-use rvpn_tls::{
-    ChromeTlsStream, ResumptionStore, TlsFingerprint, connect_chrome_like_with_resumption,
-};
+use rvpn_tls::{connect_boring_over_tcp, ChromeTlsStream, ResumptionStore, TlsFingerprint};
 
 /// WebSocket reader type (receives messages)
 pub type WebSocketReader = tokio::sync::mpsc::Receiver<Message>;
@@ -35,9 +33,27 @@ pub type WebSocketReader = tokio::sync::mpsc::Receiver<Message>;
 /// backpressure reach TCP instead of the heap.
 const WS_CHANNEL_CAPACITY: usize = 256;
 
-/// Optional DoH resolver for VPN endpoint DNS, shared across reconnects.
+/// Endpoint DNS and ECH policy are updated together on configuration reload.
 #[cfg(not(target_os = "android"))]
-static ENDPOINT_DNS: std::sync::RwLock<Option<std::sync::Arc<crate::dns_cache::DnsResolver>>> = std::sync::RwLock::new(None);
+#[derive(Clone)]
+struct EndpointDns {
+    resolver: Option<std::sync::Arc<crate::dns_cache::DnsResolver>>,
+    require_ech: bool,
+}
+
+#[cfg(not(target_os = "android"))]
+static ENDPOINT_DNS: std::sync::RwLock<EndpointDns> = std::sync::RwLock::new(EndpointDns {
+    resolver: None,
+    require_ech: false,
+});
+
+#[cfg(not(target_os = "android"))]
+fn endpoint_dns() -> EndpointDns {
+    ENDPOINT_DNS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 #[cfg(not(target_os = "android"))]
 pub fn configure_endpoint_dns(client_config: &crate::config::ClientConfig) -> Result<()> {
@@ -47,6 +63,11 @@ pub fn configure_endpoint_dns(client_config: &crate::config::ClientConfig) -> Re
     } else {
         &config.dns_servers
     };
+    anyhow::ensure!(
+        !config.require_ech
+            || (!nameservers.is_empty() && nameservers.iter().all(|ns| ns.starts_with("https://"))),
+        "network.require_ech requires an HTTPS-only DNS upstream list"
+    );
     let resolver = if nameservers.iter().any(|ns| ns.contains("://")) {
         let resolver = crate::dns_cache::DnsResolver::new(
             config.dns_cache_enabled,
@@ -57,17 +78,45 @@ pub fn configure_endpoint_dns(client_config: &crate::config::ClientConfig) -> Re
             vec![],
         ).with_nameservers(nameservers)?;
         Some(std::sync::Arc::new(resolver))
-    } else { None };
-    *ENDPOINT_DNS.write().unwrap_or_else(|e| e.into_inner()) = resolver;
+    } else {
+        None
+    };
+    *ENDPOINT_DNS.write().unwrap_or_else(|e| e.into_inner()) = EndpointDns {
+        resolver,
+        require_ech: config.require_ech,
+    };
     Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn connect_stage<T, E>(
+    stage: &'static str,
+    limit: Duration,
+    operation: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+    E: Into<anyhow::Error>,
+{
+    let started = std::time::Instant::now();
+    let result = match tokio::time::timeout(limit, operation).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(anyhow::anyhow!("timed out after {}s", limit.as_secs())),
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => tracing::debug!(stage, elapsed_ms, "VPN connection stage completed"),
+        Err(error) => tracing::warn!(
+            stage, elapsed_ms, error = %format_args!("{error:#}"), "VPN connection stage failed"
+        ),
+    }
+    result.with_context(|| format!("{stage} failed"))
 }
 
 /// Direct connections use the configured DoH resolver too, avoiding a second
 /// hostname lookup by the OS after a split-tunnel decision.
 #[cfg(not(target_os = "android"))]
 pub async fn connect_direct_tcp(host: &str, port: u16) -> Result<tokio::net::TcpStream> {
-    let resolver = ENDPOINT_DNS.read().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(resolver) = resolver {
+    if let Some(resolver) = endpoint_dns().resolver {
         let addresses = resolver.resolve(host, port).await?;
         Ok(tokio::net::TcpStream::connect(addresses.as_slice()).await?)
     } else {
@@ -169,29 +218,45 @@ pub async fn connect_websocket(
     sni_hostname: Option<&str>,
     resumption: Option<&ResumptionStore>,
 ) -> Result<WebSocketStream<ChromeTlsStream>> {
-    // Establish TLS connection with Chrome fingerprint via boring
-    let resolver = ENDPOINT_DNS.read().unwrap_or_else(|e| e.into_inner()).clone();
-    let tls_stream = if let Some(resolver) = resolver {
-        let addresses = resolver.resolve(host, port).await?;
-        let mut connected = None;
-        let mut last_error = None;
-        for addr in addresses {
-            let connect_host = match addr.ip() {
-                std::net::IpAddr::V4(ip) => ip.to_string(),
-                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-            };
-            match connect_chrome_like_with_resumption(
-                &connect_host, port, fingerprint, Some(sni_hostname.unwrap_or(host)), resumption,
-            ).await {
-                Ok(stream) => { connected = Some(stream); break; }
-                Err(e) => last_error = Some(e),
-            }
-        }
-        connected.ok_or_else(|| last_error.unwrap_or_else(|| anyhow::anyhow!("No VPN endpoint addresses")))?
+    let dns = endpoint_dns();
+    let limit = Duration::from_secs(10);
+    let origin = host.trim_end_matches('.');
+    let sni = sni_hostname.unwrap_or(host).trim_end_matches('.');
+    let (target, target_port, ech_config) = if dns.require_ech {
+        anyhow::ensure!(
+            sni.eq_ignore_ascii_case(origin),
+            "Required ECH uses the endpoint hostname as SNI"
+        );
+        let resolver = dns
+            .resolver
+            .as_ref()
+            .context("ECH requires configured DoH")?;
+        let (target, port, config) =
+            connect_stage("dns_https", limit, resolver.resolve_ech(host, port)).await?;
+        (target, port, Some(config))
     } else {
-        connect_chrome_like_with_resumption(host, port, fingerprint, sni_hostname, resumption)
-            .await.context("Failed to establish Chrome-fingerprinted TLS connection")?
+        (host.to_owned(), port, None)
     };
+
+    let addresses = connect_stage("dns_address", limit, async {
+        let target = target.trim_matches(['[', ']']);
+        if let Some(resolver) = &dns.resolver {
+            resolver.resolve(target, target_port).await
+        } else {
+            Ok(tokio::net::lookup_host((target, target_port))
+                .await?
+                .collect())
+        }
+    })
+    .await?;
+    let tls_stream = dial_tls(
+        &addresses,
+        fingerprint,
+        sni,
+        resumption,
+        ech_config.as_deref(),
+    )
+    .await?;
 
     // Build Chrome-like WebSocket upgrade request with 15 headers.
     // Real Chrome 131 sends these on WebSocket upgrade — matching this profile makes
@@ -223,14 +288,64 @@ pub async fn connect_websocket(
         .context("Failed to build WebSocket upgrade request")?;
 
     // Perform WebSocket HTTP/1.1 upgrade over the existing boring TLS stream
-    let (ws_stream, _) = tokio_tungstenite::client_async(request, tls_stream)
-        .await
-        .map_err(|e| {
-            tracing::error!("WebSocket upgrade failed for {}:{}{}: {:?}", host, port, path, e);
-            anyhow::anyhow!("WebSocket upgrade failed: {}", e)
-        })?;
+    upgrade_websocket(request, tls_stream, limit).await
+}
 
-    Ok(ws_stream)
+#[cfg(not(target_os = "android"))]
+async fn upgrade_websocket<S: AsyncRead + AsyncWrite + Unpin>(
+    request: tungstenite::http::Request<()>,
+    stream: S,
+    limit: Duration,
+) -> Result<WebSocketStream<S>> {
+    let (websocket, _) = connect_stage(
+        "websocket_upgrade",
+        limit,
+        tokio_tungstenite::client_async(request, stream),
+    )
+    .await?;
+    Ok(websocket)
+}
+
+#[cfg(not(target_os = "android"))]
+async fn dial_tls(
+    addresses: &[std::net::SocketAddr],
+    fingerprint: TlsFingerprint,
+    sni: &str,
+    resumption: Option<&ResumptionStore>,
+    ech_config: Option<&[u8]>,
+) -> Result<ChromeTlsStream> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let mut last_error = anyhow::anyhow!("No VPN endpoint addresses");
+    for addr in addresses {
+        let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining().is_zero() {
+            break;
+        }
+        let tcp = match connect_stage(
+            "tcp_connect",
+            remaining().min(Duration::from_secs(4)),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(tcp) => tcp,
+            Err(error) => {
+                last_error = error;
+                continue;
+            }
+        };
+        match connect_stage(
+            "tls_handshake",
+            remaining(),
+            connect_boring_over_tcp(tcp, fingerprint, sni, resumption, ech_config),
+        )
+        .await
+        {
+            Ok(tls) => return Ok(tls),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 /// Split WebSocket stream into reader and writer
@@ -384,6 +499,61 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt;
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn websocket_upgrade_reports_rejection_and_allows_later_reconnect() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let request = || {
+            tungstenite::client::IntoClientRequest::into_client_request(
+                "wss://example.test/api/v1/ws",
+            )
+        };
+        let denied = tokio::spawn(async move {
+            let mut end = Vec::new();
+            while !end.ends_with(b"\r\n\r\n") {
+                end.push(server.read_u8().await.unwrap());
+            }
+            server
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let result = upgrade_websocket(request()?, client, Duration::from_secs(1)).await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("websocket_upgrade failed") && error.contains("403"),
+            "{error}"
+        );
+        denied.await?;
+
+        let (client, server) = tokio::io::duplex(4096);
+        let echo = tokio::spawn(async move {
+            let mut socket = tokio_tungstenite::accept_async(server).await?;
+            let message = socket.next().await.unwrap()?;
+            socket.send(message).await
+        });
+        let mut socket = upgrade_websocket(request()?, client, Duration::from_secs(1)).await?;
+        socket.send(Message::Binary(vec![1, 2, 3])).await?;
+        let received = tokio::time::timeout(Duration::from_secs(1), socket.next()).await?;
+        assert_eq!(received.unwrap()?, Message::Binary(vec![1, 2, 3]));
+        echo.await??;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn dns_timeout_surfaces_its_stage() {
+        let result = connect_stage::<(), anyhow::Error>(
+            "dns_address",
+            Duration::ZERO,
+            std::future::pending(),
+        )
+        .await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("dns_address failed: timed out"));
+    }
 
     #[tokio::test]
     async fn peer_close_prevents_additional_data_and_completes_close_handshake() {

@@ -404,22 +404,15 @@ impl DnsProxy {
         &self,
         query_rx: &mut mpsc::UnboundedReceiver<QueryMsg>,
     ) -> Result<()> {
-        // Bound the connect (TCP + TLS handshake + WS upgrade are all
-        // unbounded inside connect_websocket) so a dead/hung server cannot
-        // stall the reconnect loop forever.
-        let ws = tokio::time::timeout(
-            Duration::from_secs(15),
-            connect_websocket(
-                &self.server_host,
-                self.server_port,
-                &self.server_dns_path,
-                self.tls_fingerprint,
-                None, // SNI hostname not needed for DNS proxy (connects to same server)
-                Some(&self.resumption),
-            ),
+        let ws = connect_websocket(
+            &self.server_host,
+            self.server_port,
+            &self.server_dns_path,
+            self.tls_fingerprint,
+            None,
+            Some(&self.resumption),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("DNS proxy: WebSocket connect timed out (15s)"))?
         .context("DNS proxy: WebSocket connect failed")?;
 
         // Split into reader/writer. The task handle is bound for the lifetime
@@ -427,9 +420,18 @@ impl DnsProxy {
         // tasks to stop when the run ends (reconnect or shutdown).
         let (mut reader, writer, _ws_tasks) = split_websocket(ws);
 
-        let mut ratchet = dns_handshake(&mut reader, &writer, &self.identity_key, &self.server_bundle)
-            .await
-            .context("DNS proxy: X3DH handshake failed")?;
+        let mut ratchet = crate::websocket::connect_stage(
+            "x3dh_handshake",
+            Duration::from_secs(15),
+            dns_handshake(
+                &mut reader,
+                &writer,
+                &self.identity_key,
+                &self.server_bundle,
+            ),
+        )
+        .await
+        .context("DNS proxy: X3DH handshake failed")?;
 
         info!(
             "DNS proxy: connected to {}{}",

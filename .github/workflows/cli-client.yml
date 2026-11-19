@@ -20,6 +20,7 @@ on:
       - config/**
       - scripts/update_rule_data.py
       - scripts/test_update_rule_data.py
+      - scripts/test_endpoint_roundtrip.py
   pull_request:
     paths:
       - .github/workflows/cli-client.yml
@@ -32,6 +33,7 @@ on:
       - config/**
       - scripts/update_rule_data.py
       - scripts/test_update_rule_data.py
+      - scripts/test_endpoint_roundtrip.py
 
 permissions:
   contents: read
@@ -139,8 +141,11 @@ jobs:
       - name: Test gfwlist imports and domain routing
         run: cargo test --profile ci-test --locked --package rvpn-split-tunnel --lib --timings
 
-      - name: Test WebSocket close handling
+      - name: Test WebSocket upgrade and close handling
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn websocket::tests --timings
+
+      - name: Test tunnel address and connection recovery
+        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn tunnel::tests --timings
 
       - name: Test server file logging
         run: cargo test --profile ci-test --locked --package rvpn-server --test logging --timings
@@ -148,7 +153,7 @@ jobs:
       - name: Test server configuration and relative paths
         run: cargo test --profile ci-test --locked --package rvpn-server --lib config::tests --timings
 
-      - name: Test system TLS trust and certificate verification
+      - name: Test system TLS trust, certificate verification and ECH
         run: cargo test --profile ci-test --locked --package rvpn-tls --lib tls_boring::tests --timings
 
       - name: Test automatic identity creation
@@ -288,8 +293,11 @@ jobs:
       - name: Test gfwlist imports and domain routing
         run: cargo test --profile ci-test --locked --package rvpn-split-tunnel --lib --timings
 
-      - name: Test WebSocket close handling
+      - name: Test WebSocket upgrade and close handling
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn websocket::tests --timings
+
+      - name: Test tunnel address and connection recovery
+        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn tunnel::tests --timings
 
       - name: Test server file logging
         run: cargo test --profile ci-test --locked --package rvpn-server --test logging --timings
@@ -297,7 +305,7 @@ jobs:
       - name: Test server configuration and relative paths
         run: cargo test --profile ci-test --locked --package rvpn-server --lib config::tests --timings
 
-      - name: Test system TLS trust and certificate verification
+      - name: Test system TLS trust, certificate verification and ECH
         run: cargo test --profile ci-test --locked --package rvpn-tls --lib tls_boring::tests --timings
 
       - name: Test automatic identity creation
@@ -311,6 +319,10 @@ jobs:
 
       - name: Test server first startup and key rotation
         run: cargo test --profile ci-test --locked --package rvpn-server --test rotation_ceremony --timings
+
+      - name: Test local SOCKS5 data and server restart recovery
+        if: matrix.artifact == 'linux-x86_64'
+        run: python3 ../scripts/test_endpoint_roundtrip.py --client target/release/rvpn --server target/release/rvpn-server
 
       - name: Upload build timing reports
         if: always()

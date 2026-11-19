@@ -90,6 +90,7 @@ impl VpnTunnel {
         // error return, handshake_ok on success (dashboard no-ops when
         // disabled).
         let probe = crate::dashboard::HandshakeProbe::start();
+        let connect_started = std::time::Instant::now();
 
         // Load identity key
         let identity_key = Arc::new(IdentityKey::load(identity_key_file)
@@ -122,18 +123,23 @@ impl VpnTunnel {
         let (mut ws_reader, ws_writer, ws_tasks) = split_websocket(ws_stream);
 
         // Step 3: Perform X3DH handshake and initialize Double Ratchet
-        let ratchet = Self::perform_handshake(
-            &mut ws_reader,
-            &ws_writer,
-            &identity_key,
-            &server_bundle,
-            host,
-            port,
-            server_identity_config,
+        let ratchet = crate::websocket::connect_stage(
+            "x3dh_handshake",
+            std::time::Duration::from_secs(15),
+            Self::perform_handshake(
+                &mut ws_reader,
+                &ws_writer,
+                &identity_key,
+                &server_bundle,
+                host,
+                port,
+                server_identity_config,
+            ),
         )
         .await?;
 
         info!("VPN tunnel X3DH handshake completed successfully");
+        probe.success();
 
         // Create channels for receiving data from tunnel
         let (recv_mux_tx, recv_mux_rx) = mpsc::unbounded_channel::<MultiplexedFrame>();
@@ -147,32 +153,30 @@ impl VpnTunnel {
         let ratchet_clone = Arc::clone(&ratchet);
         let connected_clone = Arc::clone(&connected);
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::receive_loop(ws_reader, recv_mux_tx, ratchet_clone, virtual_ip_tx, connected_clone).await
+            if let Err(e) = Self::receive_loop(
+                ws_reader,
+                recv_mux_tx,
+                ratchet_clone,
+                virtual_ip_tx,
+                connected_clone,
+                connect_started,
+            )
+            .await
             {
                 error!("Tunnel receive loop error: {}", e);
             }
         });
 
-        // Wait for VirtualIp assignment from server (with timeout)
-        let virtual_ip_assignment = tokio::time::timeout(
+        let (virtual_ip, gateway_ip, mtu) = match wait_for_virtual_ip(
+            &mut virtual_ip_rx,
             std::time::Duration::from_secs(5),
-            virtual_ip_rx.recv()
-        ).await;
-
-        let (virtual_ip, gateway_ip, mtu) = match virtual_ip_assignment {
-            Ok(Some(vip)) => {
-                info!("Received VirtualIp assignment: ipv4={:?}, gateway={:?}, dns={:?}, mtu={}",
-                      vip.ipv4, vip.gateway_ip, vip.dns_servers, vip.mtu);
-                (vip.ipv4, vip.gateway_ip, vip.mtu)
-            }
-            Ok(None) => {
-                warn!("VirtualIp channel closed without receiving assignment");
-                (None, None, 1420) // Default MTU
-            }
-            Err(_) => {
-                warn!("Timeout waiting for VirtualIp assignment from server");
-                (None, None, 1420) // Default MTU
+        )
+        .await
+        {
+            Ok(vip) => (vip.ipv4, vip.gateway_ip, vip.mtu),
+            Err(error) => {
+                warn!(%error, "Tunnel authenticated without an assigned IPv4 address");
+                (None, None, 1420)
             }
         };
 
@@ -187,7 +191,6 @@ impl VpnTunnel {
             _ws_tasks: ws_tasks,
         };
 
-        probe.success();
         Ok(Arc::new(RwLock::new(tunnel)))
     }
 
@@ -387,6 +390,7 @@ impl VpnTunnel {
         ratchet: Arc<Mutex<DoubleRatchet>>,
         virtual_ip_tx: mpsc::Sender<rvpn_core::protocol::VirtualIp>,
         connected: Arc<AtomicBool>,
+        connect_started: std::time::Instant,
     ) -> Result<()> {
         use rvpn_core::crypto::ratchet::RatchetMessage;
 
@@ -394,6 +398,7 @@ impl VpnTunnel {
 
         // Track if we've sent the VirtualIp (only need to send first one)
         let mut virtual_ip_sent = false;
+        let mut first_ip_packet = true;
 
         loop {
             match ws_reader.recv().await {
@@ -491,6 +496,14 @@ impl VpnTunnel {
                     // Send frames to TUN device
                     let mut send_failed = false;
                     for frame in frames {
+                        if first_ip_packet && frame.flow_id != 0 {
+                            first_ip_packet = false;
+                            tracing::debug!(
+                                stage = "tun_first_inbound_packet",
+                                elapsed_ms = connect_started.elapsed().as_millis() as u64,
+                                "VPN connection stage completed"
+                            );
+                        }
                         if let Err(e) = recv_mux_tx.send(frame) {
                             warn!("Failed to send frame to TUN device: {}", e);
                             send_failed = true;
@@ -640,11 +653,33 @@ impl VpnTunnel {
     }
 }
 
+async fn wait_for_virtual_ip(
+    receiver: &mut mpsc::Receiver<rvpn_core::protocol::VirtualIp>,
+    timeout: std::time::Duration,
+) -> Result<rvpn_core::protocol::VirtualIp> {
+    crate::websocket::connect_stage("tun_virtual_ip", timeout, async {
+        let vip = receiver.recv().await.context("Assignment channel closed")?;
+        anyhow::ensure!(vip.ipv4.is_some(), "Server did not assign an IPv4 address");
+        Ok(vip)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_vpn_tunnel_creation() {
-        // This is a placeholder test
-        // Real tests would require a mock server
+    use super::*;
+
+    #[tokio::test]
+    async fn virtual_ip_timeout_and_disconnect_are_separate_from_handshake() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let error = wait_for_virtual_ip(&mut receiver, std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("tun_virtual_ip failed: timed out"));
+        drop(sender);
+        let error = wait_for_virtual_ip(&mut receiver, std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("tun_virtual_ip failed: Assignment channel closed"));
     }
 }
