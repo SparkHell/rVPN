@@ -163,6 +163,7 @@ pub struct DashboardState {
     pub dns_cache_hits: AtomicU64,
     dns_gfwlist: AtomicU64,
     recent_dns: Mutex<VecDeque<serde_json::Value>>,
+    recent_proxy: Mutex<VecDeque<ProxyConnection>>,
     /// Cumulative DNS latency, microseconds (all recorded queries).
     pub dns_latency_us_total: AtomicU64,
     /// Cumulative successful tunnel handshakes.
@@ -196,6 +197,7 @@ impl DashboardState {
             dns_cache_hits: AtomicU64::new(0),
             dns_gfwlist: AtomicU64::new(0),
             recent_dns: Mutex::new(VecDeque::with_capacity(64)),
+            recent_proxy: Mutex::new(VecDeque::with_capacity(64)),
             dns_latency_us_total: AtomicU64::new(0),
             handshakes_ok: AtomicU64::new(0),
             handshakes_fail: AtomicU64::new(0),
@@ -348,6 +350,8 @@ pub fn record_conn_blocked() {
     with_state(|s| s.bump(&s.conns_blocked, 1));
 }
 
+pub static TUN_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 static LAST_TLS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 pub fn record_tls_status(status: String) {
     *LAST_TLS.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
@@ -374,6 +378,61 @@ pub fn record_dns(decision: DnsDecision, cache_hit: bool, latency: Duration) {
             s.bump(&s.dns_cache_hits, 1);
         }
         s.bump(&s.dns_latency_us_total, latency.as_micros() as u64);
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+type ProxyProtocol = crate::proxy_common::ProxyProtocol;
+
+#[derive(serde::Serialize)]
+struct ProxyConnection {
+    id: u64,
+    time: u64,
+    host: String,
+    port: u16,
+    protocol: &'static str,
+    route: &'static str,
+    reason: &'static str,
+    connected: bool,
+    ms: u128,
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn record_proxy_connection(
+    host: &str,
+    port: u16,
+    protocol: ProxyProtocol,
+    decision: Option<(rvpn_split_tunnel::RoutingDecision, &'static str)>,
+    connected: bool,
+    elapsed: Duration,
+) {
+    use rvpn_split_tunnel::RoutingDecision;
+    let (route, reason) = match decision {
+        Some((RoutingDecision::Tunnel, reason)) => ("隧道", reason),
+        Some((RoutingDecision::Bypass, reason)) => ("直连", reason),
+        Some((RoutingDecision::Block, reason)) => ("拦截", reason),
+        None => ("未选路", "连接超时"),
+    };
+    with_state(|state| {
+        let mut recent = state.recent_proxy.lock().unwrap_or_else(|e| e.into_inner());
+        let id = recent.front().map_or(1, |entry| entry.id + 1);
+        if recent.len() == 64 {
+            recent.pop_back();
+        }
+        recent.push_front(ProxyConnection {
+            id,
+            time: now_unix(),
+            host: host.chars().take(253).collect(),
+            port,
+            protocol: match protocol {
+                ProxyProtocol::Http => "HTTP",
+                ProxyProtocol::Socks5 => "SOCKS5",
+            },
+            route,
+            reason,
+            connected,
+            ms: elapsed.as_millis(),
+        });
     });
 }
 
@@ -659,7 +718,9 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
         .collect();
 
     serde_json::json!({
+        "tun_ready": TUN_READY.load(Ordering::Relaxed),
         "last_tls": LAST_TLS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        "recent_proxy": *state.recent_proxy.lock().unwrap_or_else(|e| e.into_inner()),
         "recent_dns": *state.recent_dns.lock().unwrap_or_else(|e| e.into_inner()),
         "uptime_secs": uptime,
         "counters": {

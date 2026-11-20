@@ -207,7 +207,6 @@ function Field({
       'auth_username',
       'auth_password',
       'interface_name',
-      'ip_address',
       'fingerprint',
       'directory',
       'bypassNetworksFile',
@@ -573,11 +572,13 @@ function Overview({
         <div className="hero-status">
           <span>当前网络模式</span>
           <strong>
-            {session?.runtime.tun ? 'TUN 全局网络' : 'SOCKS5 代理'}
+            {session?.runtime.tun ? 'TUN 网络' : 'SOCKS5 代理'}
           </strong>
           <span className="live-label">
             <i />
-            端到端加密
+            {session?.runtime.tun
+              ? stats?.tun_ready ? 'TUN 已连接' : 'TUN 等待接管'
+              : '端到端加密'}
           </span>
         </div>
       </section>
@@ -932,6 +933,42 @@ function DnsActivity({ stats }: { stats: Stats | null | undefined }) {
         </div>
       ) : (
         <p>等待本地 DNS 代理接收查询。</p>
+      )}
+    </section>
+  )
+}
+
+function ProxyActivity({ stats }: { stats: Stats | null | undefined }) {
+  const records = stats?.recent_proxy
+  return (
+    <section className="panel config-panel">
+      <h2>最近代理连接</h2>
+      {records?.length ? (
+        <div className="dns-query-scroll">
+          <table>
+            <thead>
+              <tr>
+                {['时间', '目标', '代理', '分流结果', '连接状态', '耗时'].map(
+                  (heading) => <th key={heading}>{heading}</th>,
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {records.map((entry) => (
+                <tr key={entry.id}>
+                  <td>{new Date(entry.time * 1000).toLocaleTimeString()}</td>
+                  <td>{entry.host.includes(':') ? `[${entry.host}]` : entry.host}:{entry.port}</td>
+                  <td>{entry.protocol}</td>
+                  <td>{entry.route} · {entry.reason}</td>
+                  <td>{entry.route === '拦截' ? '已拦截' : entry.connected ? '已连接' : '失败'}</td>
+                  <td>{entry.ms} ms</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p>等待 HTTP 或 SOCKS5 代理连接。</p>
       )}
     </section>
   )
@@ -1617,7 +1654,12 @@ function App() {
                       </section>
                     )
                   })}
-                {page === 'split' && !search && <DnsActivity stats={stats} />}
+                {page === 'split' && !search && (
+                  <>
+                    <DnsActivity stats={stats} />
+                    <ProxyActivity stats={stats} />
+                  </>
+                )}
               </div>
               <div className="save-bar">
                 <div>

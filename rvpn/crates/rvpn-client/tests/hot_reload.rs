@@ -353,6 +353,30 @@ async fn proxy_handshakes_and_http_framing() {
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
+
+        phase = "observe both protocols in live dashboard statistics";
+        loop {
+            let message = panel.next().await.unwrap().unwrap();
+            let Some(stats) = message.to_text().ok().and_then(|frame| serde_json::from_str::<Value>(frame).ok()) else { continue };
+            if stats["type"] != "stats" {
+                continue;
+            }
+            let Some(records) = stats["data"]["recent_proxy"].as_array() else { continue };
+            let has_record = |protocol, port, connected| records.iter().any(|record| {
+                record["protocol"] == json!(protocol)
+                    && record["port"] == json!(port)
+                    && record["connected"] == json!(connected)
+                    && record["route"] == "直连"
+            });
+            if has_record("SOCKS5", target.port(), true)
+                && has_record("HTTP", target.port(), true)
+                && has_record("HTTP", 0, false)
+            {
+                assert_eq!(stats["data"]["counters"]["dns_tunnel"], 0);
+                assert_eq!(stats["data"]["counters"]["dns_bypass"], 0);
+                break;
+            }
+        }
     }).await.unwrap_or_else(|_| panic!("proxy protocol regression timed out during {phase}"));
 }
 
@@ -432,17 +456,14 @@ async fn saves_apply_rebind_roll_back_and_move_panel_without_changing_pid() {
     );
     assert!(TcpStream::connect(next_socks).await.is_ok());
     assert!(TcpStream::connect(http).await.is_ok());
-    // Switching to TUN and back cancels an in-progress reconnect without
-    // requiring a real tunnel or elevated TUN-device privileges in this test.
+    // The fixture has no TUN server and therefore must never report readiness.
     let mut config = current["config"].clone();
     config["tun"]["enabled"] = json!(true);
-    assert_eq!(save(&mut socket, &mut current, config).await["ok"], true);
-    assert_eq!(current["runtime"]["tun"], true);
-    assert!(TcpStream::connect(next_socks).await.is_err());
-    let mut config = current["config"].clone();
-    config["tun"]["enabled"] = json!(false);
-    assert_eq!(save(&mut socket, &mut current, config).await["ok"], true);
+    let rejected = save(&mut socket, &mut current, config).await;
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    assert_eq!(current["runtime"]["tun"], false);
     assert!(TcpStream::connect(next_socks).await.is_ok());
+    assert!(tokio::net::UdpSocket::bind(dns).await.is_err());
     // Moving the panel itself does not rebuild or interrupt the VPN network.
     let mut flow = idle_flow(next_socks).await;
     let next_panel = address();

@@ -85,6 +85,8 @@ pub struct DnsProxy {
     identity_key: Arc<IdentityKey>,
     server_bundle: Arc<X3DHPublicBundle>,
     split_tunnel: Arc<SplitTunnel>,
+    #[cfg(target_os = "linux")]
+    tun_routes: std::sync::RwLock<Option<std::sync::Weak<crate::tun_routes::Routes>>>,
     next_id: AtomicU64,
     /// DNS resolver with caching for both local and tunnel responses
     dns_resolver: Arc<DnsResolver>,
@@ -144,6 +146,8 @@ impl DnsProxy {
             identity_key,
             server_bundle,
             split_tunnel,
+            #[cfg(target_os = "linux")]
+            tun_routes: std::sync::RwLock::new(None),
             next_id: AtomicU64::new(1),
             dns_resolver,
             nameservers,
@@ -151,6 +155,16 @@ impl DnsProxy {
             doh_hosts: Arc::new(doh_hosts),
             resumption: ResumptionStore::new(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn prepare_for_tun(&self) {
+        *self.tun_routes.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Weak::new());
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_tun_routes(&self, routes: &Arc<crate::tun_routes::Routes>) {
+        *self.tun_routes.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(routes));
     }
 
     /// Start the DNS proxy (runs indefinitely, returns only on fatal error)
@@ -202,6 +216,8 @@ impl DnsProxy {
             let nameservers_clone = self.nameservers.clone();
             let server_hosts_clone = Arc::clone(&self.server_hosts);
             let doh_hosts = Arc::clone(&self.doh_hosts);
+            #[cfg(target_os = "linux")]
+            let tun_owner = Arc::clone(&self);
             tokio::spawn(async move {
                 let _permit = permit;
                 let process = async {
@@ -353,6 +369,29 @@ impl DnsProxy {
                                     }
                                 }
                             }};
+                            #[cfg(target_os = "linux")]
+                            let tun_routes = tun_owner.tun_routes.read().unwrap_or_else(|e| e.into_inner()).clone();
+                            #[cfg(target_os = "linux")]
+                            let wire = if let Some(weak) = tun_routes {
+                                let endpoint = is_doh_host || is_server_host;
+                                if let Some(routes) = weak.upgrade() {
+                                    match prepare_tun_answer(&routes, &split_tunnel_clone, &data, &wire,
+                                        &domain, dns_txid, qtype, endpoint).await {
+                                        Ok(Some(answer)) => answer,
+                                        Ok(None) => wire,
+                                        Err(error) => {
+                                            warn!(%error, "Failed to prepare TUN DNS routes");
+                                            build_dns_servfail(&data, dns_txid)
+                                        }
+                                    }
+                                } else if !endpoint && decision != RoutingDecision::Block {
+                                    build_dns_servfail(&data, dns_txid)
+                                } else {
+                                    wire
+                                }
+                            } else {
+                                wire
+                            };
                             use crate::dashboard::DnsDecision;
                             let route = match decision {
                                 RoutingDecision::Block => DnsDecision::Block,
@@ -705,6 +744,47 @@ async fn dns_handshake(
         }
         _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
     }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn prepare_tun_answer(
+    routes: &crate::tun_routes::Routes,
+    split: &SplitTunnel,
+    query: &[u8],
+    wire: &[u8],
+    domain: &str,
+    txid: u16,
+    qtype: u16,
+    endpoint: bool,
+) -> Result<Option<Vec<u8>>> {
+    use hickory_proto::{op::Message, rr::RData};
+    if qtype != 1 && qtype != 28 {
+        return Ok(None);
+    }
+    let answer = match Message::from_vec(wire) {
+        Ok(answer) if answer.metadata.id == txid => answer,
+        _ => return Ok(None),
+    };
+    let requested = Message::from_vec(query)?;
+    anyhow::ensure!(answer.queries == requested.queries, "TUN DNS answer does not match its question");
+    let ips: Vec<IpAddr> = answer.answers.iter().filter_map(|record| match &record.data {
+        RData::A(ip) => Some(IpAddr::V4(ip.0)),
+        RData::AAAA(ip) => Some(IpAddr::V6(ip.0)),
+        _ => None,
+    }).collect();
+    if ips.is_empty() { return Ok(None); }
+    if endpoint {
+        for address in ips { routes.pin(address)?; }
+        return Ok(None);
+    }
+    let decision = split.decide(domain, &ips).await;
+    if qtype == 28 && decision != RoutingDecision::Bypass {
+        return Ok(Some(build_dns_error(query, txid, 0)));
+    }
+    let ttl = answer.answers.iter().map(|record| record.ttl).min().unwrap_or_default().max(1);
+    routes.remember(domain, &ips, decision, Duration::from_secs(ttl.into()))?;
+    Ok(None)
 }
 
 /// Parse a DNS wire-format query packet.

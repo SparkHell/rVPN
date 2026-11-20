@@ -33,6 +33,17 @@ export function dashboardUrl(
   return next.origin
 }
 export type Stats = {
+  recent_proxy?: {
+    id: number
+    time: number
+    host: string
+    port: number
+    protocol: 'HTTP' | 'SOCKS5'
+    route: string
+    reason: string
+    connected: boolean
+    ms: number
+  }[]
   recent_dns?: {
     time: number
     domain: string
@@ -46,6 +57,7 @@ export type Stats = {
   }[]
   uptime_secs: number
   bucket_secs: number
+  tun_ready?: boolean
   last_tls?: string | null
   runtime_error?: string | null
   counters: Record<string, number>
@@ -197,9 +209,8 @@ export const labels: Record<string, string> = {
   dns_cache_size: '最大缓存条数',
   ech_mode: 'ECH 模式',
   interface_name: '网卡名称',
-  ip_address: '旧版固定 IP（现由服务器分配）',
-  routes: '路由网段',
-  dns_servers: '虚拟网卡 DNS',
+  routes: '参与分流的 IPv4 网段',
+  dns_servers: 'TUN 备用 DNS 上游',
   mtu: 'MTU',
   fingerprint: '固定身份指纹',
   trust_on_first_use: '首次使用时信任',
@@ -236,11 +247,13 @@ export const labels: Record<string, string> = {
   ips: 'IP / CIDR 规则',
 }
 export const hints: Record<string, string> = {
+  routes: '每行一个网段。默认 0.0.0.0/0 表示所有 IPv4 地址都参与选路。开启分流时按规则选择直连或隧道；关闭分流时，范围内的公网流量走隧道。局域网私有地址始终直连。',
   file_enabled: '启动成功后写入日志文件。关闭后，运行日志显示在终端。',
   dns_cache_enabled: '缓存解析结果，减少重复查询。',
   ipv6_enabled: '有 IPv6 地址时优先连接，失败后尝试 IPv4。',
   server_address: '支持 ws:// 或 wss://，包含 WebSocket 路径。',
   prekey_bundle: '使用服务端生成的公开 prekey-bundle.json。',
+  dns_servers: '仅当「DNS 上游」为空时使用。TUN 启动后会把系统 DNS 指向本地 DNS 代理；此处请填上游解析器，避免指回代理自身。',
   nameservers:
     '每行填写一个 UDP 地址或 DoH URL，按顺序尝试。关闭本地监听后，客户端仍使用这些上游。',
   ech_mode:

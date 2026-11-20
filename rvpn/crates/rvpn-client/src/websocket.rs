@@ -107,11 +107,33 @@ pub(crate) fn set_server_bypass(split: &std::sync::Arc<crate::split_tunnel::Spli
     ENDPOINT_DNS.write().unwrap_or_else(|e| e.into_inner()).bypass = Some(std::sync::Arc::downgrade(split));
 }
 
+#[cfg(target_os = "linux")]
+type EndpointRouteHook = std::sync::Arc<dyn Fn(std::net::IpAddr) -> Result<()> + Send + Sync>;
+
+#[cfg(target_os = "linux")]
+static ENDPOINT_ROUTE_HOOK: std::sync::Mutex<Option<EndpointRouteHook>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+pub fn set_endpoint_route_hook(hook: Option<EndpointRouteHook>) {
+    *ENDPOINT_ROUTE_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
 #[cfg(not(target_os = "android"))]
 async fn remember_server_addresses(dns: &EndpointDns, host: &str, addresses: &[std::net::SocketAddr]) {
     if let Some(split) = dns.bypass.as_ref().and_then(std::sync::Weak::upgrade) {
         split.set_server_ips(host, &addresses.iter().map(|address| address.ip()).collect::<Vec<_>>()).await;
     }
+}
+
+#[cfg(not(target_os = "android"))]
+fn pin_endpoint_routes(addresses: &[std::net::SocketAddr]) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(hook) = ENDPOINT_ROUTE_HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        for address in addresses { hook(address.ip())?; }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = addresses;
+    Ok(())
 }
 
 #[cfg(not(target_os = "android"))]
@@ -284,6 +306,7 @@ pub async fn connect_websocket(
             }
         }).await?;
         remember_server_addresses(&dns, origin, &addresses).await;
+        pin_endpoint_routes(&addresses)?;
         dial_tls(&addresses, fingerprint, sni, resumption, None).await
     };
     let tls_stream = if dns.ech_mode != crate::config::EchMode::Off {
@@ -294,6 +317,7 @@ pub async fn connect_websocket(
                 connect_stage("dns_https", limit, resolver.resolve_ech(origin, port)).await?;
             let addresses = connect_stage("dns_address", limit, resolver.resolve(&target, target_port)).await?;
             remember_server_addresses(&dns, origin, &addresses).await;
+            pin_endpoint_routes(&addresses)?;
             dial_tls(&addresses, fingerprint, sni, resumption, Some(&config)).await
         };
         if dns.ech_mode == crate::config::EchMode::Required {

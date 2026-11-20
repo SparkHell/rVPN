@@ -66,12 +66,14 @@ impl Worker {
                         _ = stopped.changed() => Ok(()),
                         result = async {
                             rvpn_core::crypto::key_files::ensure_identity(&config.identity_key_file, "Client")?;
-                            crate::websocket::configure_endpoint_dns(&config)?;
                             if config.tun.enabled {
                                 // Validate key/bundle files before acknowledging a TUN generation.
                                 crate::server_pool::ServerPool::from_config(&config).await?;
                                 crate::run_tun(config, ready_tx).await
-                            } else { crate::run_socks5(config, ready_tx).await }
+                            } else {
+                                crate::websocket::configure_endpoint_dns(&config)?;
+                                crate::run_socks5(config, ready_tx).await
+                            }
                         } => result,
                     }
                 });
@@ -227,6 +229,8 @@ pub async fn run(
     overrides: Overrides,
     logging: &rvpn_logging::ReloadableLogging,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    crate::tun_routes::recover()?;
     config.split_tunnel.subscriptions = Some(Arc::new(rvpn_split_tunnel::subscriptions::Subscriptions::open(&config.data_dir)));
     let panel = Arc::new(ControlPanel::new(path, config.clone())?);
     let (sender, mut requests) = mpsc::channel::<ApplyRequest>(8);
@@ -250,6 +254,9 @@ pub async fn run(
             None
         }
     };
+    let (shutdown, mut stopped) = watch::channel(false);
+    let signals = tokio::spawn(crate::handle_signals(shutdown));
+    let _signal_guard = crate::OnDrop::new(move || signals.abort());
     let mut worker = match start_ready(config.clone()).await {
         Ok(worker) => {
             logging.use_runtime_settings(&config.logging)?;
@@ -274,9 +281,6 @@ pub async fn run(
     )?;
     #[cfg(windows)]
     crate::service::windows::ready()?;
-    let (shutdown, mut stopped) = watch::channel(false);
-    let signals = tokio::spawn(crate::handle_signals(shutdown));
-    let _signal_guard = crate::OnDrop::new(move || signals.abort());
     loop {
         tokio::select! {
             _ = stopped.changed() => break,

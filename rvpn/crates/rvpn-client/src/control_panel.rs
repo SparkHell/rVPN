@@ -57,7 +57,10 @@ fn merge_defaults(defaults: &mut Value, input: Value) {
     }
 }
 
-fn remove_retired_network_fields(config: &mut Value) {
+fn remove_retired_fields(config: &mut Value) {
+    if let Some(tun) = config.get_mut("tun").and_then(Value::as_object_mut) {
+        tun.remove("ip_address");
+    }
     if let Some(network) = config.get_mut("network").and_then(Value::as_object_mut) {
         network.remove("dns_servers");
         network.remove("prefer_ipv4");
@@ -185,7 +188,13 @@ fn validate(value: &Value) -> Result<ClientConfig> {
         }
     }
     if config.dns_proxy.enabled {
-        rvpn_split_tunnel::dns_cache::DnsUpstreams::new(&config.dns_proxy.nameservers)?;
+        let upstreams = if config.tun.enabled && config.dns_proxy.nameservers.is_empty() {
+            &config.tun.dns_servers
+        } else {
+            &config.dns_proxy.nameservers
+        };
+        rvpn_split_tunnel::dns_cache::DnsUpstreams::new(upstreams)?
+            .validate_listener(config.dns_proxy.listen_address.parse()?)?;
     }
     config.socks5.validate_pool()?;
     anyhow::ensure!(config.logging.max_files > 0, "logging.max_files 必须大于 0");
@@ -344,6 +353,34 @@ mod tests {
         assert!(current["config"]["network"].get("require_ech").is_none());
         panel.command(&json!({"method":"config.save", "revision":current["revision"], "config":current["config"]})).await.unwrap();
         assert_eq!(ClientConfig::load(&panel.path).unwrap().network.ech_mode, crate::config::EchMode::Prefer);
+    }
+
+    #[test]
+    fn tun_fallback_upstream_cannot_recurse_into_the_listener() {
+        let mut config = serde_json::to_value(ClientConfig::default()).unwrap();
+        config["tun"]["enabled"] = json!(true);
+        config["dns_proxy"]["enabled"] = json!(true);
+        config["dns_proxy"]["listen_address"] = json!("127.0.0.1:53");
+        config["dns_proxy"]["nameservers"] = json!([]);
+        config["tun"]["dns_servers"] = json!(["127.0.0.1"]);
+        assert!(validate(&config).unwrap_err().to_string().contains("代理自身"));
+        config["tun"]["dns_servers"] = json!(["127.0.0.1:5353"]);
+        validate(&config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_tun_ip_is_removed_and_routes_are_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let panel = panel(directory.path(), "toml");
+        std::fs::write(&panel.path, "[tun]\nip_address = '10.200.0.2/24'\nroutes = ['203.0.113.0/24']\n").unwrap();
+        let current = panel.configuration().unwrap();
+        let tun = &current["config"]["tun"];
+        assert!(tun.get("ip_address").is_none());
+        assert_eq!(tun["routes"], json!(["203.0.113.0/24"]));
+        panel.command(&json!({"method":"config.save","revision":current["revision"],"config":current["config"]})).await.unwrap();
+        let config = ClientConfig::load(&panel.path).unwrap();
+        assert_eq!(config.tun.routes, ["203.0.113.0/24"]);
+        assert!(!std::fs::read_to_string(&panel.path).unwrap().contains("ip_address"));
     }
 
     #[tokio::test]
@@ -563,7 +600,7 @@ impl ControlPanel {
         let parsed: ClientConfig = serde_json::from_value(input.clone())?;
         let mut defaults = serde_json::to_value(parsed)?;
         let mut input = input;
-        remove_retired_network_fields(&mut input);
+        remove_retired_fields(&mut input);
         if let Some(network) = input.get_mut("network").and_then(Value::as_object_mut) {
             // The typed config already converted this alias to the canonical mode.
             network.remove("require_ech");
@@ -656,7 +693,7 @@ impl ControlPanel {
                     "配置已被其他页面或程序修改，请重新加载后再保存"
                 );
                 let mut config = request["config"].clone();
-                remove_retired_network_fields(&mut config);
+                remove_retired_fields(&mut config);
                 let body = if self.path.extension().is_some_and(|ext| ext == "json") {
                     serde_json::to_string_pretty(&config)?
                 } else {

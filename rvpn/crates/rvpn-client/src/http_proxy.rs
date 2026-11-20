@@ -322,7 +322,7 @@ async fn forward(
     {
         return Ok(response(StatusCode::BAD_REQUEST));
     }
-    let mut remote = proxy_common::open_target(host, port, proxy).await?;
+    let mut remote = proxy_common::open_target(host, port, proxy, Some(proxy_common::ProxyProtocol::Http)).await?;
     if connect {
         let upgrade = hyper::upgrade::on(&mut request);
         tokio::spawn(async move {

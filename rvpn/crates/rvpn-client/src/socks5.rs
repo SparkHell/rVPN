@@ -264,7 +264,7 @@ async fn handle_connection(
     debug!("SOCKS5 target: {}", target_addr);
 
     let (host, port) = proxy_common::parse_target(&target_addr)?;
-    let mut remote = match proxy_common::open_target(&host, port, &proxy).await {
+    let mut remote = match proxy_common::open_target(&host, port, &proxy, Some(proxy_common::ProxyProtocol::Socks5)).await {
         Ok(remote) => remote,
         Err(error) => {
             use std::io::ErrorKind;

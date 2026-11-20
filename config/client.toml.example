@@ -13,6 +13,7 @@ listen_address = "127.0.0.1:1088"
 [tun]
 enabled = false
 mtu = 1420
+# All IPv4 destinations are eligible for split routing. Private LAN addresses always bypass the tunnel.
 routes = [ "0.0.0.0/0" ]
 
 [dns_proxy]

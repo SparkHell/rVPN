@@ -84,7 +84,6 @@ async fn main() -> Result<()> {
 /// Run the VPN server
 async fn run_server(config: ServerConfig) -> Result<()> {
     info!("Starting R-VPN Server on {}", config.bind_address);
-    verify_tun_network_prerequisites(&config);
 
     // Initialize TUN server if configured (must be done before creating handlers)
     let tun_server = rvpn_server::tun_server::TunServer::new(&config.tun)?;
@@ -92,14 +91,15 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     let tun_server = Arc::new(RwLock::new(tun_server));
     let tun_server_for_loop = tun_server.clone();
 
-    if config.tun.enabled {
-        {
-            let mut ts = tun_server_for_loop.write().await;
-            ts.start().await?;
-        }
+    let _tun_network = if config.tun.enabled {
+        tun_server_for_loop.write().await.start().await?;
         setup_tun_routing(&config.tun)?;
+        let network = TunForwarding::install(&config)?;
         info!("TUN server started on {}", config.tun.tun_ip);
-    }
+        Some(network)
+    } else {
+        None
+    };
 
     let handler = Arc::new(RwLock::new(VpnHandler::new(config.clone())?));
     let tun_handler = Arc::new(RwLock::new(TunHandler::new(config.clone(), Some(tun_server.clone()))?));
@@ -191,10 +191,23 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     info!("WebSocket endpoint (DNS proxy): {}", dns_path);
 
     let handshakes = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
-    // Accept connections
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let shutdown = async {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::pin!(shutdown);
     loop {
-        let (stream, peer_addr) = listener.accept().await
-            .context("Failed to accept connection")?;
+        let (stream, peer_addr) = tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            result = listener.accept() => result.context("Failed to accept connection")?,
+        };
 
         let permit = if tls_acceptor.is_some() {
             let Ok(permit) = handshakes.clone().try_acquire_owned() else { continue };
@@ -276,81 +289,92 @@ fn setup_tun_routing(config: &TunNetworkConfig) -> Result<()> {
     Ok(())
 }
 
-fn verify_tun_network_prerequisites(config: &ServerConfig) {
-    if !config.network.nat_enabled {
-        warn!("server.network.nat_enabled is false; full-tunnel Internet egress will require external routing");
-        return;
+/// Firewall entries installed and removed by this server instance.
+struct TunForwarding {
+    owner: String,
+    rules: Vec<Vec<String>>,
+}
+
+impl TunForwarding {
+    fn install(config: &ServerConfig) -> Result<Self> {
+        anyhow::ensure!(cfg!(target_os = "linux"), "Server TUN forwarding requires Linux");
+        anyhow::ensure!(
+            std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")?.trim() == "1",
+            "Enable net.ipv4.ip_forward before starting the TUN server"
+        );
+        let device = &config.tun.interface_name;
+        anyhow::ensure!(device.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "Invalid TUN interface name");
+        let mut forwarding = Self { owner: format!("rvpn-tun-{device}"), rules: Vec::new() };
+        if !config.network.nat_enabled {
+            info!("TUN NAT is managed externally");
+            return Ok(forwarding);
+        }
+
+        let output = Command::new("ip").args(["-4", "route", "show", "default"]).output()?;
+        anyhow::ensure!(output.status.success(), "Could not inspect the default IPv4 route");
+        let route = String::from_utf8(output.stdout)?;
+        let egress = route.lines().next().unwrap_or_default().split_whitespace()
+            .skip_while(|word| *word != "dev").nth(1).context("Missing default IPv4 egress interface")?;
+        anyhow::ensure!(egress != device, "TUN interface cannot also be the server's default egress");
+        let (gateway, prefix) = config.tun.tun_ip.split_once('/').context("Missing TUN CIDR prefix")?;
+        let network = ip_network::Ipv4Network::new_truncate(gateway.parse()?, prefix.parse()?)?.to_string();
+
+        // A forced process exit can leave rules in the kernel. Remove only
+        // this interface's tagged rules, including rules for its old subnet.
+        for (table, chain) in [("nat", "POSTROUTING"), ("filter", "FORWARD"), ("filter", "INPUT")] {
+            forwarding.remove_stale(table, chain)?;
+        }
+
+        forwarding.add("nat", "POSTROUTING", &["-s", &network, "-o", egress, "-j", "MASQUERADE"])?;
+        forwarding.add("filter", "FORWARD", &["-i", egress, "-o", device, "-d", &network,
+            "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])?;
+        forwarding.add("filter", "FORWARD", &["-i", device, "-o", egress, "-s", &network, "-j", "ACCEPT"])?;
+        // Insertion order puts the private-destination blocks above the egress accept rule.
+        for range in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
+            forwarding.add("filter", "FORWARD", &["-i", device, "-d", range, "-j", "DROP"])?;
+            forwarding.add("filter", "INPUT", &["-i", device, "-d", range, "-j", "DROP"])?;
+        }
+        Ok(forwarding)
     }
 
-    if cfg!(target_os = "linux") {
-        match std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
-            Ok(v) => {
-                if v.trim() != "1" {
-                    warn!("net.ipv4.ip_forward is disabled; enable it for full-tunnel packet forwarding");
-                } else {
-                    info!("Kernel IPv4 forwarding is enabled");
-                }
+    fn remove_stale(&self, table: &str, chain: &str) -> Result<()> {
+        let output = Command::new("iptables").args(["-w", "2", "-t", table, "-S", chain]).output()?;
+        anyhow::ensure!(output.status.success(), "Inspect {table}/{chain}: {}", String::from_utf8_lossy(&output.stderr));
+        for line in std::str::from_utf8(&output.stdout)?.lines() {
+            let fields: Vec<_> = line.split_ascii_whitespace().map(|f| f.trim_matches('"')).collect();
+            if fields.starts_with(&["-A", chain]) && fields.windows(2).any(|w| w == ["--comment", self.owner.as_str()]) {
+                let status = Command::new("iptables").args(["-w", "2", "-t", table, "-D", chain])
+                    .args(&fields[2..]).status()?;
+                anyhow::ensure!(status.success(), "Remove stale {table}/{chain} rule for {}", self.owner);
             }
-            Err(e) => warn!("Unable to read /proc/sys/net/ipv4/ip_forward: {}", e),
         }
+        Ok(())
     }
 
-    match detect_default_interface() {
-        Some(iface) => {
-            if !has_nat_masquerade_rule(&iface, &config.network.dhcp_range) {
-                warn!(
-                    "NAT MASQUERADE rule appears missing for subnet {} via interface {}; full-tunnel Internet access may fail",
-                    config.network.dhcp_range, iface
-                );
-            } else {
-                info!(
-                    "Detected NAT MASQUERADE rule for subnet {} via interface {}",
-                    config.network.dhcp_range, iface
-                );
-            }
+    fn add(&mut self, table: &str, chain: &str, args: &[&str]) -> Result<()> {
+        let mut rule = vec!["-w".into(), "2".into(), "-t".into(), table.into(), "-C".into(), chain.into()];
+        rule.extend(["-m".into(), "comment".into(), "--comment".into(), self.owner.clone()]);
+        rule.extend(args.iter().map(|arg| (*arg).to_owned()));
+        if Command::new("iptables").args(&rule).output()?.status.success() {
+            return Ok(());
         }
-        None => warn!("Could not detect default egress interface; verify NAT MASQUERADE setup manually"),
+        rule[4] = "-I".into();
+        let output = Command::new("iptables").args(&rule).output()?;
+        anyhow::ensure!(output.status.success(), "Install TUN firewall rule: {}", String::from_utf8_lossy(&output.stderr));
+        rule[4] = "-D".into();
+        self.rules.push(rule);
+        Ok(())
     }
 }
 
-fn detect_default_interface() -> Option<String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg("ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}'")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let iface = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if iface.is_empty() {
-        None
-    } else {
-        Some(iface)
-    }
-}
-
-fn has_nat_masquerade_rule(interface: &str, subnet: &str) -> bool {
-    let cmd = format!(
-        "iptables -t nat -C POSTROUTING -s {} -o {} -j MASQUERADE >/dev/null 2>&1",
-        subnet, interface
-    );
-    if let Ok(status) = Command::new("sh").arg("-c").arg(&cmd).status() {
-        if status.success() {
-            return true;
+impl Drop for TunForwarding {
+    fn drop(&mut self) {
+        for rule in self.rules.iter().rev() {
+            if !Command::new("iptables").args(rule).output().is_ok_and(|output| output.status.success()) {
+                warn!("Failed to remove rVPN TUN firewall rule: {:?}", rule);
+            }
         }
     }
-
-    let legacy_cmd = format!(
-        "iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- '-s {} -o {} -j MASQUERADE'",
-        subnet, interface
-    );
-    Command::new("sh")
-        .arg("-c")
-        .arg(&legacy_cmd)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// Server TLS front-end. Either a static rustls acceptor, or the pair of

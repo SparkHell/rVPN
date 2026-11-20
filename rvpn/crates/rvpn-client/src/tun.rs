@@ -76,15 +76,10 @@ impl TunDevice {
         })
     }
 
-    /// Create a new TUN device (legacy - requires ip_address in config)
-    /// DEPRECATED: Use create_with_ip() with server-assigned IP instead
-    #[allow(dead_code)]
-    pub fn create(config: &TunConfig) -> Result<Self> {
-        let ip_cidr: &String = config
-            .ip_address
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No IP address configured and no server-assigned IP provided. Use create_with_ip() with server-assigned IP."))?;
-        Self::create_with_ip(config, ip_cidr)
+    /// Kernel interface name, including an automatically assigned name.
+    #[cfg(target_os = "linux")]
+    pub fn name(&self) -> Result<String> {
+        self.device.as_ref().context("TUN device not initialized")?.name().context("Read TUN device name")
     }
 
     /// Run the TUN device with graceful shutdown support
@@ -155,11 +150,19 @@ impl TunDevice {
                     match result {
                         Ok(n) if n > 0 => {
                             let packet = &tun_buffer[..n];
+                            // Desktop TUN currently negotiates only an IPv4 address.
+                            if packet[0] >> 4 != 4 {
+                                continue;
+                            }
                             trace!("Read {} bytes from TUN", n);
                             crate::dashboard::record_bytes_up(n as u64);
 
                             // Parse packet for logging/debugging
                             if let Some(packet_info) = parse_packet(packet) {
+                                if matches!(packet_info.dst_ip, std::net::IpAddr::V4(ip)
+                                    if ip.is_private() || ip.is_loopback() || ip.is_link_local()) {
+                                    continue;
+                                }
                                 trace!(
                                     "TUN -> Tunnel: {:?} {}:{} -> {}:{}",
                                     packet_info.protocol,

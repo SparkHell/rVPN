@@ -67,7 +67,6 @@ const config = {
   tun: {
     enabled: false,
     interface_name: null,
-    ip_address: null,
     dns_servers: ['1.1.1.1'],
     routes: ['0.0.0.0/0'],
     mtu: 1420,
@@ -127,6 +126,10 @@ test.beforeEach(async ({ page }) => {
             dns_cache_hits: 15,
             dns_gfwlist: 30,
           },
+          recent_proxy: [
+            { id: 1, time: 1, host: 'google.com', port: 443, protocol: 'HTTP', route: '隧道', reason: '命中 GFWList', connected: true, ms: 20 },
+            { id: 2, time: 1, host: 'baidu.com', port: 443, protocol: 'SOCKS5', route: '直连', reason: '目标地址均命中直连网段', connected: true, ms: 5 },
+          ],
           buckets: [],
         },
       }),
@@ -380,6 +383,10 @@ test('split rules expose independent switches, immediate updates and DNS ratios'
   ).not.toBeChecked()
   await expect(page.locator('.dns-metrics')).toContainText('15 次 · 20.0%')
   await expect(page.locator('.dns-metrics')).toContainText('30 次 · 40.0%')
+  const httpRecord = page.getByRole('row').filter({ hasText: 'google.com:443' })
+  await expect(httpRecord).toContainText(/HTTP.*隧道/)
+  const socksRecord = page.getByRole('row').filter({ hasText: 'baidu.com:443' })
+  await expect(socksRecord).toContainText(/SOCKS5.*直连/)
 })
 
 test('imports a PAC and lets a newer SSRL move a rule before saving', async ({

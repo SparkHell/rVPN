@@ -75,6 +75,20 @@ impl DnsUpstreams {
         Ok(Self(upstreams))
     }
 
+    /// Using the listener itself as a UDP upstream would recursively create queries.
+    pub fn validate_listener(&self, listener: SocketAddr) -> anyhow::Result<()> {
+        for upstream in &self.0 {
+            if let DnsUpstream::Udp(address) = upstream {
+                let same_ip = address.ip() == listener.ip()
+                    || (listener.ip().is_unspecified() && address.ip().is_loopback()
+                        && listener.is_ipv4() == address.is_ipv4());
+                anyhow::ensure!(!(same_ip && address.port() == listener.port()),
+                    "DNS 上游 {address} 指向本地 DNS 代理自身，请填写实际的上游解析器");
+            }
+        }
+        Ok(())
+    }
+
     pub async fn query(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.query_upstreams(query, None).await
     }

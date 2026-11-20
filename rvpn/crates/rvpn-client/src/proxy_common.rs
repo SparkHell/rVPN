@@ -106,27 +106,46 @@ pub fn encode_target_address(target: &str) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+#[derive(Clone, Copy)]
+pub enum ProxyProtocol {
+    Http,
+    Socks5,
+}
+
 /// Open a routed stream only after the destination has accepted the connection.
 pub async fn open_target(
     host: &str,
     port: u16,
     proxy: &ProxyHandle,
+    protocol: Option<ProxyProtocol>,
 ) -> Result<tokio::io::DuplexStream> {
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        open_target_inner(host, port, proxy),
-    )
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "target connection timed out"))?
+    crate::dashboard::record_conn_accepted();
+    let started = std::time::Instant::now();
+    let mut route = None;
+    let attempt = async {
+        let (decision, reason, addresses) = proxy.split_tunnel.explain_connection(host).await;
+        route = Some((decision, reason));
+        open_target_inner(host, port, proxy, decision, &addresses).await
+    };
+    let result = tokio::time::timeout(Duration::from_secs(30), attempt)
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut, "target connection timed out"
+        ).into()));
+    if let Some(protocol) = protocol {
+        crate::dashboard::record_proxy_connection(host, port, protocol, route,
+            result.is_ok(), started.elapsed());
+    }
+    result
 }
 
 async fn open_target_inner(
     host: &str,
     port: u16,
     proxy: &ProxyHandle,
+    decision: RoutingDecision,
+    addresses: &[std::net::IpAddr],
 ) -> Result<tokio::io::DuplexStream> {
-    crate::dashboard::record_conn_accepted();
-    let (decision, _, addresses) = proxy.split_tunnel.explain_connection(host).await;
     let (client, mut relay_socket) = tokio::io::duplex(64 * 1024);
     match decision {
         RoutingDecision::Block => {
@@ -139,7 +158,7 @@ async fn open_target_inner(
         }
         RoutingDecision::Bypass => {
             crate::dashboard::record_conn_bypassed();
-            let mut remote = crate::websocket::connect_direct_tcp(host, port, &addresses).await?;
+            let mut remote = crate::websocket::connect_direct_tcp(host, port, addresses).await?;
             tokio::spawn(async move {
                 match tokio::io::copy_bidirectional(&mut relay_socket, &mut remote).await {
                     Ok((up, down)) => {
@@ -181,7 +200,7 @@ pub async fn route_connection(
     proxy: &ProxyHandle,
 ) -> Result<()> {
     let (host, port) = parse_target(target)?;
-    let mut remote = open_target(&host, port, proxy).await?;
+    let mut remote = open_target(&host, port, proxy, None).await?;
     tokio::io::copy_bidirectional(&mut socket, &mut remote).await?;
     Ok(())
 }

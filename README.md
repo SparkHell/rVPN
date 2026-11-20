@@ -409,11 +409,42 @@ The script uses temporary credentials and a loopback echo server. It checks
 the returned payload, then stops and restarts the server and checks
 recovery. Omit `--caddy` to run the direct case only.
 
-The optional local `[dns_proxy]` listener still accepts UDP queries from apps;
-DoH changes its local upstream transport. Tunnel-routed A/AAAA queries keep
-the existing encrypted WebSocket DNS path. In TUN mode, tunneled DNS packets
-keep their existing forwarding path; this setting controls client-side lookups
-and does not replace the remote server's resolver.
+The local `[dns_proxy]` listener accepts UDP queries from apps. DoH changes
+its local upstream transport, while tunnel-routed address queries use the
+encrypted WebSocket DNS endpoint.
+
+### Desktop TUN on Linux
+
+The Linux desktop client manages IPv4 system routes and keeps the local DNS
+proxy running in TUN mode. Keep `[dns_proxy].enabled = true` and bind it to an
+IPv4 loopback address on port 53 (for example, `127.0.0.1:53`). Keep the
+desired upstreams in `[dns_proxy].nameservers`. The client uses
+`[tun].dns_servers` as upstreams when that list is empty.
+
+Set `[tun].enabled = true` and specify the ranges eligible for capture in
+`[tun].routes`. Use `0.0.0.0/0` for IPv4 full coverage. The client derives
+`/tun` from the configured WebSocket base path. Disable
+`[split_tunnel].enabled` to send all captured public IPv4 traffic through the
+VPN. With split routing enabled, the client uses the proxy's IP rules and
+learns domain decisions from answers served by the local DNS proxy.
+For shared addresses, an active tunnel decision takes precedence over direct
+routing. The three RFC 1918 ranges, link-local and multicast addresses, and
+VPN transport endpoints stay on the physical network. Desktop TUN has no
+IPv6 data plane. IPv6 routes remain managed by the operating system. Domain
+routing relies on DNS queries reaching rVPN.
+
+On the Linux server, enable `[server.tun]`, choose a virtual subnet that
+does not overlap either network, and enable kernel IPv4 forwarding. With
+`[server.network].nat_enabled = true`, the server installs its own iptables
+forwarding and masquerade rules for the TUN subnet. With NAT disabled, provide
+forwarding policy and return routing externally. Make the `/tun` and `/dns`
+WebSocket paths reachable through the TLS frontend.
+
+The client reports TUN readiness after receiving an IPv4 address and
+installing the interface, route policy, and local system resolver. Startup
+failure triggers configuration rollback on a live mode switch. Shutdown or
+reconnect releases the route policy and restores the previous resolver file
+when rVPN still owns it.
 
 ### Cross-compilation
 

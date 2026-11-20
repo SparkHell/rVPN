@@ -31,6 +31,8 @@ mod stats;
 mod stream_relay;
 // TLS re-exported from rvpn-tls crate
 mod tun;
+#[cfg(target_os = "linux")]
+mod tun_routes;
 mod tunnel;
 mod tunnel_pool;
 mod websocket;
@@ -46,10 +48,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Maximum reconnection attempts before giving up
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
-/// Initial delay between reconnection attempts (ms)
-const INITIAL_RECONNECT_DELAY_MS: u64 = 1000;
-/// Maximum delay between reconnection attempts (ms)
-const MAX_RECONNECT_DELAY_MS: u64 = 30000;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -276,53 +274,8 @@ async fn run_socks5(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()
     let socks_listener = tokio::net::TcpListener::bind(socks_addr).await
         .with_context(|| format!("Failed to bind SOCKS5 proxy to {socks_addr}"))?;
 
-    // Optionally start DNS proxy (forwards UDP DNS through the tunnel's /dns endpoint)
     if config.dns_proxy.enabled {
-        let dns_listen: std::net::SocketAddr =
-            config.dns_proxy.listen_address.parse().with_context(|| {
-                format!(
-                    "Invalid DNS proxy listen address: {}",
-                    config.dns_proxy.listen_address
-                )
-            })?;
-
-        let nameservers = rvpn_split_tunnel::dns_cache::DnsUpstreams::new(
-            &config.dns_proxy.nameservers,
-        )?;
-
-        // All VPN server hostnames (primary + multi-server routing targets).
-        // The DNS proxy resolves these locally so a tunnel reconnect never
-        // depends on the tunnel itself for DNS.
-        let extra_server_hosts: Vec<String> = config
-            .extra_servers
-            .iter()
-            .map(|e| parse_server_url(&e.address).0)
-            .collect();
-        let doh_hosts = config
-            .dns_proxy
-            .nameservers
-            .iter()
-            .filter_map(|endpoint| rvpn_split_tunnel::dns_cache::doh_upstream_hostname(endpoint))
-            .collect();
-
-        let dns_proxy = std::sync::Arc::new(dns_proxy::DnsProxy::new(
-            dns_listen,
-            proxy.server_host().to_string(),
-            proxy.server_port(),
-            proxy.server_path(),
-            proxy.tls_fingerprint(),
-            proxy.identity_key(),
-            proxy.server_bundle(),
-            proxy.split_tunnel(),
-            proxy.dns_resolver(),
-            nameservers,
-            extra_server_hosts,
-            doh_hosts,
-        ));
-
-        let socket = tokio::net::UdpSocket::bind(dns_listen).await
-            .with_context(|| format!("Failed to bind DNS proxy to {dns_listen}"))?;
-
+        let (dns_proxy, socket) = bind_dns_proxy(&config, &proxy).await?;
         tokio::spawn(async move {
             if let Err(e) = dns_proxy.run_with_socket(socket).await {
                 error!("DNS proxy fatal error: {}", e);
@@ -367,208 +320,132 @@ async fn run_socks5(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()
     proxy.run_with_listener(socks_listener).await
 }
 
-/// Run in TUN mode (full VPN)
-async fn run_tun(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()>) -> Result<()> {
+async fn bind_dns_proxy(
+    config: &ClientConfig,
+    proxy: &Socks5Proxy,
+) -> Result<(std::sync::Arc<dns_proxy::DnsProxy>, tokio::net::UdpSocket)> {
+    let address: SocketAddr = config.dns_proxy.listen_address.parse()?;
+    let nameservers = rvpn_split_tunnel::dns_cache::DnsUpstreams::new(&config.dns_proxy.nameservers)?;
+    nameservers.validate_listener(address)?;
+    let extra_hosts = config.extra_servers.iter().map(|server| parse_server_url(&server.address).0).collect();
+    let doh_hosts = config.dns_proxy.nameservers.iter()
+        .filter_map(|endpoint| rvpn_split_tunnel::dns_cache::doh_upstream_hostname(endpoint)).collect();
+    let dns = std::sync::Arc::new(dns_proxy::DnsProxy::new(
+        address, proxy.server_host().to_string(), proxy.server_port(), proxy.server_path(),
+        proxy.tls_fingerprint(), proxy.identity_key(), proxy.server_bundle(), proxy.split_tunnel(),
+        proxy.dns_resolver(), nameservers, extra_hosts, doh_hosts,
+    ));
+    let socket = tokio::net::UdpSocket::bind(address).await
+        .with_context(|| format!("Failed to bind DNS proxy to {address}"))?;
+    Ok((dns, socket))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_tun(_: ClientConfig, _: tokio::sync::oneshot::Sender<()>) -> Result<()> {
+    anyhow::bail!("Managed desktop TUN routing and DNS currently require Linux")
+}
+
+#[cfg(target_os = "linux")]
+async fn run_tun(mut config: ClientConfig, ready: tokio::sync::oneshot::Sender<()>) -> Result<()> {
+    use std::sync::Arc;
     use tun::TunDevice;
     use tunnel::VpnTunnel;
 
-    // Multi-server routing is per-flow SOCKS5 only. TUN mode wraps the
-    // whole network stack in one tunnel, so per-domain routing has no
-    // meaningful hook. Refuse rather than silently ignoring the config.
-    if !config.extra_servers.is_empty() || !config.routing.is_empty() {
-        anyhow::bail!(
-            "multi-server routing ([[server]] / [routing.<name>]) is only supported in SOCKS5 mode; \
-             remove those sections or disable TUN mode"
-        );
+    anyhow::ensure!(config.extra_servers.is_empty() && config.routing.is_empty(),
+        "Multi-server routing is supported only in proxy mode");
+    anyhow::ensure!(config.dns_proxy.enabled, "TUN requires the local DNS proxy for domain rules");
+    if config.dns_proxy.nameservers.is_empty() {
+        config.dns_proxy.nameservers.clone_from(&config.tun.dns_servers);
     }
+    websocket::configure_endpoint_dns(&config)?;
+    let listen: SocketAddr = config.dns_proxy.listen_address.parse()?;
+    anyhow::ensure!(listen.is_ipv4() && listen.ip().is_loopback() && listen.port() == 53,
+        "TUN DNS proxy must listen on an IPv4 loopback address at port 53");
 
-    info!("Starting R-VPN Client in TUN mode (full VPN)");
-    info!("Server: {}", config.server_address);
-    let if_name = config.tun.interface_name.as_deref().unwrap_or("(auto-assigned by OS)");
-    info!("TUN interface: {} (IP will be assigned by server)", if_name);
-
-    // Save PID file
-    let pid_file = config.data_dir.join("rvpn.pid");
-    tokio::fs::create_dir_all(&config.data_dir).await?;
-    tokio::fs::write(&pid_file, process_id().to_string()).await?;
-    info!("Saved PID to {:?}", pid_file);
-
-    // Set up cleanup on exit
-    let pid_file_clone = pid_file.clone();
-    let _guard = OnDrop::new(move || {
-        let _ = std::fs::remove_file(&pid_file_clone);
-    });
-
-    // Parse server URL
+    let engine = Socks5Proxy::new(listen, &config).await?;
+    let split = engine.split_tunnel();
+    let dns_resolver = engine.dns_resolver();
     let (host, port, path) = parse_server_url(&config.server_address);
-
-    // Initialize stats manager for historical tracking
-    let stats_manager = stats::init_global_stats_manager_with_dir(config.data_dir.clone()).await;
-    let _stats_handle = stats_manager.start_collection();
-
-    // Reconnection state
-    let mut reconnect_attempts: u32 = 0;
-    let tun_config = config.tun.clone();
-
-    // TLS session resumption store for the single TUN-mode server. Held here
-    // (outside the reconnect loop) so every reconnect offers the cached TLS
-    // 1.3 ticket instead of paying a full handshake.
-    let resumption_store = rvpn_tls::ResumptionStore::new();
-
-    // The generation runtime owns cancellation, including a pending connect or
-    // retry sleep. No per-generation process signal handlers are installed.
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let _ = ready.send(());
-
-    // Main reconnection loop
-    loop {
-        // Check shutdown signal first
-        if *shutdown_rx.borrow() {
-            info!("Shutdown signal received, exiting TUN mode");
-            break;
-        }
-
-        // Connect VPN tunnel
-        info!(
-            "Connecting VPN tunnel to {}:{}{} (attempt {})",
-            host, port, path, reconnect_attempts + 1
-        );
-
-        let tunnel = match VpnTunnel::connect(
-            &host,
-            port,
-            &path,
-            config.tls_fingerprint,
-            config.sni_hostname.as_deref(),
-            &config.identity_key_file,
-            config.prekey_bundle.as_deref(),
-            &config.server_identity,
-            Some(&resumption_store),
-        )
-        .await
-        {
-            Ok(t) => {
-                info!("VPN tunnel established successfully");
-                reconnect_attempts = 0; // Reset on successful connection
-                t
-            }
-            Err(e) => {
-                error!("Failed to connect VPN tunnel: {}", e);
-                // VpnTunnel::connect already recorded handshake_fail; don't double-count.
-                reconnect_attempts += 1;
-                dashboard::record_reconnect();
-                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                    error!("Max connection attempts ({}) reached, giving up", MAX_RECONNECT_ATTEMPTS);
-                    return Err(anyhow::anyhow!("Failed to connect after {} attempts: {}", MAX_RECONNECT_ATTEMPTS, e));
-                }
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Retrying in {} ms (attempt {}/{})", delay_ms, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                continue;
-            }
-        };
-
-        // Get the server-assigned virtual IP and gateway
-        let (virtual_ip, gateway_ip, mtu) = {
-            let tunnel_guard = tunnel.read().await;
-            (tunnel_guard.virtual_ip, tunnel_guard.gateway_ip, tunnel_guard.mtu)
-        };
-
-        // Build the IP CIDR string from the server-assigned IP
-        let ip_cidr = match virtual_ip {
-            Some(ip) => {
-                format!("{}/24", ip)
-            }
-            None => {
-                error!("No IP address assigned by server - TUN mode requires server-assigned IP");
-                reconnect_attempts += 1;
-                continue;
-            }
-        };
-
-        // Log gateway info (gateway is derived if not sent by server)
-        if let Some(gw) = gateway_ip {
-            info!("Server assigned IP: {}, Gateway: {}, MTU: {}", ip_cidr, gw, mtu);
+    let path = path.trim_end_matches('/');
+    let tun_path = if path.ends_with("/tun") { path.to_owned() } else { format!("{path}/tun") };
+    let mut upstream_ips = Vec::new();
+    for upstream in &config.dns_proxy.nameservers {
+        if upstream.starts_with("https://") {
+            let url = url::Url::parse(upstream)?;
+            let hostname = url.host_str().context("Missing DoH host")?.trim_matches(['[', ']']);
+            upstream_ips.extend(dns_resolver.resolve(hostname, url.port().unwrap_or(443)).await?.into_iter().map(|addr| addr.ip()));
+        } else if let Ok(address) = upstream.parse::<SocketAddr>() {
+            upstream_ips.push(address.ip());
         } else {
-            info!("Server assigned IP: {}, MTU: {} (gateway will be derived)", ip_cidr, mtu);
-        }
-
-        // Create TUN device with server-assigned IP
-        let tun_device = match TunDevice::create_with_ip(&tun_config, &ip_cidr)
-            .with_context(|| "Failed to create TUN device")
-        {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to create TUN device: {}", e);
-                reconnect_attempts += 1;
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Retrying TUN device creation in {} ms", delay_ms);
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                continue;
-            }
-        };
-
-        info!("TUN device ready");
-
-        // Run TUN device until tunnel disconnects OR shutdown signal received
-        // Use tokio::select! to wait on both simultaneously
-        let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);
-        let run_result = tokio::select! {
-            result = tun_device.run(tunnel, local_shutdown_rx) => {
-                Some(result)
-            }
-            _ = shutdown_rx_changed(&shutdown_rx) => {
-                info!("Shutdown signal received during tunnel run");
-                let _ = local_shutdown_tx.send(true);
-                None
-            }
-        };
-
-        // Check if we exited due to shutdown
-        if *shutdown_rx.borrow() {
-            info!("Shutdown signal received, exiting TUN mode");
-            break;
-        }
-
-        match run_result {
-            Some(Ok(())) => {
-                info!("TUN device run completed normally");
-                break;
-            }
-            Some(Err(e)) => {
-                error!("TUN device error: {}", e);
-                reconnect_attempts += 1;
-                dashboard::record_reconnect();
-
-                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                    error!("Max reconnection attempts ({}) reached, giving up", MAX_RECONNECT_ATTEMPTS);
-                    return Err(anyhow::anyhow!("Tunnel disconnected after {} reconnection attempts: {}", MAX_RECONNECT_ATTEMPTS, e));
-                }
-
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Tunnel disconnected, reconnecting in {} ms (attempt {}/{})", delay_ms, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
-
-                // Brief pause before reconnect
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-            }
-            None => {
-                // Shutdown was triggered
-                break;
-            }
+            upstream_ips.push(upstream.parse()?);
         }
     }
 
-    info!("TUN mode shutdown complete");
-    Ok(())
+    let (dns, socket) = bind_dns_proxy(&config, &engine).await?;
+    dns.prepare_for_tun();
+    let connection = async {
+        let resumption = rvpn_tls::ResumptionStore::new();
+        let mut ready = Some(ready);
+        let mut failures = 0;
+        loop {
+            let session = async {
+                // Connect before capturing system routes. Record all IPs used to reach
+                // the TLS frontend, including ECH alternative addresses.
+                let tunnel = VpnTunnel::connect(&host, port, &tun_path, config.tls_fingerprint,
+                    config.sni_hostname.as_deref(), &config.identity_key_file, config.prekey_bundle.as_deref(),
+                    &config.server_identity, Some(&resumption)).await?;
+                let (virtual_ip, server_mtu) = {
+                    let guard = tunnel.read().await;
+                    let address = guard.virtual_ip.context("TUN server did not assign an IPv4 address")?;
+                    info!(%address, gateway = ?guard.gateway_ip, mtu = guard.mtu, "TUN address assigned");
+                    (address, guard.mtu)
+                };
+                let mut tun_config = config.tun.clone();
+                tun_config.mtu = tun_config.mtu.min(server_mtu);
+                let device = TunDevice::create_with_ip(&tun_config, &format!("{virtual_ip}/32"))?;
+                let (direct, forced, full_unknown) = split.ipv4_routes().await;
+                let mut routes = tun_routes::Routes::new(&device.name()?, &tun_config.routes, direct, forced, full_unknown)?;
+                for address in split.server_ipv4_exceptions().await.into_iter().chain(upstream_ips.iter().copied()) {
+                    routes.pin(address)?;
+                }
+                routes.activate()?;
+                let routes = Arc::new(routes);
+                let weak = Arc::downgrade(&routes);
+                websocket::set_endpoint_route_hook(Some(Arc::new(move |address| {
+                    if let Some(routes) = weak.upgrade() { routes.pin(address)?; }
+                    Ok(())
+                })));
+                let _hook = OnDrop::new(|| websocket::set_endpoint_route_hook(None));
+                dns.set_tun_routes(&routes);
+                let _dns = tun_routes::SystemDns::install(listen)?;
+                dashboard::TUN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _status = OnDrop::new(|| dashboard::TUN_READY.store(false, std::sync::atomic::Ordering::Relaxed));
+                failures = 0;
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
+                let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
+                tokio::select! {
+                    result = device.run(tunnel, shutdown) => result,
+                    result = routes.expire() => result.context("TUN DNS route expiry failed"),
+                }
+            }.await;
+            if ready.is_some() {
+                return session.context("TUN initialization failed");
+            }
+            failures += 1;
+            if failures >= MAX_RECONNECT_ATTEMPTS {
+                return session.and_then(|_| Err(anyhow::anyhow!("TUN network stopped")));
+            }
+            warn!(?session, "TUN disconnected, retrying with system routes restored");
+            dashboard::record_reconnect();
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+    };
+    tokio::select! {
+        result = connection => result,
+        result = Arc::clone(&dns).run_with_socket(socket) => result.context("TUN DNS listener stopped"),
+    }
 }
 
 /// Handle shutdown signals (SIGINT, SIGTERM on Unix; Ctrl+C on Windows)
@@ -604,17 +481,7 @@ async fn handle_signals(shutdown_tx: tokio::sync::watch::Sender<bool>) {
 }
 
 /// Wait for shutdown signal to be received
-async fn shutdown_rx_changed(shutdown_rx: &tokio::sync::watch::Receiver<bool>) {
-    // This helper waits until the shutdown signal changes from false to true
-    // It uses the watch::Channel's changed() method
-    let mut rx = shutdown_rx.clone();
-    // If already true, return immediately
-    if *rx.borrow() {
-        return;
-    }
-    // Otherwise wait for change
-    let _ = rx.changed().await;
-}
+
 
 /// Parse server URL into (host, port, path) components
 fn parse_server_url(url: &str) -> (String, u16, String) {

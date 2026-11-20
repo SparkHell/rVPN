@@ -518,17 +518,12 @@ pub struct TunConfig {
     #[serde(default)]
     pub interface_name: Option<String>,
 
-    /// IP address (CIDR notation) - DEPRECATED: Server now assigns IP dynamically
-    /// This field is kept for backward compatibility but ignored in TUN mode
-    #[serde(default)]
-    pub ip_address: Option<String>,
-
     /// DNS servers
     #[serde(default = "default_dns_servers")]
     pub dns_servers: Vec<String>,
 
     /// Routes (CIDR notation)
-    #[serde(default)]
+    #[serde(default = "default_tun_routes")]
     pub routes: Vec<String>,
 
     /// MTU
@@ -541,12 +536,15 @@ impl Default for TunConfig {
         Self {
             enabled: false,
             interface_name: None, // Auto-assigned by OS
-            ip_address: None,     // Server assigns IP dynamically
             dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
-            routes: vec!["0.0.0.0/0".to_string()],
+            routes: default_tun_routes(),
             mtu: 1420,
         }
     }
+}
+
+fn default_tun_routes() -> Vec<String> {
+    vec!["0.0.0.0/0".into()]
 }
 
 fn default_dns_servers() -> Vec<String> {

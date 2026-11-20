@@ -255,6 +255,26 @@ impl SplitTunnel {
         ips.iter().all(|ip| bypass.contains_ip(ip))
     }
 
+    pub async fn server_ipv4_exceptions(&self) -> Vec<IpAddr> {
+        let bypass = self.server_bypass.read().await;
+        bypass.ips.iter().chain(bypass.resolved.values().flatten())
+            .copied().filter(IpAddr::is_ipv4).collect()
+    }
+
+    /// Snapshot the IPv4 policy for a kernel-routed TUN session.
+    pub async fn ipv4_routes(&self) -> (Vec<IpNetwork>, Vec<IpNetwork>, bool) {
+        if !self.config.enabled {
+            return (Vec::new(), Vec::new(), true);
+        }
+        let data = self.data.read().await;
+        let ipv4 = |table: &IpNetworkTable<bool>| table.iter()
+            .map(|(network, _)| network)
+            .filter(|network| matches!(network, IpNetwork::V4(_)))
+            .collect::<Vec<_>>();
+        (ipv4(&data.bypass_networks), ipv4(&data.tunnel_networks),
+         !self.config.builtin_bypass_countries.is_empty())
+    }
+
     /// Apply domain rules first, then the destination IP rules.
     pub async fn decide(&self, host: &str, ips: &[IpAddr]) -> RoutingDecision {
         if self.are_server_ips(ips).await { return RoutingDecision::Bypass; }
