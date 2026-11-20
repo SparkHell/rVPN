@@ -159,7 +159,8 @@ def run_case(args, use_caddy, scenario="restart"):
 
             fixture = stack.enter_context(http.server.ThreadingHTTPServer(("127.0.0.1", server_port), RejectUpgrade))
             if not use_caddy:
-                tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                tls = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                tls.minimum_version = ssl.TLSVersion.TLSv1_2
                 tls.load_cert_chain(cert, key)
                 fixture.socket = tls.wrap_socket(fixture.socket, server_side=True)
             threading.Thread(target=fixture.serve_forever, daemon=True).start()
