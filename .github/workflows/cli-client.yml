@@ -21,6 +21,7 @@ on:
       - scripts/update_rule_data.py
       - scripts/test_update_rule_data.py
       - scripts/test_endpoint_roundtrip.py
+      - scripts/check-release-linkage.py
   pull_request:
     paths:
       - .github/workflows/cli-client.yml
@@ -34,6 +35,7 @@ on:
       - scripts/update_rule_data.py
       - scripts/test_update_rule_data.py
       - scripts/test_endpoint_roundtrip.py
+      - scripts/check-release-linkage.py
 
 permissions:
   contents: read
@@ -118,14 +120,19 @@ jobs:
           workspaces: rvpn -> target
           # Refresh the immutable pre-test cache so both release and ci-test
           # dependency artifacts are captured after the first successful run.
-          key: windows-cli-thin-lto-8-ci-test-v1
+          key: windows-cli-static-v1
           cache-bin: "false"
 
       - name: Report cache lookup
         run: Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'Cargo cache exact hit=${{ steps.rust-cache.outputs.cache-hit }}'
 
-      - name: Build CLI client and server
-        run: cargo build --release --locked --package rvpn-client --package rvpn-server --bins --timings
+      - name: Build CLI client and server with a static CRT
+        run: |
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          cargo build --release --locked --target x86_64-pc-windows-msvc --package rvpn-client --package rvpn-server --bins --timings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force target/release | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/rvpn.exe,target/x86_64-pc-windows-msvc/release/rvpn-server.exe target/release/
 
       - name: Test configuration and relative paths
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn config::tests --timings
@@ -239,8 +246,10 @@ jobs:
         include:
           - runner: ubuntu-24.04
             artifact: linux-x86_64
+            target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             artifact: linux-aarch64
+            target: aarch64-unknown-linux-gnu
           - runner: macos-15-intel
             artifact: macos-x86_64
           - runner: macos-26
@@ -281,14 +290,29 @@ jobs:
         with:
           workspaces: rvpn -> target
           # This cache includes dependencies for both production and ci-test.
-          key: cli-thin-lto-8-ci-test-v1-rvpn-${{ matrix.artifact }}
+          key: cli-static-v1-rvpn-${{ matrix.artifact }}
           cache-bin: "false"
 
       - name: Report cache lookup
         run: echo 'Cargo cache exact hit=${{ steps.rust-cache.outputs.cache-hit }}' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build CLI client and server
-        run: cargo build --release --locked --package rvpn-client --package rvpn-server --bins --timings
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$RELEASE_TARGET" ]]; then
+            cpp_runtime="$(g++ -print-file-name=libstdc++.a)"
+            test -f "$cpp_runtime"
+            cpp_runtime_dir="$(dirname "$cpp_runtime")"
+            export BORING_BSSL_RUST_CPPLIB=static=stdc++
+            export RUSTFLAGS="-C target-feature=+crt-static -L native=$cpp_runtime_dir"
+            cargo build --release --locked --target "$RELEASE_TARGET" --package rvpn-client --package rvpn-server --bins --timings
+            mkdir -p target/release
+            install -m 755 "target/$RELEASE_TARGET/release/"{rvpn,rvpn-server} target/release/
+          else
+            cargo build --release --locked --package rvpn-client --package rvpn-server --bins --timings
+          fi
 
       - name: Test configuration and relative paths
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn config::tests --timings
@@ -421,6 +445,13 @@ jobs:
           pattern: rvpn-*
           path: downloads
 
+      - name: Install binary inspection tools
+        run: |
+          if ! command -v llvm-readobj >/dev/null || ! command -v llvm-objdump >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y llvm
+          fi
+
       - name: Package release assets
         shell: bash
         run: |
@@ -442,6 +473,7 @@ jobs:
             if [[ "$name" == *-windows-* ]]; then
               binary="${binary}.exe"
               (cd "$dir" && sha256sum -c "${binary}.sha256")
+              python3 scripts/check-release-linkage.py "${name#rvpn-*-}" "$dir/$binary"
               if [[ "$name" == rvpn-client-* ]]; then
                 [[ -s "$dir/rules/filter_1.txt" && -s "$dir/rules/filter_2.txt" && -s "$dir/rules/gfwlist.txt" ]]
                 (cd "$dir" && zip -q -r "${GITHUB_WORKSPACE}/dist/${name}.zip" "$binary" "${binary}.sha256" "$config" rules)
@@ -451,6 +483,7 @@ jobs:
             else
               (cd "$dir" && sha256sum -c "${binary}.sha256")
               chmod +x "$dir/$binary"
+              python3 scripts/check-release-linkage.py "${name#rvpn-*-}" "$dir/$binary"
               if [[ "$name" == rvpn-client-* ]]; then
                 [[ -s "$dir/rules/filter_1.txt" && -s "$dir/rules/filter_2.txt" && -s "$dir/rules/gfwlist.txt" ]]
                 tar -czf "dist/${name}.tar.gz" -C "$dir" "$binary" "${binary}.sha256" "$config" rules
@@ -464,7 +497,7 @@ jobs:
             echo "Expected 10 client/server artifacts, found $count" >&2
             exit 1
           fi
-          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+          (cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt)
 
       - name: Update nightly prerelease and replace assets
         if: github.event_name != 'release'
@@ -480,6 +513,7 @@ jobs:
           cat > nightly-notes.md <<EOF
           Automated CLI client and server builds for Windows, Linux, and macOS.
           Commit: ${GITHUB_SHA}
+          Linux binaries are fully statically linked. Windows binaries statically link the C/C++ runtime and import Windows system DLLs. macOS binaries use Apple system libraries and frameworks.
           Client archives include refreshed routing rules, source hashes, and upstream license notices.
           Client and server archives each include their corresponding example configuration.
           See SHA256SUMS.txt for archive checksums. TUN routing requires platform-specific setup.

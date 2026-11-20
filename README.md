@@ -78,6 +78,13 @@ Each platform also uploads a separate `build-timings-*` Actions artifact with
 Cargo's HTML compilation reports. Cache exact-match status appears in the job
 summary. These diagnostics are separate from release archives.
 
+Release packaging checks the executable for each platform before uploading
+archives. Linux x86_64 and ARM64 have no ELF interpreter or shared-library
+dependencies. Windows x86_64 statically links the C/C++ runtime and imports
+only Windows system DLLs at load time. The optional Windows TUN mode loads
+the Wintun driver separately. macOS Intel and Apple Silicon use only Apple
+system libraries and frameworks for dynamic linkage.
+
 Configuration tests use the `ci-test` profile, with optimization, debug symbols,
 LTO, and incremental compilation disabled. Dependency caches retain both the
 release and test profiles; the first run with a new cache key warms both sets.
