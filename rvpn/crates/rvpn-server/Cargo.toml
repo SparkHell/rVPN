@@ -62,7 +62,7 @@ hex.workspace = true
 futures-util = "0.3"
 
 # Networking (for split tunneling)
-ip_network.workspace = true
+ip_network = { workspace = true, features = ["serde"] }
 ip_network_table.workspace = true
 
 # TUN interface

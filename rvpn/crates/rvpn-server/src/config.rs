@@ -323,6 +323,10 @@ fn default_dhcp_range() -> String {
 /// TUN interface configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunNetworkConfig {
+    /// Explicit exceptions to the user-space proxy's private-address policy.
+    #[serde(default)]
+    pub proxy_allow_cidrs: Vec<ip_network::IpNetwork>,
+
     /// Enable TUN interface (default: false for backward compatibility)
     #[serde(default)]
     pub enabled: bool,
@@ -347,6 +351,7 @@ pub struct TunNetworkConfig {
 impl Default for TunNetworkConfig {
     fn default() -> Self {
         Self {
+            proxy_allow_cidrs: Vec::new(),
             enabled: false, // Disabled by default to preserve existing behavior
             tun_ip: "10.200.0.1/24".to_string(),
             mtu: 1420,

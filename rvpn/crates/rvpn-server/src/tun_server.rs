@@ -415,6 +415,12 @@ impl TunServer {
 
     /// Write packet to TUN interface (for sending to kernel/network)
     pub async fn write_to_tun(&self, packet: &[u8]) -> Result<()> {
+        // Only IPv4 is negotiated. Apply raw-packet isolation independently of
+        // host NAT settings and user-space proxy exceptions.
+        anyhow::ensure!(packet.len() >= 20 && packet[0] >> 4 == 4, "Expected an IPv4 TUN packet");
+        let destination = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        anyhow::ensure!(!crate::handler::should_block_address(&destination.into(), &[]),
+            "TUN destination is private or reserved");
         let device = self
             .device
             .as_ref()
@@ -555,6 +561,7 @@ mod tests {
             tun_ip: "10.200.0.1/24".to_string(),
             mtu: 1420,
             interface_name: "tun-test".to_string(),
+            proxy_allow_cidrs: vec![],
             dns_servers: vec![],
         }
     }

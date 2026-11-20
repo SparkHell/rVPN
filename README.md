@@ -440,6 +440,18 @@ forwarding and masquerade rules for the TUN subnet. With NAT disabled, provide
 forwarding policy and return routing externally. Make the `/tun` and `/dns`
 WebSocket paths reachable through the TLS frontend.
 
+Before creating the interface, the Linux server checks the chosen subnet against
+IPv4 interface addresses, non-default routes in all tables, and IPAM pools from
+the local Docker daemon when its standard socket exists (requires the Docker CLI
+and permission to inspect networks). Overlap stops startup and identifies the
+conflicting network. Repeat the check by restarting after network changes.
+
+TUN private-destination isolation applies with or without automatic NAT. TCP and
+UDP proxy connections also reject private destinations by default, including the
+configured tunnel subnet. To allow a specific internal proxy destination,
+set `proxy_allow_cidrs = ["10.200.0.42/32"]` under `[server.tun]`.
+This setting applies to proxy sockets only; it does not relax raw TUN forwarding.
+
 The client reports TUN readiness after receiving an IPv4 address and
 installing the interface, route policy, and local system resolver. Startup
 failure triggers configuration rollback on a live mode switch. Shutdown or

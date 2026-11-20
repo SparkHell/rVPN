@@ -31,73 +31,21 @@ use rvpn_core::protocol::multiplex::{
 use rvpn_core::protocol::HandshakeMessage;
 use rvpn_core::protocol::{AuthMethod, PayloadType, ProtocolVersion};
 
-/// Check if an IP address is private or reserved (and should be blocked for outbound connections).
-///
-/// Returns `true` if the address should be blocked. If `allowed_cidr` is provided,
-/// addresses falling within that CIDR range are allowed (returns `false`).
-fn should_block_address(addr: &IpAddr, allowed_cidr: Option<&str>) -> bool {
-    // Check if address is within the allowed CIDR (e.g., tunnel subnet)
-    let is_allowed = allowed_cidr.and_then(|cidr| {
-        let network = cidr.parse::<IpNetwork>().ok()?;
-        Some(network.contains(*addr))
-    });
-
-    if is_allowed == Some(true) {
+/// Check the resolved destination before opening a TCP or UDP socket.
+pub(crate) fn should_block_address(addr: &IpAddr, allowed: &[IpNetwork]) -> bool {
+    let addr = addr.to_canonical();
+    if allowed.iter().any(|network| network.contains(addr)) {
         return false;
     }
-
     match addr {
-        IpAddr::V4(ipv4) => {
-            // Loopback: 127.0.0.0/8
-            if ipv4.is_loopback() {
-                return true;
-            }
-            // Private: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            if ipv4.is_private() {
-                return true;
-            }
-            // Link-local: 169.254.0.0/16
-            if ipv4.is_link_local() {
-                return true;
-            }
-            // Multicast: 224.0.0.0/4
-            if ipv4.is_multicast() {
-                return true;
-            }
-            // Unspecified: 0.0.0.0
-            if ipv4.is_unspecified() {
-                return true;
-            }
-            // IPv4-mapped IPv6 handled in IpAddr::V6 branch
-            false
+        IpAddr::V4(ip) => {
+            let [first, second, ..] = ip.octets();
+            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_multicast()
+                || first == 0 || first >= 240 || (first == 100 && (64..128).contains(&second))
         }
-        IpAddr::V6(ipv6) => {
-            // Loopback: ::1
-            if ipv6.is_loopback() {
-                return true;
-            }
-            // Private (ULA): fc00::/7
-            if (ipv6.segments()[0] & 0xfe00) == 0xfc00 {
-                return true;
-            }
-            // Link-local: fe80::/10
-            if (ipv6.segments()[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-            // Multicast: ff00::/8
-            if ipv6.is_multicast() {
-                return true;
-            }
-            // Unspecified: ::
-            if ipv6.is_unspecified() {
-                return true;
-            }
-            // IPv4-mapped IPv6: ::ffff:0:0/96 — check inner IPv4
-            if let Some(mapped_ipv4) = ipv6.to_ipv4_mapped() {
-                return should_block_address(&IpAddr::V4(mapped_ipv4), allowed_cidr);
-            }
-            false
-        }
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+            || (ip.segments()[0] & 0xfe00) == 0xfc00
+            || (ip.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
@@ -108,7 +56,7 @@ fn should_block_address(addr: &IpAddr, allowed_cidr: Option<&str>) -> bool {
 /// the entire flow for 10 seconds.
 async fn connect_fastest(
     addrs: Vec<SocketAddr>,
-    allowed_cidr: Option<&str>,
+    allowed_cidr: &[IpNetwork],
     target: &str,
 ) -> Result<TcpStream> {
     let mut join_set = JoinSet::new();
@@ -838,7 +786,7 @@ impl VpnHandler {
     /// Connect to target server
     async fn connect_to_target(&self, target: &TargetAddress) -> Result<TcpStream> {
         let cache_key = format!("{}:{}", target.host, target.port);
-        let allowed_cidr = Some(self.config.tun.tun_ip.as_str());
+        let allowed_cidr = &self.config.tun.proxy_allow_cidrs;
 
         // Check DNS cache
         let addrs: Vec<SocketAddr> = {
@@ -1135,8 +1083,8 @@ impl VpnHandler {
             }
         };
 
-        // Block connections to private/reserved addresses (except tunnel subnet)
-        let allowed_cidr = Some(self.config.tun.tun_ip.as_str());
+        // Block connections to private/reserved addresses (except explicitly allowed CIDRs)
+        let allowed_cidr = &self.config.tun.proxy_allow_cidrs;
         if should_block_address(&target_socket_addr.ip(), allowed_cidr) {
             debug!(
                 "Blocking UDP relay to private/reserved address {} for {}",
@@ -1581,6 +1529,8 @@ impl MultiplexerHandler {
     {
         info!("MUX: New multiplexed connection from {}", peer_addr);
 
+        let mut tun_config = tun_config;
+        tun_config.proxy_allow_cidrs.clone_from(&self.config.tun.proxy_allow_cidrs);
         // Create and run the session handler
         let session = MultiplexerSession::new(
             ws_stream,
@@ -2915,11 +2865,7 @@ where
         dns_cache: &DnsCache,
         tun_config: &TunNetworkConfig,
     ) -> Result<TcpStream> {
-        let allowed_cidr = if tun_config.enabled {
-            Some(tun_config.tun_ip.as_str())
-        } else {
-            None
-        };
+        let allowed_cidr = &tun_config.proxy_allow_cidrs;
 
         // If target is an IP literal, use it directly without DNS resolution
         let addrs: Vec<SocketAddr> = if let Some(addr) = Self::parse_socket_addr_literal(target) {
@@ -4395,5 +4341,23 @@ mod tcp_pool_tests {
             .checked_sub(TCP_POOL_MAX_IDLE + Duration::from_secs(1))
             .unwrap();
         assert!(!tcp_pool_entry_usable(old, &client));
+    }
+}
+
+#[cfg(test)]
+mod proxy_policy_tests {
+    use super::*;
+
+    #[test]
+    fn exceptions_are_explicit_and_match_the_resolved_address() {
+        let allowed = ["10.200.0.42/32".parse().unwrap()];
+        for ip in ["10.200.0.42", "::ffff:10.200.0.42"] {
+            assert!(should_block_address(&ip.parse().unwrap(), &[]));
+            assert!(!should_block_address(&ip.parse().unwrap(), &allowed));
+        }
+        for ip in ["10.200.0.1", "127.0.0.1", "::1", "169.254.169.254", "100.64.0.1", "fd00::1"] {
+            assert!(should_block_address(&ip.parse().unwrap(), &allowed));
+        }
+        assert!(!should_block_address(&"1.1.1.1".parse().unwrap(), &[]));
     }
 }

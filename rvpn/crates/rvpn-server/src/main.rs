@@ -15,6 +15,7 @@ use rvpn_server::config::{ServerConfig, TunNetworkConfig};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+mod tun_preflight;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -92,6 +93,7 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     let tun_server_for_loop = tun_server.clone();
 
     let _tun_network = if config.tun.enabled {
+        tun_preflight::check(&config.tun)?;
         tun_server_for_loop.write().await.start().await?;
         setup_tun_routing(&config.tun)?;
         let network = TunForwarding::install(&config)?;
@@ -254,24 +256,11 @@ async fn run_server(config: ServerConfig) -> Result<()> {
 fn setup_tun_routing(config: &TunNetworkConfig) -> Result<()> {
     use std::process::Command;
 
-    // Parse CIDR and calculate actual network address (e.g., "10.200.0.1/24" -> "10.200.0.0/24")
-    let parts: Vec<&str> = config.tun_ip.split('/').collect();
-    let ip_str = parts.first().unwrap();
-    let prefix: u8 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
-
-    let ip: std::net::Ipv4Addr = ip_str.parse()
-        .with_context(|| format!("Invalid IP: {}", ip_str))?;
-
-    let ip_u32 = u32::from(ip);
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-    let network_u32 = ip_u32 & mask;
-
-    let network = format!(
-        "{}/{}",
-        std::net::Ipv4Addr::from(network_u32),
-        prefix
-    );
-
+    let network = tun_preflight::subnet(&config.tun_ip)?.to_string();
+    // Linux normally creates the connected route when assigning the interface address.
+    if tun_preflight::has_connected_route(&network, &config.interface_name)? {
+        return Ok(());
+    }
     // Add route to TUN network via TUN interface
     let output = Command::new("ip")
         .args(["route", "add", &network, "dev", &config.interface_name])
@@ -279,10 +268,8 @@ fn setup_tun_routing(config: &TunNetworkConfig) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Don't fail if route already exists
-        if !stderr.contains("File exists") {
-            anyhow::bail!("Failed to add route: {}", stderr);
-        }
+        anyhow::ensure!(tun_preflight::has_connected_route(&network, &config.interface_name)?,
+            "Failed to add route {network} on {}: {stderr}", config.interface_name);
     }
 
     info!("Added route for {} via {}", network, config.interface_name);
@@ -305,32 +292,29 @@ impl TunForwarding {
         let device = &config.tun.interface_name;
         anyhow::ensure!(device.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "Invalid TUN interface name");
         let mut forwarding = Self { owner: format!("rvpn-tun-{device}"), rules: Vec::new() };
-        if !config.network.nat_enabled {
-            info!("TUN NAT is managed externally");
-            return Ok(forwarding);
-        }
-
-        let output = Command::new("ip").args(["-4", "route", "show", "default"]).output()?;
-        anyhow::ensure!(output.status.success(), "Could not inspect the default IPv4 route");
-        let route = String::from_utf8(output.stdout)?;
-        let egress = route.lines().next().unwrap_or_default().split_whitespace()
-            .skip_while(|word| *word != "dev").nth(1).context("Missing default IPv4 egress interface")?;
-        anyhow::ensure!(egress != device, "TUN interface cannot also be the server's default egress");
-        let (gateway, prefix) = config.tun.tun_ip.split_once('/').context("Missing TUN CIDR prefix")?;
-        let network = ip_network::Ipv4Network::new_truncate(gateway.parse()?, prefix.parse()?)?.to_string();
-
         // A forced process exit can leave rules in the kernel. Remove only
         // this interface's tagged rules, including rules for its old subnet.
         for (table, chain) in [("nat", "POSTROUTING"), ("filter", "FORWARD"), ("filter", "INPUT")] {
             forwarding.remove_stale(table, chain)?;
         }
 
-        forwarding.add("nat", "POSTROUTING", &["-s", &network, "-o", egress, "-j", "MASQUERADE"])?;
-        forwarding.add("filter", "FORWARD", &["-i", egress, "-o", device, "-d", &network,
-            "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])?;
-        forwarding.add("filter", "FORWARD", &["-i", device, "-o", egress, "-s", &network, "-j", "ACCEPT"])?;
+        if config.network.nat_enabled {
+            let output = Command::new("ip").args(["-4", "route", "show", "default"]).output()?;
+            anyhow::ensure!(output.status.success(), "Could not inspect the default IPv4 route");
+            let route = String::from_utf8(output.stdout)?;
+            let egress = route.lines().next().unwrap_or_default().split_whitespace()
+                .skip_while(|word| *word != "dev").nth(1).context("Missing default IPv4 egress interface")?;
+            anyhow::ensure!(egress != device, "TUN interface cannot also be the server's default egress");
+            let (gateway, prefix) = config.tun.tun_ip.split_once('/').context("Missing TUN CIDR prefix")?;
+            let network = ip_network::Ipv4Network::new_truncate(gateway.parse()?, prefix.parse()?)?.to_string();
+
+            forwarding.add("nat", "POSTROUTING", &["-s", &network, "-o", egress, "-j", "MASQUERADE"])?;
+            forwarding.add("filter", "FORWARD", &["-i", egress, "-o", device, "-d", &network,
+                "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])?;
+            forwarding.add("filter", "FORWARD", &["-i", device, "-o", egress, "-s", &network, "-j", "ACCEPT"])?;
+        }
         // Insertion order puts the private-destination blocks above the egress accept rule.
-        for range in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
+        for range in ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"] {
             forwarding.add("filter", "FORWARD", &["-i", device, "-d", range, "-j", "DROP"])?;
             forwarding.add("filter", "INPUT", &["-i", device, "-d", range, "-j", "DROP"])?;
         }

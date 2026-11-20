@@ -135,9 +135,8 @@ def run_case(args, use_caddy, scenario="restart"):
                 "tls_key_file": str(key) if not use_caddy else str(work / "no-key.pem"),
                 "identity_key_file": str(work / "server.key"),
                 "prekey_bundle_file": str(work / "bundle.json"),
-                # The legacy handler already allows targets inside the configured
-                # tunnel CIDR. This temporary fixture stays on loopback.
-                "tun": {"enabled": False, "tun_ip": "127.0.0.0/24"},
+                # Allow only the isolated loopback echo target.
+                "tun": {"enabled": False, "proxy_allow_cidrs": ["127.0.0.2/32"]},
                 "logging": {"file_enabled": False},
             }
         }
