@@ -258,6 +258,7 @@ async fn server_endpoints_use_direct_socks_and_http_after_configuration_reload()
 
 #[tokio::test]
 async fn proxy_handshakes_and_http_framing() {
+    let mut phase = "start client";
     tokio::time::timeout(Duration::from_secs(20), async {
         let (_directory, _child, panel, socks) = fixture(false);
         let (mut panel, mut current) = connect(panel).await;
@@ -271,9 +272,11 @@ async fn proxy_handshakes_and_http_framing() {
         config["socks5"]["auth_password"] = json!("pass");
         config["http_proxy"]["enabled"] = json!(true);
         config["http_proxy"]["listen_address"] = json!(http.to_string());
+        phase = "apply proxy configuration";
         let saved = save(&mut panel, &mut current, config).await;
         assert_eq!(saved["ok"], true, "{saved}");
 
+        phase = "SOCKS5 authentication and IPv6 connection";
         let mut client = TcpStream::connect(socks).await.unwrap();
         client.write_all(&[5, 1, 0]).await.unwrap();
         assert_eq!(client.read_u16().await.unwrap(), 0x05ff);
@@ -319,6 +322,7 @@ async fn proxy_handshakes_and_http_framing() {
             assert_eq!(&early, b"ping");
             stream.write_all(b"pong").await.unwrap();
         });
+        phase = "pipelined HEAD and chunked POST";
         let mut client = TcpStream::connect(http).await.unwrap();
         client.write_all(format!("HEAD http://{target}/ HTTP/1.1\r\nHost: {target}\r\n\r\nPOST http://{target}/ HTTP/1.1\r\nHost: {target}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nping\r\n0\r\n\r\n").as_bytes()).await.unwrap();
         let mut replies = String::new();
@@ -326,6 +330,7 @@ async fn proxy_handshakes_and_http_framing() {
         assert_eq!(replies.matches("HTTP/1.1 200").count(), 2, "{replies}");
         assert!(replies.contains("\r\n\r\nHTTP/1.1 200") && replies.ends_with("pong"), "{replies}");
 
+        phase = "CONNECT with buffered tunnel data";
         let mut client = TcpStream::connect(http).await.unwrap();
         client.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\nping").as_bytes()).await.unwrap();
         let mut reply = String::new();
@@ -333,23 +338,22 @@ async fn proxy_handshakes_and_http_framing() {
         assert!(reply.starts_with("HTTP/1.1 200") && reply.ends_with("pong"), "{reply}");
         origin.await.unwrap();
 
+        phase = "reject invalid Content-Length";
         let mut client = TcpStream::connect(http).await.unwrap();
         client.write_all(format!("POST http://{target}/ HTTP/1.1\r\nHost: {target}\r\nContent-Length: invalid\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
 
-        // Reserve a port without listening so concurrent tests cannot bind it
-        // and the outbound connection cannot use it as its source port.
-        let refused = tokio::net::TcpSocket::new_v6().unwrap();
-        refused.bind("[::1]:0".parse().unwrap()).unwrap();
-        let refused_target = refused.local_addr().unwrap();
+        phase = "CONNECT to an unavailable destination";
+        // TCP port 0 cannot identify a listener or be reused by another test.
+        let refused_target = SocketAddr::new(target.ip(), 0);
         let mut client = TcpStream::connect(http).await.unwrap();
         client.write_all(format!("CONNECT {refused_target} HTTP/1.1\r\nHost: {refused_target}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
-    }).await.expect("proxy protocol regression timed out");
+    }).await.unwrap_or_else(|_| panic!("proxy protocol regression timed out during {phase}"));
 }
 
 #[tokio::test]
