@@ -742,6 +742,10 @@ pub struct DnsProxyConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Use the local DNS proxy as the desktop system resolver.
+    #[serde(default)]
+    pub takeover_system_dns: bool,
+
     /// UDP listen address (e.g. "127.0.0.1:5353")
     #[serde(default = "default_dns_proxy_listen")]
     pub listen_address: String,
@@ -758,8 +762,39 @@ impl Default for DnsProxyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            takeover_system_dns: false,
             listen_address: default_dns_proxy_listen(),
             nameservers: default_dns_proxy_nameservers(),
+        }
+    }
+}
+
+impl DnsProxyConfig {
+    pub(crate) const SYSTEM_DNS_V4: &str = "127.0.0.1:53";
+    pub(crate) const SYSTEM_DNS_V6: &str = "[::1]:53";
+
+    pub fn takes_over_system_dns(&self) -> bool {
+        self.enabled && self.takeover_system_dns
+    }
+
+    pub fn validate_system_dns(&self, tun: &TunConfig) -> anyhow::Result<()> {
+        if self.takes_over_system_dns() {
+            anyhow::ensure!(cfg!(any(windows, target_os = "macos", target_os = "linux")), "此平台不支持系统 DNS 接管");
+            anyhow::ensure!(!tun.enabled || cfg!(target_os = "linux"), "TUN 模式目前仅支持 Linux");
+            let servers = if tun.enabled && self.nameservers.is_empty() { &tun.dns_servers } else { &self.nameservers };
+            let upstreams = rvpn_split_tunnel::dns_cache::DnsUpstreams::new(servers)?;
+            upstreams.validate_listener(Self::SYSTEM_DNS_V4.parse()?)?;
+            upstreams.validate_listener(Self::SYSTEM_DNS_V6.parse()?)?;
+        }
+        Ok(())
+    }
+
+    /// Primary UDP listener. System takeover also binds IPv6 loopback.
+    pub fn effective_listener(&self) -> &str {
+        if self.takes_over_system_dns() {
+            Self::SYSTEM_DNS_V4
+        } else {
+            &self.listen_address
         }
     }
 }

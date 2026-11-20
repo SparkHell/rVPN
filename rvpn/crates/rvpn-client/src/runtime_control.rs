@@ -49,6 +49,7 @@ struct Worker {
 
 impl Worker {
     fn start(config: ClientConfig) -> Result<Self> {
+        config.dns_proxy.validate_system_dns(&config.tun)?;
         anyhow::ensure!(
             config.performance.worker_threads > 0,
             "performance.worker_threads must be greater than zero"
@@ -230,7 +231,10 @@ pub async fn run(
     logging: &rvpn_logging::ReloadableLogging,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
-    crate::tun_routes::recover()?;
+    {
+        crate::linux_dns::recover()?;
+        crate::tun_routes::recover()?;
+    }
     config.split_tunnel.subscriptions = Some(Arc::new(rvpn_split_tunnel::subscriptions::Subscriptions::open(&config.data_dir)));
     let panel = Arc::new(ControlPanel::new(path, config.clone())?);
     let (sender, mut requests) = mpsc::channel::<ApplyRequest>(8);

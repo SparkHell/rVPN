@@ -59,7 +59,7 @@ const hiddenNetworkFields = new Set([
 ])
 
 const fieldOrder: Record<string, string[]> = {
-  dns_proxy: ['enabled', 'listen_address', 'nameservers'],
+  dns_proxy: ['enabled', 'takeover_system_dns', 'listen_address', 'nameservers'],
   network: [
     'dns_cache_enabled',
     'dns_cache_size',
@@ -98,6 +98,8 @@ function fieldRank(section: string, name: string) {
 
 function fieldDisabled(section: string, name: string, settings: Config) {
   if (name === 'enabled') return false
+  if (section === 'dns_proxy' && name === 'listen_address' && settings.takeover_system_dns)
+    return true
   if (
     settings.enabled === false &&
     !(section === 'dns_proxy' && name === 'nameservers')
@@ -1444,6 +1446,7 @@ function App() {
                       ? Object.entries(value)
                           .filter(
                             ([name]) =>
+                              (name !== 'takeover_system_dns' || session?.runtime.system_dns_supported) &&
                               (key !== 'network' ||
                                 !hiddenNetworkFields.has(name)) &&
                               (key !== 'split_tunnel' ||
@@ -1629,7 +1632,9 @@ function App() {
                               <Field
                                 key={name}
                                 name={name}
-                                value={v}
+                                value={key === 'dns_proxy' && name === 'listen_address' &&
+                                  (value as Config).enabled && (value as Config).takeover_system_dns
+                                  ? '127.0.0.1:53, [::1]:53' : v}
                                 section={key}
                                 disabled={fieldDisabled(
                                   key,

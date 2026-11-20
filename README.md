@@ -413,6 +413,20 @@ The local `[dns_proxy]` listener accepts UDP queries from apps. DoH changes
 its local upstream transport, while tunnel-routed address queries use the
 encrypted WebSocket DNS endpoint.
 
+On Windows 10 version 2004 or later, macOS, and Linux, enable both
+`dns_proxy.enabled` and `dns_proxy.takeover_system_dns` to use rVPN for
+system DNS. Run the client as administrator or root. During takeover, the
+client checks UDP listeners on `127.0.0.1:53` and `[::1]:53`. It updates
+default-route adapters on Windows, the primary IPv4 and IPv6 network services
+on macOS, and the system resolver configuration on Linux. Disabling takeover
+or stopping the client normally restores the previous configuration.
+Takeover defaults to off.
+
+On Linux, rVPN preserves the original `/etc/resolv.conf` file or symlink.
+When systemd-resolved is active, it also uses `resolvectl` to update and
+restore per-link DNS servers. Linux TUN keeps its existing IPv4 resolver
+management when dual-stack takeover is off.
+
 ### Desktop TUN on Linux
 
 The Linux desktop client manages IPv4 system routes and keeps the local DNS

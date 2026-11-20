@@ -8,6 +8,7 @@ export type Session = {
   access_allowed?: boolean
   version: string
   runtime: {
+    system_dns_supported?: boolean
     dashboard?: { enabled: boolean; listen_address: string }
     server_address: string
     tun: boolean
@@ -181,6 +182,7 @@ export const labels: Record<string, string> = {
   socks5: 'SOCKS5 代理',
   http_proxy: 'HTTP / HTTPS 代理',
   dns_proxy: 'DNS 代理',
+  takeover_system_dns: '接管系统 DNS',
   network: '网络设置',
   split_tunnel: '分流设置',
   tun: 'TUN 虚拟网卡',
@@ -249,6 +251,7 @@ export const labels: Record<string, string> = {
 export const hints: Record<string, string> = {
   routes: '每行一个网段。默认 0.0.0.0/0 表示所有 IPv4 地址都参与选路。开启分流时按规则选择直连或隧道；关闭分流时，范围内的公网流量走隧道。局域网私有地址始终直连。',
   file_enabled: '启动成功后写入日志文件。关闭后，运行日志显示在终端。',
+  takeover_system_dns: '需要管理员权限。将系统 DNS 指向 127.0.0.1:53 和 [::1]:53，关闭接管或正常退出时恢复。',
   dns_cache_enabled: '缓存解析结果，减少重复查询。',
   ipv6_enabled: '有 IPv6 地址时优先连接，失败后尝试 IPv4。',
   server_address: '支持 ws:// 或 wss://，包含 WebSocket 路径。',

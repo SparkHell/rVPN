@@ -147,6 +147,7 @@ async fn inspect_route(config: ClientConfig, input: &str) -> Result<Value> {
 
 fn validate(value: &Value) -> Result<ClientConfig> {
     let config: ClientConfig = serde_json::from_value(value.clone()).context("配置字段类型错误")?;
+    config.dns_proxy.validate_system_dns(&config.tun)?;
     anyhow::ensure!(
         config.performance.worker_threads > 0,
         "performance.worker_threads 必须大于 0"
@@ -164,20 +165,20 @@ fn validate(value: &Value) -> Result<ClientConfig> {
         "server_address 必须使用 ws:// 或 wss://"
     );
     for (name, address, enabled) in [
-        ("socks5", &config.socks5.listen_address, !config.tun.enabled),
+        ("socks5", config.socks5.listen_address.as_str(), !config.tun.enabled),
         (
             "http_proxy",
-            &config.http_proxy.listen_address,
+            config.http_proxy.listen_address.as_str(),
             config.http_proxy.enabled,
         ),
         (
             "dns_proxy",
-            &config.dns_proxy.listen_address,
+            config.dns_proxy.effective_listener(),
             config.dns_proxy.enabled,
         ),
         (
             "dashboard",
-            &config.dashboard.listen_address,
+            config.dashboard.listen_address.as_str(),
             config.dashboard.enabled,
         ),
     ] {
@@ -194,7 +195,7 @@ fn validate(value: &Value) -> Result<ClientConfig> {
             &config.dns_proxy.nameservers
         };
         rvpn_split_tunnel::dns_cache::DnsUpstreams::new(upstreams)?
-            .validate_listener(config.dns_proxy.listen_address.parse()?)?;
+            .validate_listener(config.dns_proxy.effective_listener().parse()?)?;
     }
     config.socks5.validate_pool()?;
     anyhow::ensure!(config.logging.max_files > 0, "logging.max_files 必须大于 0");
@@ -644,7 +645,8 @@ impl ControlPanel {
             "restart_required":false, "pending_changes":pending,
             "runtime":{"server_address":running.server_address,"tun":running.tun.enabled,
                 "socks5":running.socks5.listen_address,"http_proxy":running.http_proxy.listen_address,
-                "dns_proxy":running.dns_proxy.listen_address,"dashboard":running.dashboard}, "version":env!("CARGO_PKG_VERSION")}),
+                "system_dns_supported":cfg!(any(windows, target_os = "linux", target_os = "macos")),
+                "dns_proxy":running.dns_proxy.effective_listener(),"dashboard":running.dashboard}, "version":env!("CARGO_PKG_VERSION")}),
         )
     }
 

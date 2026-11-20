@@ -1,14 +1,14 @@
 //! Linux policy routes owned by one TUN session.
 use std::collections::{HashMap, HashSet};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use ip_network::IpNetwork;
 use rvpn_split_tunnel::RoutingDecision;
 
@@ -385,117 +385,7 @@ pub fn recover() -> Result<()> {
             std::fs::remove_file(marker)?;
         }
     }
-    if Path::new(DNS_BACKUP).try_exists()? {
-        let mut lock = fslock::LockFile::open("/run/rvpn-tun-resolver.lock")?;
-        if lock.try_lock()? {
-            restore_resolver()?;
-        }
-    }
     Ok(())
-}
-
-const DNS_BACKUP: &str = "/etc/.rvpn-tun-dns";
-const RESOLVER: &str = "/etc/resolv.conf";
-
-pub struct SystemDns {
-    _lock: fslock::LockFile,
-}
-
-impl SystemDns {
-    pub fn install(address: std::net::SocketAddr) -> Result<Option<Self>> {
-        ensure!(
-            address.port() == 53 && address.ip().is_loopback() && address.is_ipv4(),
-            "Linux TUN DNS requires a local IPv4 DNS proxy on port 53"
-        );
-        let resolver = Path::new(RESOLVER);
-        let contents = std::fs::read_to_string(resolver);
-        if contents.as_ref().is_ok_and(|s| {
-            let mut servers = s.lines().filter_map(|line| {
-                let mut words = line.split_whitespace();
-                (words.next()? == "nameserver")
-                    .then(|| words.next())
-                    .flatten()
-            });
-            let ip = address.ip().to_string();
-            servers.next() == Some(ip.as_str()) && servers.all(|server| server == ip)
-        }) {
-            return Ok(None);
-        }
-        let mut lock = fslock::LockFile::open("/run/rvpn-tun-resolver.lock")?;
-        ensure!(
-            lock.try_lock()?,
-            "Another rVPN session is managing system DNS"
-        );
-        ensure!(
-            !Path::new(DNS_BACKUP).try_exists()?,
-            "Previous TUN resolver backup still exists"
-        );
-        let mut active = format!("# Managed by rVPN TUN\nnameserver {}\n", address.ip());
-        if let Ok(contents) = contents {
-            for line in contents.lines() {
-                if matches!(
-                    line.split_whitespace().next(),
-                    Some("search" | "domain" | "options")
-                ) {
-                    active.push_str(line);
-                    active.push('\n');
-                }
-            }
-        }
-        // Publish the recovery files together before replacing the system resolver.
-        let backup = tempfile::tempdir_in("/etc")?;
-        match std::fs::symlink_metadata(resolver) {
-            Ok(m) if m.is_symlink() || m.is_file() => {
-                std::fs::hard_link(resolver, backup.path().join("original"))?
-            }
-            Ok(_) => bail!("Unsupported /etc/resolv.conf file type"),
-            Err(e) if e.kind() == ErrorKind::NotFound => (),
-            Err(e) => return Err(e.into()),
-        }
-        std::fs::write(backup.path().join("active"), &active)?;
-        let mut file = tempfile::NamedTempFile::new_in("/etc")?;
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        file.write_all(active.as_bytes())?;
-        std::fs::rename(backup.path(), DNS_BACKUP)?;
-        let guard = Self { _lock: lock };
-        file.persist(resolver)?;
-        Ok(Some(guard))
-    }
-}
-
-fn restore_resolver() -> Result<()> {
-    let backup = Path::new(DNS_BACKUP);
-    if !backup.try_exists()? {
-        return Ok(());
-    }
-    let active = std::fs::read(backup.join("active"))?;
-    let original = backup.join("original");
-    if std::fs::symlink_metadata(RESOLVER).is_ok_and(|m| m.is_file())
-        && std::fs::read(RESOLVER).is_ok_and(|bytes| bytes == active)
-    {
-        match std::fs::symlink_metadata(&original) {
-            Ok(_) => std::fs::rename(&original, RESOLVER)?,
-            Err(e) if e.kind() == ErrorKind::NotFound => std::fs::remove_file(RESOLVER)?,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    if std::fs::symlink_metadata(&original).is_ok() {
-        std::fs::remove_file(original)?;
-    }
-    // Rename before cleanup so an interrupted cleanup never looks like a valid journal.
-    let discarded = tempfile::tempdir_in("/etc")?;
-    std::fs::rename(backup, discarded.path().join("done"))?;
-    discarded.close()?;
-    Ok(())
-}
-
-impl Drop for SystemDns {
-    fn drop(&mut self) {
-        if let Err(error) = restore_resolver() {
-            tracing::error!(%error, "Failed to restore system DNS");
-        }
-    }
 }
 
 #[cfg(test)]

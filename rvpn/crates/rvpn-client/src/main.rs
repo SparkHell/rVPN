@@ -16,6 +16,14 @@ mod dashboard;
 mod dns;
 mod dns_cache;
 mod dns_proxy;
+#[cfg(windows)]
+mod windows_dns;
+#[cfg(any(target_os = "macos", test))]
+mod macos_dns;
+#[cfg(any(target_os = "linux", test))]
+mod resolved_dns;
+#[cfg(target_os = "linux")]
+mod linux_dns;
 mod http_proxy;
 mod identity_verification;
 mod metrics;
@@ -274,15 +282,6 @@ async fn run_socks5(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()
     let socks_listener = tokio::net::TcpListener::bind(socks_addr).await
         .with_context(|| format!("Failed to bind SOCKS5 proxy to {socks_addr}"))?;
 
-    if config.dns_proxy.enabled {
-        let (dns_proxy, socket) = bind_dns_proxy(&config, &proxy).await?;
-        tokio::spawn(async move {
-            if let Err(e) = dns_proxy.run_with_socket(socket).await {
-                error!("DNS proxy fatal error: {}", e);
-            }
-        });
-    }
-
     // Optionally start HTTP proxy (shares mux tunnel with SOCKS5)
     if config.http_proxy.enabled {
         let http_listen: SocketAddr = config.http_proxy.listen_address.parse().with_context(|| {
@@ -316,15 +315,51 @@ async fn run_socks5(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()
         });
     }
 
+    let dns = if config.dns_proxy.enabled {
+        let (dns, primary, secondary) = bind_dns_proxy(&config, &proxy).await?;
+        Some(tokio::spawn(dns.run_with_sockets(primary, secondary)))
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let _system_dns = config.dns_proxy.takes_over_system_dns()
+        .then(windows_dns::SystemDns::take_over).transpose()?;
+    #[cfg(target_os = "macos")]
+    let _system_dns = config.dns_proxy.takes_over_system_dns()
+        .then(macos_dns::SystemDns::take_over).transpose()?;
+    #[cfg(target_os = "linux")]
+    let _system_dns = if config.dns_proxy.takes_over_system_dns() {
+        linux_dns::SystemDns::install(config.dns_proxy.effective_listener().parse()?, true)?
+    } else { None };
     let _ = ready.send(());
-    proxy.run_with_listener(socks_listener).await
+    tokio::select! {
+        result = proxy.run_with_listener(socks_listener) => result,
+        result = async {
+            match dns {
+                Some(task) => task.await.context("DNS proxy task stopped")?,
+                None => std::future::pending().await,
+            }
+        } => result,
+    }
+}
+
+/// Check delivery to each bound socket before changing any adapter. Peeking
+/// preserves DNS requests that arrived before our empty probe datagram.
+async fn check_dns_loopback(listener: &tokio::net::UdpSocket) -> Result<()> {
+    let address = listener.local_addr()?;
+    let probe = tokio::net::UdpSocket::bind(SocketAddr::new(address.ip(), 0)).await?;
+    probe.send_to(&[], address).await?;
+    let mut packet = vec![0; 65535];
+    tokio::time::timeout(std::time::Duration::from_secs(2), listener.peek_from(&mut packet))
+        .await.with_context(|| format!("DNS 回环监听 {address} 未收到探测数据"))??;
+    Ok(())
 }
 
 async fn bind_dns_proxy(
     config: &ClientConfig,
     proxy: &Socks5Proxy,
-) -> Result<(std::sync::Arc<dns_proxy::DnsProxy>, tokio::net::UdpSocket)> {
-    let address: SocketAddr = config.dns_proxy.listen_address.parse()?;
+) -> Result<(std::sync::Arc<dns_proxy::DnsProxy>, tokio::net::UdpSocket, Option<tokio::net::UdpSocket>)> {
+    let address: SocketAddr = config.dns_proxy.effective_listener().parse()?;
     let nameservers = rvpn_split_tunnel::dns_cache::DnsUpstreams::new(&config.dns_proxy.nameservers)?;
     nameservers.validate_listener(address)?;
     let extra_hosts = config.extra_servers.iter().map(|server| parse_server_url(&server.address).0).collect();
@@ -337,7 +372,14 @@ async fn bind_dns_proxy(
     ));
     let socket = tokio::net::UdpSocket::bind(address).await
         .with_context(|| format!("Failed to bind DNS proxy to {address}"))?;
-    Ok((dns, socket))
+    let secondary = if config.dns_proxy.takes_over_system_dns() {
+        let address = config::DnsProxyConfig::SYSTEM_DNS_V6;
+        let secondary = tokio::net::UdpSocket::bind(address).await
+            .with_context(|| format!("Failed to bind DNS proxy to {address}"))?;
+        tokio::try_join!(check_dns_loopback(&socket), check_dns_loopback(&secondary))?;
+        Some(secondary)
+    } else { None };
+    Ok((dns, socket, secondary))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -358,7 +400,7 @@ async fn run_tun(mut config: ClientConfig, ready: tokio::sync::oneshot::Sender<(
         config.dns_proxy.nameservers.clone_from(&config.tun.dns_servers);
     }
     websocket::configure_endpoint_dns(&config)?;
-    let listen: SocketAddr = config.dns_proxy.listen_address.parse()?;
+    let listen: SocketAddr = config.dns_proxy.effective_listener().parse()?;
     anyhow::ensure!(listen.is_ipv4() && listen.ip().is_loopback() && listen.port() == 53,
         "TUN DNS proxy must listen on an IPv4 loopback address at port 53");
 
@@ -381,7 +423,7 @@ async fn run_tun(mut config: ClientConfig, ready: tokio::sync::oneshot::Sender<(
         }
     }
 
-    let (dns, socket) = bind_dns_proxy(&config, &engine).await?;
+    let (dns, socket, secondary) = bind_dns_proxy(&config, &engine).await?;
     dns.prepare_for_tun();
     let connection = async {
         let resumption = rvpn_tls::ResumptionStore::new();
@@ -417,7 +459,7 @@ async fn run_tun(mut config: ClientConfig, ready: tokio::sync::oneshot::Sender<(
                 })));
                 let _hook = OnDrop::new(|| websocket::set_endpoint_route_hook(None));
                 dns.set_tun_routes(&routes);
-                let _dns = tun_routes::SystemDns::install(listen)?;
+                let _dns = linux_dns::SystemDns::install(listen, config.dns_proxy.takes_over_system_dns())?;
                 dashboard::TUN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _status = OnDrop::new(|| dashboard::TUN_READY.store(false, std::sync::atomic::Ordering::Relaxed));
                 failures = 0;
@@ -444,7 +486,7 @@ async fn run_tun(mut config: ClientConfig, ready: tokio::sync::oneshot::Sender<(
     };
     tokio::select! {
         result = connection => result,
-        result = Arc::clone(&dns).run_with_socket(socket) => result.context("TUN DNS listener stopped"),
+        result = Arc::clone(&dns).run_with_sockets(socket, secondary) => result.context("TUN DNS listener stopped"),
     }
 }
 

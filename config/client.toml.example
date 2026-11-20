@@ -17,6 +17,7 @@ mtu = 1420
 routes = [ "0.0.0.0/0" ]
 
 [dns_proxy]
+takeover_system_dns = false  # Windows, macOS and Linux: use both loopback DNS listeners (administrator/root required)
 enabled = true
 listen_address = "127.0.0.1:53"
 nameservers = [ "https://223.6.6.6/dns-query", "https://223.5.5.5/dns-query" ]

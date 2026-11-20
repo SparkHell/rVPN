@@ -37,6 +37,7 @@ const config = {
   },
   dns_proxy: {
     enabled: true,
+    takeover_system_dns: false,
     listen_address: '127.0.0.1:53',
     nameservers: ['https://1.1.1.1/dns-query', '223.5.5.5:53'],
   },
@@ -101,6 +102,7 @@ test.beforeEach(async ({ page }) => {
       restart_required: false,
       version: '1.3.6',
       runtime: {
+        system_dns_supported: true,
         server_address: config.server_address,
         tun: false,
         socks5: '127.0.0.1:1080',
@@ -227,11 +229,15 @@ test('edits DoH and optional log directory, validates and applies without restar
     .getByRole('button', { name: 'DNS 与网络', exact: true })
     .click()
   const listener = page.getByLabel('监听地址')
+  const takeover = page.getByRole('switch', { name: '接管系统 DNS' })
   await page.getByRole('switch', { name: '启用 DNS 代理' }).click()
   await expect(listener).toBeDisabled()
+  await expect(takeover).toBeDisabled()
   await expect(page.getByLabel('DNS 上游')).toBeEnabled()
   await page.getByRole('switch', { name: '启用 DNS 代理' }).click()
   await expect(listener).toBeEnabled()
+  await takeover.click()
+  await expect(listener).toBeDisabled()
   await page.getByRole('switch', { name: 'DNS 缓存' }).click()
   await expect(page.getByLabel('最大缓存条数')).toBeDisabled()
   await expect(
@@ -264,6 +270,7 @@ test('edits DoH and optional log directory, validates and applies without restar
   await expect(page.getByLabel('DNS 上游')).toHaveValue(
     'https://dns.example.com/dns-query\n1.1.1.1:53',
   )
+  await expect(takeover).toBeChecked()
 })
 
 test('supports node and routing forms, and protects unsaved changes', async ({

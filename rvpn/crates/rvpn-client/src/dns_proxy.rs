@@ -177,11 +177,14 @@ impl DnsProxy {
     }
 
     pub(crate) async fn run_with_socket(self: Arc<Self>, socket: UdpSocket) -> Result<()> {
-        let listener = socket.local_addr()?;
-        let socket = Arc::new(socket);
+        self.run_with_sockets(socket, None).await
+    }
 
-        info!("DNS proxy listening on {}", self.listen_addr);
-
+    pub(crate) async fn run_with_sockets(
+        self: Arc<Self>,
+        socket: UdpSocket,
+        secondary: Option<UdpSocket>,
+    ) -> Result<()> {
         // Channel: UDP tasks → WebSocket connection manager
         let (query_tx, query_rx) = mpsc::channel::<QueryMsg>(DNS_QUERY_LIMIT);
         crate::dashboard::track_dns_queue(query_tx.downgrade());
@@ -193,11 +196,29 @@ impl DnsProxy {
             self_clone.run_ws_manager(query_rx).await;
         }));
 
-        // UDP receive loop
+        let primary = self.serve_socket(socket, &query_tx, &workers);
+        if let Some(secondary) = secondary {
+            tokio::try_join!(primary, self.serve_socket(secondary, &query_tx, &workers))?;
+            Ok(())
+        } else {
+            primary.await
+        }
+    }
+
+    async fn serve_socket(
+        self: &Arc<Self>,
+        socket: UdpSocket,
+        query_tx: &mpsc::Sender<QueryMsg>,
+        workers: &Arc<tokio::sync::Semaphore>,
+    ) -> Result<()> {
+        let listener = socket.local_addr()?;
+        let socket = Arc::new(socket);
+        info!("DNS proxy listening on {listener}");
         // Receive complete EDNS datagrams to avoid WSAEMSGSIZE on Windows.
         let mut buf = vec![0u8; 65535];
         loop {
             let (n, src) = receive_datagram(&socket, &mut buf).await?;
+            if n == 0 { continue; }
             let Ok(permit) = workers.clone().try_acquire_owned() else {
                 crate::dashboard::DNS_OVERLOAD.fetch_add(1, Ordering::Relaxed);
                 if n >= 12 {
@@ -217,7 +238,7 @@ impl DnsProxy {
             let server_hosts_clone = Arc::clone(&self.server_hosts);
             let doh_hosts = Arc::clone(&self.doh_hosts);
             #[cfg(target_os = "linux")]
-            let tun_owner = Arc::clone(&self);
+            let tun_owner = Arc::clone(self);
             tokio::spawn(async move {
                 let _permit = permit;
                 let process = async {
@@ -927,6 +948,64 @@ fn build_dns_error(query: &[u8], txid: u16, rcode: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn takeover_defaults_off_and_rejects_both_loopback_upstreams() {
+        let mut config: crate::config::DnsProxyConfig = toml::from_str(
+            "enabled = true\nlisten_address = '127.0.0.1:1053'"
+        ).unwrap();
+        assert!(!config.takes_over_system_dns());
+        assert_eq!(config.effective_listener(), "127.0.0.1:1053");
+        config.takeover_system_dns = true;
+        assert_eq!(config.effective_listener(), "127.0.0.1:53");
+        config.validate_system_dns(&Default::default()).unwrap();
+        for upstream in ["127.0.0.1", "[::1]:53"] {
+            config.nameservers = vec![upstream.into()];
+            assert!(config.validate_system_dns(&Default::default()).is_err());
+        }
+        config.enabled = false;
+        assert!(!config.takes_over_system_dns());
+        assert_eq!(config.effective_listener(), "127.0.0.1:1053");
+    }
+
+    #[tokio::test]
+    async fn dual_stack_listeners_handle_dns_and_reply_to_the_correct_client() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+        use hickory_proto::rr::{Name, RecordType};
+        use rvpn_core::crypto::x3dh::X3DHResponder;
+
+        let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let v6 = UdpSocket::bind("[::1]:0").await.unwrap();
+        tokio::try_join!(crate::check_dns_loopback(&v4), crate::check_dns_loopback(&v6)).unwrap();
+        let addresses = [v4.local_addr().unwrap(), v6.local_addr().unwrap()];
+        let resolver = Arc::new(DnsResolver::new(true, 300, 100, false, true, vec![]));
+        let rules = crate::split_tunnel::SplitTunnelConfig {
+            enabled: true, tunnel_domains: vec!["routing.test".into()], ..Default::default()
+        };
+        let split = Arc::new(SplitTunnel::new(rules, resolver.clone()).await.unwrap());
+        let proxy = DnsProxy::new(addresses[0], "127.0.0.1".into(), 1, "/ws",
+            TlsFingerprint::default(), Arc::new(IdentityKey::generate()),
+            Arc::new(X3DHResponder::new().get_public_bundle()), split, resolver,
+            rvpn_split_tunnel::dns_cache::DnsUpstreams::new(&["127.0.0.1:1".into()]).unwrap(),
+            vec![], vec![]);
+        let service = tokio::spawn(Arc::new(proxy).run_with_sockets(v4, Some(v6)));
+        for address in addresses {
+            let client = UdpSocket::bind(SocketAddr::new(address.ip(), 0)).await.unwrap();
+            client.connect(address).await.unwrap();
+            // Tunnel AAAA produces NODATA locally and requires no external resolver.
+            let mut query = Message::new(123, MessageType::Query, OpCode::Query);
+            query.add_query(Query::query(Name::from_ascii("routing.test.").unwrap(), RecordType::AAAA));
+            client.send(&query.to_vec().unwrap()).await.unwrap();
+            let mut buf = [0; 512];
+            let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await.unwrap().unwrap();
+            let answer = Message::from_vec(&buf[..n]).unwrap();
+            assert_eq!(answer.metadata.id, 123);
+            assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+            assert_eq!(answer.queries, query.queries);
+        }
+        service.abort();
+    }
 
     #[test]
     fn dns_errors_echo_the_question_without_edns() {
