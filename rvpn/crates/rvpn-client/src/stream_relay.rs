@@ -20,7 +20,7 @@ use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::protocol::HandshakeMessage;
 
 use crate::config::ServerIdentityConfig;
-use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
+use crate::identity_verification::{check_server_identity, VerificationResult};
 use rvpn_tls::{ResumptionStore, TlsFingerprint};
 use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter};
 
@@ -235,24 +235,7 @@ impl StreamRelay {
                         if let Some(config) = server_identity_config {
                             let server_addr = format!("{}:{}", host, port);
 
-                            // Load known hosts (mut — verify_server_identity
-                            // writes canonical pins on TOFU capture and
-                            // migrates legacy hex entries in-place).
-                            let mut known_hosts = KnownHosts::load(&config.known_hosts_file)
-                                .unwrap_or_default();
-
-                            let (result, should_proceed) = verify_server_identity(
-                                &server_addr,
-                                &received_bundle,
-                                &mut known_hosts,
-                                config.fingerprint.as_deref(),
-                                config.trust_on_first_use,
-                                config.strict_mode,
-                            );
-
-                            if let Err(e) = known_hosts.save(&config.known_hosts_file) {
-                                warn!("Failed to persist known_hosts.json: {}", e);
-                            }
+                            let (result, should_proceed) = check_server_identity(server_addr, &received_bundle, config).await?;
 
                             match result {
                                 VerificationResult::Verified => {

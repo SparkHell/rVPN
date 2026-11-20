@@ -840,6 +840,7 @@ impl DnsServer {
         const MAX_RETRIES: usize = 2;
         const TIMEOUT_SECS: u64 = 3;
 
+        let request = Message::from_vec(query)?;
         let mut last_error = None;
 
         for attempt in 0..=MAX_RETRIES {
@@ -847,20 +848,31 @@ impl DnsServer {
                 tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
             }
 
-            let socket = UdpSocket::bind("0.0.0.0:0").await
-                .context("Failed to bind UDP socket for DNS forward")?;
+            let bind = if nameserver.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let socket = UdpSocket::bind(bind).await?;
+            socket.connect(nameserver).await?;
 
-            if let Err(e) = socket.send_to(query, nameserver).await {
+            if let Err(e) = socket.send(query).await {
                 last_error = Some(format!("send failed: {}", e));
                 continue;
             }
 
-            let mut buf = [0u8; 4096];
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(TIMEOUT_SECS),
-                socket.recv_from(&mut buf)
-            ).await {
-                Ok(Ok((len, _))) => return Ok(buf[..len].to_vec()),
+            let mut buf = vec![0; 65535];
+            let receive = async {
+                loop {
+                    let len = socket.recv(&mut buf).await?;
+                    if let Ok(response) = Message::from_vec(&buf[..len]) {
+                        if response.metadata.id == request.metadata.id
+                            && response.metadata.message_type == MessageType::Response
+                            && response.metadata.op_code == request.metadata.op_code
+                            && response.queries == request.queries {
+                            return Ok::<_, std::io::Error>(len);
+                        }
+                    }
+                }
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), receive).await {
+                Ok(Ok(len)) => return Ok(buf[..len].to_vec()),
                 Ok(Err(e)) => last_error = Some(format!("recv error: {}", e)),
                 Err(_) => last_error = Some(format!("timeout ({}s)", TIMEOUT_SECS)),
             }
@@ -946,6 +958,36 @@ impl DnsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn udp_forward_validates_peer_and_question_on_both_families() {
+        for addr in ["127.0.0.1:0", "[::1]:0"] {
+            let upstream = UdpSocket::bind(addr).await.unwrap();
+            let other = UdpSocket::bind(addr).await.unwrap();
+            let endpoint = upstream.local_addr().unwrap();
+            let mut query = Message::new(42, MessageType::Query, OpCode::Query);
+            query.add_query(Query::query(Name::root(), RecordType::A));
+            let wire = query.to_vec().unwrap();
+            let mut reply = Message::response(42, OpCode::Query);
+            reply.queries.clone_from(&query.queries);
+            let expected = reply.to_vec().unwrap();
+            let responder = async {
+                let (_, peer) = upstream.recv_from(&mut [0; 512]).await.unwrap();
+                let mut unrelated = reply.clone();
+                unrelated.metadata.response_code = ResponseCode::ServFail;
+                other.send_to(&unrelated.to_vec().unwrap(), peer).await.unwrap();
+                upstream.send_to(&wire, peer).await.unwrap();
+                unrelated.metadata.id = 43;
+                upstream.send_to(&unrelated.to_vec().unwrap(), peer).await.unwrap();
+                unrelated.metadata.id = 42;
+                unrelated.queries.clear();
+                upstream.send_to(&unrelated.to_vec().unwrap(), peer).await.unwrap();
+                upstream.send_to(&expected, peer).await.unwrap();
+            };
+            let (_, response) = tokio::join!(responder, DnsServer::query_nameserver_udp_raw(endpoint, &wire));
+            assert_eq!(response.unwrap(), expected);
+        }
+    }
 
     #[tokio::test]
     async fn test_routing_decision_with_split_tunnel() {

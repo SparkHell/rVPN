@@ -28,7 +28,7 @@ gfwlist_enabled = true
 
 [network]
 dns_cache_enabled = true
-require_ech = true
+ech_mode = "prefer"
 
 [server_identity]
 trust_on_first_use = true

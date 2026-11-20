@@ -22,7 +22,7 @@ use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType};
 
 use crate::config::ServerIdentityConfig;
-use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
+use crate::identity_verification::{check_server_identity, VerificationResult};
 use rvpn_tls::{ResumptionStore, TlsFingerprint};
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
@@ -296,13 +296,6 @@ impl VpnTunnel {
                         // Verify server identity if configured
                         let server_addr = format!("{}:{}", host, port);
 
-                        // Load known hosts (mut — verify_server_identity
-                        // now writes canonical pins on TOFU capture and
-                        // migrates legacy hex entries in-place).
-                        let mut known_hosts =
-                            KnownHosts::load(&server_identity_config.known_hosts_file)
-                                .unwrap_or_default();
-
                         // Bundle for identity verification — uses the Ed25519 key from ServerHello
                         // so the fingerprint matches what the operator sees
                         let received_bundle = X3DHPublicBundle {
@@ -316,20 +309,7 @@ impl VpnTunnel {
                         };
 
                         // Verify the server identity
-                        let (result, should_proceed) = verify_server_identity(
-                            &server_addr,
-                            &received_bundle,
-                            &mut known_hosts,
-                            server_identity_config.fingerprint.as_deref(),
-                            server_identity_config.trust_on_first_use,
-                            server_identity_config.strict_mode,
-                        );
-
-                        // Persist any mutations (TOFU capture, legacy
-                        // pin migration, last_verified bump).
-                        if let Err(e) = known_hosts.save(&server_identity_config.known_hosts_file) {
-                            warn!("Failed to persist known_hosts.json: {}", e);
-                        }
+                        let (result, should_proceed) = check_server_identity(server_addr, &received_bundle, server_identity_config).await?;
 
                         match result {
                             VerificationResult::Verified => {

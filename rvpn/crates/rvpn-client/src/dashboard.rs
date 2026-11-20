@@ -348,6 +348,18 @@ pub fn record_conn_blocked() {
     with_state(|s| s.bump(&s.conns_blocked, 1));
 }
 
+static LAST_TLS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub fn record_tls_status(status: String) {
+    *LAST_TLS.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+}
+pub static DNS_OVERLOAD: AtomicU64 = AtomicU64::new(0);
+type QueueDepth = Box<dyn Fn() -> usize + Send + Sync>;
+static DNS_QUEUE: std::sync::Mutex<Option<QueueDepth>> = std::sync::Mutex::new(None);
+pub fn track_dns_queue<T: Send + 'static>(queue: tokio::sync::mpsc::WeakSender<T>) {
+    *DNS_QUEUE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move ||
+        queue.upgrade().map_or(0, |q| q.max_capacity() - q.capacity())));
+}
+
 /// Record a DNS query decision, cache-hit flag, and end-to-end latency.
 #[inline]
 pub fn record_dns(decision: DnsDecision, cache_hit: bool, latency: Duration) {
@@ -647,6 +659,7 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
         .collect();
 
     serde_json::json!({
+        "last_tls": LAST_TLS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         "recent_dns": *state.recent_dns.lock().unwrap_or_else(|e| e.into_inner()),
         "uptime_secs": uptime,
         "counters": {
@@ -661,6 +674,8 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
             "dns_bypass": state.dns_bypass.load(Ordering::Relaxed),
             "dns_block": state.dns_block.load(Ordering::Relaxed),
             "dns_gfwlist": state.dns_gfwlist.load(Ordering::Relaxed),
+            "dns_queue_depth": DNS_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |depth| depth()),
+            "dns_overload": DNS_OVERLOAD.load(Ordering::Relaxed),
             "dns_cache_hits": state.dns_cache_hits.load(Ordering::Relaxed),
             "handshakes_ok": state.handshakes_ok.load(Ordering::Relaxed),
             "handshakes_fail": state.handshakes_fail.load(Ordering::Relaxed),

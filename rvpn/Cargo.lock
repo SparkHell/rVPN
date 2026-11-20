@@ -2745,6 +2745,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "fast-socks5",
+ "fslock",
  "futures",
  "futures-util",
  "hex",

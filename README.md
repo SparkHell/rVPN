@@ -378,13 +378,13 @@ are ignored. Hostname lookups prefer IPv6 when enabled and keep IPv4 available
 as a fallback. Record TTLs take precedence over the fallback TTL used for
 system address lookups that return no record TTL.
 
-Set `[network].require_ech = true` to prefer Encrypted ClientHello on the
+Set `[network].ech_mode = "required"` to require ECH or `ech_mode = "prefer"` to prefer Encrypted ClientHello on the
 desktop CLI's VPN WebSockets. The client reads the VPN endpoint's HTTPS and
 address records using the HTTPS entries in `dns_proxy.nameservers`. Use the
 VPN endpoint hostname as SNI. The TLS frontend can issue an authenticated
 ECH retry config. If HTTPS/ECH discovery or the ECH handshake fails, the
-client logs the reason and retries the original endpoint with standard TLS
-and certificate verification before upgrading to WebSocket.
+client stops in required mode. In prefer mode it logs the reason and retries the original endpoint with standard TLS
+and certificate verification before upgrading to WebSocket. Legacy `require_ech = true` selects prefer mode and `false` selects off.
 
 Run with `-v` for per-stage timing. The logs distinguish endpoint address
 and HTTPS lookups, TCP, TLS, WebSocket upgrade, X3DH and TUN address

@@ -46,6 +46,7 @@ export type Stats = {
   }[]
   uptime_secs: number
   bucket_secs: number
+  last_tls?: string | null
   runtime_error?: string | null
   counters: Record<string, number>
   buckets: { ts: number; bytes_up: number; bytes_down: number }[]
@@ -194,7 +195,7 @@ export const labels: Record<string, string> = {
   ipv6_enabled: '启用 IPv6',
   dns_cache_enabled: 'DNS 缓存',
   dns_cache_size: '最大缓存条数',
-  require_ech: '优先使用 ECH',
+  ech_mode: 'ECH 模式',
   interface_name: '网卡名称',
   ip_address: '旧版固定 IP（现由服务器分配）',
   routes: '路由网段',
@@ -242,8 +243,8 @@ export const hints: Record<string, string> = {
   prekey_bundle: '使用服务端生成的公开 prekey-bundle.json。',
   nameservers:
     '每行填写一个 UDP 地址或 DoH URL，按顺序尝试。关闭本地监听后，客户端仍使用这些上游。',
-  require_ech:
-    '连接 VPN 服务器时隐藏握手中的域名。缺少 ECH 记录或握手失败时，自动回退到普通 TLS，并继续校验证书。',
+  ech_mode:
+    'prefer 优先使用 ECH，失败时回退；required 要求 ECH 成功；off 使用普通 TLS。',
   directory: '留空时写在程序目录；./logs 相对于配置文件目录。',
   mode: '留空时由复用兼容开关决定；pooled 使用连接池。',
   allow_cidrs:
@@ -272,6 +273,7 @@ export const hints: Record<string, string> = {
   logging: '保存后立即切换日志级别和文件设置，不中断代理连接。',
 }
 export const options: Record<string, string[]> = {
+  ech_mode: ['off', 'prefer', 'required'],
   tls_fingerprint: [
     'chrome',
     'firefox',

@@ -47,7 +47,7 @@ const config = {
     dns_cache_ttl: 14400,
     dns_cache_size: 1000,
     dns_servers: [],
-    require_ech: false,
+    ech_mode: 'off',
   },
   split_tunnel: {
     enabled: true,
@@ -225,7 +225,7 @@ test('edits DoH and optional log directory, validates and applies without restar
   await page.getByRole('switch', { name: 'DNS 缓存' }).click()
   await expect(page.getByLabel('最大缓存条数')).toBeDisabled()
   await expect(
-    page.getByRole('switch', { name: '优先使用 ECH' }),
+    page.getByRole('combobox', { name: /ECH 模式/ }),
   ).toHaveAccessibleDescription(/普通 TLS/)
   await expect(page.locator('.config-sections')).not.toContainText(
     /dns_cache_ttl|dns_servers|prefer_ipv4/,

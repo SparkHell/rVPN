@@ -134,3 +134,29 @@ fn strict_mode_refuses_new_server_without_state_change() {
     assert_eq!(result, VerificationResult::New);
     assert!(hosts.get_fingerprint("hk3.example.com:443").is_none());
 }
+
+
+#[test]
+fn persisted_tofu_preserves_corrupt_files_and_concurrent_pins() {
+    use rvpn_client::{ServerIdentityConfig, identity_verification::verify_persisted_identity};
+    let dir = TempDir::new().unwrap();
+    let cfg = ServerIdentityConfig {
+        known_hosts_file: known_hosts_path(&dir), trust_on_first_use: true, strict_mode: false,
+        ..Default::default()
+    };
+    let bundle = X3DHResponder::new().get_public_bundle();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for addr in ["a:443", "b:443"] {
+            let (barrier, bundle, cfg) = (&barrier, &bundle, &cfg);
+            scope.spawn(move || {
+                barrier.wait();
+                assert!(verify_persisted_identity(addr, bundle, cfg).unwrap().1);
+            });
+        }
+    });
+    assert_eq!(KnownHosts::load(&cfg.known_hosts_file).unwrap().servers.len(), 2);
+    std::fs::write(&cfg.known_hosts_file, b"broken").unwrap();
+    assert!(verify_persisted_identity("a:443", &bundle, &cfg).is_err());
+    assert_eq!(std::fs::read(&cfg.known_hosts_file).unwrap(), b"broken");
+}

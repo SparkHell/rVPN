@@ -18,6 +18,7 @@ name = "rvpn"
 path = "src/main.rs"
 
 [dependencies]
+fslock = "0.2"
 hickory-proto.workspace = true
 rvpn-core = { path = "../rvpn-core" }
 rvpn-logging = { path = "../rvpn-logging" }

@@ -14,8 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::{error, info, warn};
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{ErrorKind, Write};
 
 use rvpn_core::crypto::X3DHPublicBundle;
 use rvpn_core::identity_pin::{encode_identity_pin, pins_match, ParsedPin};
@@ -59,15 +58,49 @@ pub enum VerificationResult {
     },
 }
 
+pub async fn check_server_identity(
+    addr: String,
+    bundle: &X3DHPublicBundle,
+    cfg: &crate::config::ServerIdentityConfig,
+) -> Result<(VerificationResult, bool)> {
+    let bundle = bundle.clone();
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || verify_persisted_identity(&addr, &bundle, &cfg))
+        .await.context("Known hosts worker stopped")?
+}
+
+pub fn verify_persisted_identity(
+    addr: &str,
+    bundle: &X3DHPublicBundle,
+    cfg: &crate::config::ServerIdentityConfig,
+) -> Result<(VerificationResult, bool)> {
+    if cfg.fingerprint.is_some() {
+        // An explicit pin is authoritative and needs no writable TOFU store.
+        return Ok(verify_server_identity(addr, bundle, &mut KnownHosts::default(),
+            cfg.fingerprint.as_deref(), cfg.trust_on_first_use, cfg.strict_mode));
+    }
+    let path = Path::new(&cfg.known_hosts_file);
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let mut lock = fslock::LockFile::open(Path::new(&lock_path))?;
+    lock.lock().context("Lock known hosts file")?;
+    let mut known = KnownHosts::load(path)?;
+    let result = verify_server_identity(addr, bundle, &mut known, cfg.fingerprint.as_deref(),
+        cfg.trust_on_first_use, cfg.strict_mode);
+    if result.1 {
+        known.save(path)?;
+    }
+    Ok(result)
+}
+
 impl KnownHosts {
     /// Load known hosts from file
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        if !path.as_ref().exists() {
-            return Ok(Self::default());
-        }
-
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read known hosts file: {:?}", path.as_ref()))?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err).context(format!("Read {}", path.as_ref().display())),
+        };
 
         let hosts: KnownHosts = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse known hosts file: {:?}", path.as_ref()))?;
@@ -80,26 +113,12 @@ impl KnownHosts {
         let content =
             serde_json::to_string_pretty(self).context("Failed to serialize known hosts")?;
 
-        // Use OpenOptions for more control over file creation
-        use std::fs::OpenOptions;
-        use std::io::Write;
-
         let path = path.as_ref();
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-
-        #[cfg(unix)]
-        opts.mode(0o644);
-
-        let mut file = opts
-            .open(path)
-            .with_context(|| format!("Failed to open known hosts file for writing: {:?}", path))?;
-
-        file.write_all(content.as_bytes())
-            .with_context(|| format!("Failed to write known hosts file content: {:?}", path))?;
-
-        file.sync_all()
-            .with_context(|| format!("Failed to sync known hosts file: {:?}", path))?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(content.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(path).context("Replace known hosts file")?;
 
         Ok(())
     }

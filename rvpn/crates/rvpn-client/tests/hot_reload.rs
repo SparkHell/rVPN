@@ -403,7 +403,7 @@ async fn saves_apply_rebind_roll_back_and_move_panel_without_changing_pid() {
     config["dns_proxy"]["enabled"] = json!(true);
     config["dns_proxy"]["listen_address"] = json!(dns.to_string());
     config["dns_proxy"]["nameservers"] = json!(["https://resolver.example/dns-query", "223.5.5.5:53"]);
-    config["network"]["require_ech"] = json!(true);
+    config["network"]["ech_mode"] = json!("prefer");
     assert_eq!(save(&mut socket, &mut current, config).await["ok"], true);
     assert_eq!(current["runtime"]["socks5"], next_socks.to_string());
     assert!(TcpStream::connect(socks).await.is_err());

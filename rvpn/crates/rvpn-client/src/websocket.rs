@@ -39,7 +39,7 @@ const WS_CHANNEL_CAPACITY: usize = 256;
 struct EndpointDns {
     resolver: Option<std::sync::Arc<crate::dns_cache::DnsResolver>>,
     ech_resolver: Option<std::sync::Arc<crate::dns_cache::DnsResolver>>,
-    require_ech: bool,
+    ech_mode: crate::config::EchMode,
     bypass: Option<std::sync::Weak<crate::split_tunnel::SplitTunnel>>,
 }
 
@@ -47,7 +47,7 @@ struct EndpointDns {
 static ENDPOINT_DNS: std::sync::RwLock<EndpointDns> = std::sync::RwLock::new(EndpointDns {
     resolver: None,
     ech_resolver: None,
-    require_ech: false,
+    ech_mode: crate::config::EchMode::Off,
     bypass: None,
 });
 
@@ -81,7 +81,7 @@ pub fn configure_endpoint_dns(client_config: &crate::config::ClientConfig) -> Re
         ).with_nameservers(servers).map(std::sync::Arc::new)
     };
     let resolver = build_resolver(nameservers)?;
-    let ech_resolver = if config.require_ech {
+    let ech_resolver = if config.ech_mode != crate::config::EchMode::Off {
         let servers = doh_nameservers(nameservers);
         if servers.is_empty() {
             None
@@ -96,7 +96,7 @@ pub fn configure_endpoint_dns(client_config: &crate::config::ClientConfig) -> Re
     *ENDPOINT_DNS.write().unwrap_or_else(|e| e.into_inner()) = EndpointDns {
         resolver: Some(resolver),
         ech_resolver,
-        require_ech: config.require_ech,
+        ech_mode: config.ech_mode,
         bypass: None,
     };
     Ok(())
@@ -166,10 +166,12 @@ async fn with_ech_fallback<T>(
     ordinary_tls: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     match ech.await {
-        Ok(connection) => Ok(connection),
+        Ok(connection) => { crate::dashboard::record_tls_status("ECH".into()); Ok(connection) },
         Err(error) => {
             tracing::warn!("ECH unavailable; retrying with standard TLS: {error:#}");
-            ordinary_tls.await
+            let connection = ordinary_tls.await?;
+            crate::dashboard::record_tls_status(format!("普通 TLS，ECH 回退原因：{error:#}"));
+            Ok(connection)
         }
     }
 }
@@ -284,7 +286,7 @@ pub async fn connect_websocket(
         remember_server_addresses(&dns, origin, &addresses).await;
         dial_tls(&addresses, fingerprint, sni, resumption, None).await
     };
-    let tls_stream = if dns.require_ech {
+    let tls_stream = if dns.ech_mode != crate::config::EchMode::Off {
         let ech = async {
             anyhow::ensure!(sni.eq_ignore_ascii_case(origin), "ECH uses the endpoint hostname as SNI");
             let resolver = dns.ech_resolver.as_ref().context("No DoH upstream configured for ECH")?;
@@ -294,9 +296,19 @@ pub async fn connect_websocket(
             remember_server_addresses(&dns, origin, &addresses).await;
             dial_tls(&addresses, fingerprint, sni, resumption, Some(&config)).await
         };
-        with_ech_fallback(ech, ordinary_tls).await?
+        if dns.ech_mode == crate::config::EchMode::Required {
+            let connection = ech.await.inspect_err(|err| {
+                crate::dashboard::record_tls_status(format!("强制 ECH 失败：{err:#}"));
+            }).context("Required ECH connection failed")?;
+            crate::dashboard::record_tls_status("ECH".into());
+            connection
+        } else {
+            with_ech_fallback(ech, ordinary_tls).await?
+        }
     } else {
-        ordinary_tls.await?
+        let connection = ordinary_tls.await?;
+        crate::dashboard::record_tls_status("普通 TLS".into());
+        connection
     };
 
     // Build Chrome-like WebSocket upgrade request with 15 headers.
@@ -550,7 +562,7 @@ mod tests {
             std::sync::Arc::new(crate::dns_cache::DnsResolver::new(true, 300, 1000, true, false, vec![])),
         ).await.unwrap());
         split.set_server_endpoints(&["vpn.example".into()]).await;
-        let dns = EndpointDns { resolver: None, ech_resolver: None, require_ech: false, bypass: Some(std::sync::Arc::downgrade(&split)) };
+        let dns = EndpointDns { resolver: None, ech_resolver: None, ech_mode: crate::config::EchMode::Off, bypass: Some(std::sync::Arc::downgrade(&split)) };
         let old = "192.0.2.1:443".parse::<std::net::SocketAddr>().unwrap();
         let new = "[2001:db8::1]:8443".parse::<std::net::SocketAddr>().unwrap();
         remember_server_addresses(&dns, "VPN.EXAMPLE.", &[old]).await;

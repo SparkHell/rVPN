@@ -30,6 +30,7 @@ use rvpn_tls::{ResumptionStore, TlsFingerprint};
 use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter};
 
 /// Payload type bytes for DNS messages — must match server's DnsHandler
+const DNS_QUERY_LIMIT: usize = 256;
 const PAYLOAD_DNS_QUERY: u8 = 0x08;
 const PAYLOAD_DNS_RESPONSE: u8 = 0x09;
 
@@ -168,7 +169,9 @@ impl DnsProxy {
         info!("DNS proxy listening on {}", self.listen_addr);
 
         // Channel: UDP tasks → WebSocket connection manager
-        let (query_tx, query_rx) = mpsc::unbounded_channel::<QueryMsg>();
+        let (query_tx, query_rx) = mpsc::channel::<QueryMsg>(DNS_QUERY_LIMIT);
+        crate::dashboard::track_dns_queue(query_tx.downgrade());
+        let workers = Arc::new(tokio::sync::Semaphore::new(DNS_QUERY_LIMIT));
 
         // WebSocket connection manager (runs in background, reconnects on failure)
         let self_clone = Arc::clone(&self);
@@ -181,6 +184,14 @@ impl DnsProxy {
         let mut buf = vec![0u8; 65535];
         loop {
             let (n, src) = receive_datagram(&socket, &mut buf).await?;
+            let Ok(permit) = workers.clone().try_acquire_owned() else {
+                crate::dashboard::DNS_OVERLOAD.fetch_add(1, Ordering::Relaxed);
+                if n >= 12 {
+                    let reply = build_dns_servfail(&buf[..n], u16::from_be_bytes([buf[0], buf[1]]));
+                    let _ = socket.send_to(&reply, src).await;
+                }
+                continue;
+            };
             let data = buf[..n].to_vec();
             let socket_clone = Arc::clone(&socket);
             let query_tx_clone = query_tx.clone();
@@ -192,174 +203,181 @@ impl DnsProxy {
             let server_hosts_clone = Arc::clone(&self.server_hosts);
             let doh_hosts = Arc::clone(&self.doh_hosts);
             tokio::spawn(async move {
-                match parse_dns_query(&data) {
-                    Ok((dns_txid, domain, qtype)) => {
-                        let query_start = Instant::now();
-                        debug!("DNS query from {}: {} (type={})", src, domain, qtype);
+                let _permit = permit;
+                let process = async {
+                    match parse_dns_query(&data) {
+                        Ok((dns_txid, domain, qtype)) => {
+                            let query_start = Instant::now();
+                            debug!("DNS query from {}: {} (type={})", src, domain, qtype);
 
-                        // The VPN server hostnames themselves must never be
-                        // resolved through the tunnel: the tunnel needs DNS to
-                        // (re)connect, so tunneling these queries creates a
-                        // circular dependency — after any disconnect, buffered
-                        // queries wait for the tunnel while the tunnel waits
-                        // for DNS, and the client never recovers. Resolve them
-                        // locally via the same path as bypass domains.
-                        let host = domain.trim_end_matches('.');
-                        let is_doh_host = doh_hosts.iter().any(|name| name.eq_ignore_ascii_case(host));
-                        let is_server_host = server_hosts_clone.iter().any(|name| name.eq_ignore_ascii_case(host));
-                        let (decision, gfwlist) = if is_doh_host || is_server_host {
-                            (RoutingDecision::Bypass, false)
-                        } else {
-                            split_tunnel_clone.decide_dns(&domain).await
-                        };
+                            // The VPN server hostnames themselves must never be
+                            // resolved through the tunnel: the tunnel needs DNS to
+                            // (re)connect, so tunneling these queries creates a
+                            // circular dependency — after any disconnect, buffered
+                            // queries wait for the tunnel while the tunnel waits
+                            // for DNS, and the client never recovers. Resolve them
+                            // locally via the same path as bypass domains.
+                            let host = domain.trim_end_matches('.');
+                            let is_doh_host = doh_hosts.iter().any(|name| name.eq_ignore_ascii_case(host));
+                            let is_server_host = server_hosts_clone.iter().any(|name| name.eq_ignore_ascii_case(host));
+                            let (decision, gfwlist) = if is_doh_host || is_server_host {
+                                (RoutingDecision::Bypass, false)
+                            } else {
+                                split_tunnel_clone.decide_dns(&domain).await
+                            };
 
-                        let mut cache_hit = false;
-                        let wire = 'answer: { match decision {
-                            RoutingDecision::Bypass => {
-                                // Resolve locally — bypass domain should not go through tunnel
-                                debug!("DNS proxy: resolving {} locally (bypass)", domain);
-                                let result = if is_doh_host {
-                                    nameservers_clone.query_bootstrap(&data, listener).await
-                                } else {
-                                    resolve_locally(&data, &nameservers_clone).await
-                                };
-                                let wire = match result {
-                                    Ok(wire) => {
-                                        // Parse and cache successful bypass responses
-                                        if let Ok((ips, ttl_secs)) = crate::dns_cache::parse_dns_a_response(&wire, dns_txid) {
-                                            let ttl = std::time::Duration::from_secs(ttl_secs as u64);
-                                            dns_resolver_clone.store_with_ttl(&domain, ips, ttl).await;
+                            let mut cache_hit = false;
+                            let wire = 'answer: { match decision {
+                                RoutingDecision::Bypass => {
+                                    // Resolve locally — bypass domain should not go through tunnel
+                                    debug!("DNS proxy: resolving {} locally (bypass)", domain);
+                                    let result = if is_doh_host {
+                                        nameservers_clone.query_bootstrap(&data, listener).await
+                                    } else {
+                                        resolve_locally(&data, &nameservers_clone).await
+                                    };
+                                    let wire = match result {
+                                        Ok(wire) => {
+                                            // Parse and cache successful bypass responses
+                                            if let Ok((ips, ttl_secs)) = crate::dns_cache::parse_dns_a_response(&wire, dns_txid) {
+                                                let ttl = std::time::Duration::from_secs(ttl_secs as u64);
+                                                dns_resolver_clone.store_with_ttl(&domain, ips, ttl).await;
+                                            }
+                                            wire
                                         }
-                                        wire
-                                    }
-                                    Err(e) => {
-                                        warn!("DNS proxy: local resolution failed for {}: {}", domain, e);
-                                        build_dns_servfail(&data, dns_txid)
-                                    }
-                                };
-                                wire
-                            }
-                            RoutingDecision::Block => {
-                                // Return NXDOMAIN — treat blocked ad/tracker as non-existent
-                                debug!("DNS proxy: blocking {} (ad/tracker)", domain);
-                                build_dns_nxdomain(&data, dns_txid)
-                            }
-                            RoutingDecision::Tunnel => {
-                                // Non-address record types (NS/TXT/MX/HTTPS/...)
-                                // cannot be represented by the tunnel DNS protocol
-                                // (server answers via getaddrinfo — A/AAAA only).
-                                // Resolve them locally with a raw UDP forward so
-                                // diagnostic tools (dig) and HTTPS-RR clients get
-                                // real answers instead of empty NODATA/SERVFAIL.
-                                // A/AAAA — the record types CN resolvers poison
-                                // for connectivity — still go through the tunnel.
-                                if qtype != 1 && qtype != 28 {
-                                    debug!("DNS proxy: resolving {} (type={}) locally (non-A/AAAA)", domain, qtype);
-                                    let wire = match resolve_locally(
-                                        &data, &nameservers_clone
-                                    ).await {
-                                        Ok(wire) => wire,
                                         Err(e) => {
-                                            warn!("DNS proxy: local resolution failed for {} (type={}): {}", domain, qtype, e);
+                                            warn!("DNS proxy: local resolution failed for {}: {}", domain, e);
                                             build_dns_servfail(&data, dns_txid)
                                         }
                                     };
                                     wire
-                                } else {
-
-                                // The server has no IPv6 upstream and build_dns_response
-                                // strips AAAA records, so an AAAA query can only ever
-                                // produce an empty answer. Answer locally with an empty
-                                // NOERROR (NODATA) instead of spending a tunnel
-                                // round-trip — and during tunnel outages AAAA lookups
-                                // can no longer stall the client's resolver.
-                                if qtype == 28 {
-                                    let response = DnsResponse {
-                                        query_id: 0,
-                                        success: true,
-                                        ipv4_addrs: vec![],
-                                        ipv6_addrs: vec![],
-                                        ttl: 300,
-                                        error: None,
-                                    };
-                                    let wire = build_dns_response(&data, dns_txid, &response);
-                                    break 'answer wire;
                                 }
+                                RoutingDecision::Block => {
+                                    // Return NXDOMAIN — treat blocked ad/tracker as non-existent
+                                    debug!("DNS proxy: blocking {} (ad/tracker)", domain);
+                                    build_dns_nxdomain(&data, dns_txid)
+                                }
+                                RoutingDecision::Tunnel => {
+                                    // Non-address record types (NS/TXT/MX/HTTPS/...)
+                                    // cannot be represented by the tunnel DNS protocol
+                                    // (server answers via getaddrinfo — A/AAAA only).
+                                    // Resolve them locally with a raw UDP forward so
+                                    // diagnostic tools (dig) and HTTPS-RR clients get
+                                    // real answers instead of empty NODATA/SERVFAIL.
+                                    // A/AAAA — the record types CN resolvers poison
+                                    // for connectivity — still go through the tunnel.
+                                    if qtype != 1 && qtype != 28 {
+                                        debug!("DNS proxy: resolving {} (type={}) locally (non-A/AAAA)", domain, qtype);
+                                        let wire = match resolve_locally(
+                                            &data, &nameservers_clone
+                                        ).await {
+                                            Ok(wire) => wire,
+                                            Err(e) => {
+                                                warn!("DNS proxy: local resolution failed for {} (type={}): {}", domain, qtype, e);
+                                                build_dns_servfail(&data, dns_txid)
+                                            }
+                                        };
+                                        wire
+                                    } else {
 
-                                // Check local cache before forwarding through tunnel.
-                                // A queries only: cached A data must never answer a
-                                // non-A question (HTTPS/TXT/etc. would get A records).
-                                if qtype == 1 {
-                                    if let Some(ips) = dns_resolver_clone.lookup_cached(&domain).await {
-                                        debug!("DNS proxy: cache hit for {}, skipping tunnel", domain);
-                                        let ipv4_addrs: Vec<std::net::Ipv4Addr> = ips
-                                            .iter()
-                                            .filter_map(|ip| match ip {
-                                                IpAddr::V4(v4) => Some(*v4),
-                                                _ => None,
-                                            })
-                                            .collect();
-                                        // Use the actual remaining TTL from the cache entry
-                                        let ttl = dns_resolver_clone.get_remaining_ttl(&domain).await.unwrap_or(14400);
+                                    // The server has no IPv6 upstream and build_dns_response
+                                    // strips AAAA records, so an AAAA query can only ever
+                                    // produce an empty answer. Answer locally with an empty
+                                    // NOERROR (NODATA) instead of spending a tunnel
+                                    // round-trip — and during tunnel outages AAAA lookups
+                                    // can no longer stall the client's resolver.
+                                    if qtype == 28 {
                                         let response = DnsResponse {
                                             query_id: 0,
                                             success: true,
-                                            ipv4_addrs,
+                                            ipv4_addrs: vec![],
                                             ipv6_addrs: vec![],
-                                            ttl,
+                                            ttl: 300,
                                             error: None,
                                         };
                                         let wire = build_dns_response(&data, dns_txid, &response);
-                                        cache_hit = true;
                                         break 'answer wire;
                                     }
-                                }
 
-                                // Forward through encrypted WebSocket tunnel
-                                let query = DnsQuery {
-                                    query_id: qid,
-                                    domain: domain.clone(),
-                                    query_type: qtype,
-                                };
-                                let (reply_tx, reply_rx) = oneshot::channel();
-                                if query_tx_clone.send((query, dns_txid, src, reply_tx)).is_err() {
-                                    return; // proxy shutting down
+                                    // Check local cache before forwarding through tunnel.
+                                    // A queries only: cached A data must never answer a
+                                    // non-A question (HTTPS/TXT/etc. would get A records).
+                                    if qtype == 1 {
+                                        if let Some(ips) = dns_resolver_clone.lookup_cached(&domain).await {
+                                            debug!("DNS proxy: cache hit for {}, skipping tunnel", domain);
+                                            let ipv4_addrs: Vec<std::net::Ipv4Addr> = ips
+                                                .iter()
+                                                .filter_map(|ip| match ip {
+                                                    IpAddr::V4(v4) => Some(*v4),
+                                                    _ => None,
+                                                })
+                                                .collect();
+                                            // Use the actual remaining TTL from the cache entry
+                                            let ttl = dns_resolver_clone.get_remaining_ttl(&domain).await.unwrap_or(14400);
+                                            let response = DnsResponse {
+                                                query_id: 0,
+                                                success: true,
+                                                ipv4_addrs,
+                                                ipv6_addrs: vec![],
+                                                ttl,
+                                                error: None,
+                                            };
+                                            let wire = build_dns_response(&data, dns_txid, &response);
+                                            cache_hit = true;
+                                            break 'answer wire;
+                                        }
+                                    }
+
+                                    // Forward through encrypted WebSocket tunnel
+                                    let query = DnsQuery {
+                                        query_id: qid,
+                                        domain: domain.clone(),
+                                        query_type: qtype,
+                                    };
+                                    let (reply_tx, reply_rx) = oneshot::channel();
+                                    if query_tx_clone.try_send((query, dns_txid, src, reply_tx)).is_err() {
+                                        crate::dashboard::DNS_OVERLOAD.fetch_add(1, Ordering::Relaxed);
+                                        break 'answer build_dns_servfail(&data, dns_txid);
+                                    }
+                                    // 5s timeout — if the WebSocket is zombie (protocol alive but
+                                    // server not responding), don't hang the DNS client forever.
+                                    let wire = match tokio::time::timeout(tokio::time::Duration::from_secs(5), reply_rx).await {
+                                        // Propagate resolution failure as SERVFAIL
+                                        // instead of a NOERROR with no answers —
+                                        // NODATA wrongly tells stubs the name
+                                        // exists but has no such record.
+                                        Ok(Ok(Some(r))) if r.success => build_dns_response(&data, dns_txid, &r),
+                                        _ => build_dns_servfail(&data, dns_txid),
+                                    };
+                                    wire
+                                    }
                                 }
-                                // 5s timeout — if the WebSocket is zombie (protocol alive but
-                                // server not responding), don't hang the DNS client forever.
-                                let wire = match tokio::time::timeout(tokio::time::Duration::from_secs(5), reply_rx).await {
-                                    // Propagate resolution failure as SERVFAIL
-                                    // instead of a NOERROR with no answers —
-                                    // NODATA wrongly tells stubs the name
-                                    // exists but has no such record.
-                                    Ok(Ok(Some(r))) if r.success => build_dns_response(&data, dns_txid, &r),
-                                    _ => build_dns_servfail(&data, dns_txid),
-                                };
-                                wire
-                                }
+                            }};
+                            use crate::dashboard::DnsDecision;
+                            let route = match decision {
+                                RoutingDecision::Block => DnsDecision::Block,
+                                RoutingDecision::Tunnel if qtype == 1 => DnsDecision::Tunnel,
+                                _ => DnsDecision::Bypass,
+                            };
+                            crate::dashboard::record_dns_answer(&domain, qtype, route, cache_hit, gfwlist, query_start.elapsed(), &wire);
+                            if let Err(e) = socket_clone.send_to(&wire, src).await {
+                                debug!("DNS proxy: failed to send response to {}: {}", src, e);
                             }
-                        }};
-                        use crate::dashboard::DnsDecision;
-                        let route = match decision {
-                            RoutingDecision::Block => DnsDecision::Block,
-                            RoutingDecision::Tunnel if qtype == 1 => DnsDecision::Tunnel,
-                            _ => DnsDecision::Bypass,
-                        };
-                        crate::dashboard::record_dns_answer(&domain, qtype, route, cache_hit, gfwlist, query_start.elapsed(), &wire);
-                        if let Err(e) = socket_clone.send_to(&wire, src).await {
-                            debug!("DNS proxy: failed to send response to {}: {}", src, e);
+                        }
+                        Err(e) => {
+                            warn!("DNS proxy: failed to parse query from {}: {}", src, e);
                         }
                     }
-                    Err(e) => {
-                        warn!("DNS proxy: failed to parse query from {}: {}", src, e);
-                    }
+                };
+                if tokio::time::timeout(std::time::Duration::from_secs(10), process).await.is_err() && data.len() >= 12 {
+                    let _ = socket_clone.send_to(&build_dns_servfail(&data, u16::from_be_bytes([data[0],data[1]])), src).await;
                 }
             });
         }
     }
 
     /// Connection manager loop — reconnects on failure with exponential backoff
-    async fn run_ws_manager(self: Arc<Self>, mut query_rx: mpsc::UnboundedReceiver<QueryMsg>) {
+    async fn run_ws_manager(self: Arc<Self>, mut query_rx: mpsc::Receiver<QueryMsg>) {
         let mut backoff_secs: u64 = 2;
 
         loop {
@@ -386,7 +404,7 @@ impl DnsProxy {
     /// Single WebSocket session: connect, handshake, process queries until closed
     async fn run_ws_session(
         &self,
-        query_rx: &mut mpsc::UnboundedReceiver<QueryMsg>,
+        query_rx: &mut mpsc::Receiver<QueryMsg>,
     ) -> Result<()> {
         let ws = connect_websocket(
             &self.server_host,
@@ -455,9 +473,10 @@ impl DnsProxy {
         loop {
             tokio::select! {
                 // Outgoing: new DNS query from UDP handler
-                msg = query_rx.recv() => {
+                msg = query_rx.recv(), if pending.len() < DNS_QUERY_LIMIT => {
                     match msg {
                         Some((query, _dns_txid, _src, reply_tx)) => {
+                            if reply_tx.is_closed() { continue; }
                             let query_id = query.query_id;
 
                             let query_bytes = serde_json::to_vec(&query)

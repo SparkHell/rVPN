@@ -66,7 +66,7 @@ const fieldOrder: Record<string, string[]> = {
     'dns_cache_enabled',
     'dns_cache_size',
     'ipv6_enabled',
-    'require_ech',
+    'ech_mode',
   ],
   socks5: [
     'listen_address',
@@ -230,6 +230,7 @@ function Field({
       </label>
       {options[name] ? (
         <select
+          aria-description={switchHint}
           id={id}
           disabled={disabled}
           value={String(value ?? '')}
@@ -873,7 +874,7 @@ function DnsActivity({ stats }: { stats: Stats | null | undefined }) {
         <div>
           <h2>DNS 查询统计</h2>
           <p>
-            本次运行累计 {total} 次查询，各项占比以已完成的 DNS 查询为基数。
+            本次运行累计 {total} 次查询，当前排队 {counters.dns_queue_depth || 0}，过载拒绝 {counters.dns_overload || 0} 次。
           </p>
         </div>
       </div>
@@ -1274,6 +1275,7 @@ function App() {
               </span>
             </div>
           )}
+          {page === 'overview' && stats?.last_tls && <p>最近一次 TLS 握手：{stats.last_tls}</p>}
           {stats?.runtime_error && (
             <div className="notice error" role="alert">
               <ShieldCheck size={18} />

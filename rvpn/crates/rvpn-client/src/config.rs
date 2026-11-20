@@ -609,6 +609,26 @@ fn default_send_buffer_size() -> usize {
 /// Split tunnel configuration
 pub use rvpn_split_tunnel::SplitTunnelConfig;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EchMode {
+    #[default]
+    Off,
+    Prefer,
+    Required,
+}
+
+fn read_ech_mode<'de, D: serde::Deserializer<'de>>(d: D) -> Result<EchMode, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Setting { Mode(EchMode), Legacy(bool) }
+    Ok(match Setting::deserialize(d)? {
+        Setting::Mode(mode) => mode,
+        Setting::Legacy(true) => EchMode::Prefer,
+        Setting::Legacy(false) => EchMode::Off,
+    })
+}
+
 /// Network configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
@@ -628,9 +648,20 @@ pub struct NetworkConfig {
     #[serde(default = "default_dns_cache_size")]
     pub dns_cache_size: usize,
 
-    /// Prefer Encrypted ClientHello, with standard TLS fallback.
-    #[serde(default)]
-    pub require_ech: bool,
+    #[serde(default, alias = "require_ech", deserialize_with = "read_ech_mode")]
+    pub ech_mode: EchMode,
+}
+
+#[cfg(test)]
+#[test]
+fn ech_mode_migrates_saved_settings() {
+    for (old, expected) in [(true, EchMode::Prefer), (false, EchMode::Off)] {
+        let network: NetworkConfig = serde_json::from_value(serde_json::json!({"require_ech":old})).unwrap();
+        assert_eq!(network.ech_mode, expected);
+        assert!(serde_json::to_value(network).unwrap().get("require_ech").is_none());
+    }
+    let network: NetworkConfig = toml::from_str("ech_mode = 'required'").unwrap();
+    assert_eq!(network.ech_mode, EchMode::Required);
 }
 
 impl Default for NetworkConfig {
@@ -640,7 +671,7 @@ impl Default for NetworkConfig {
             dns_cache_enabled: true,
             dns_cache_ttl: 14400, // 4 hours — client-side cache can be aggressive since A-records rarely change
             dns_cache_size: 1000,
-            require_ech: false,
+            ech_mode: EchMode::Off,
         }
     }
 }

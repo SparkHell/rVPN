@@ -190,11 +190,16 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     info!("WebSocket endpoint (mobile TUN): {}", tun_path);
     info!("WebSocket endpoint (DNS proxy): {}", dns_path);
 
+    let handshakes = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
     // Accept connections
     loop {
         let (stream, peer_addr) = listener.accept().await
             .context("Failed to accept connection")?;
 
+        let permit = if tls_acceptor.is_some() {
+            let Ok(permit) = handshakes.clone().try_acquire_owned() else { continue };
+            Some(permit)
+        } else { None };
         let handler = handler.clone();
         let tun_handler = tun_handler.clone();
         let dns_handler = dns_handler.clone();
@@ -222,6 +227,7 @@ async fn run_server(config: ServerConfig) -> Result<()> {
                 dns_path,
                 mux_path,
                 tls_acceptor,
+                permit,
             )
             .await
             {
@@ -709,12 +715,13 @@ async fn handle_connection(
     dns_path: String,
     mux_path: String,
     tls_acceptor: Option<RvpnTlsAcceptor>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
     // If TLS is configured, do TLS handshake first. In ACME mode the
     // acceptor may consume the ClientHello as a TLS-ALPN-01 challenge —
     // that's `Ok(None)`, and we're done with this connection.
     let stream: Box<dyn AsyncReadWrite + Send + Unpin> = if let Some(acceptor) = tls_acceptor {
-        match acceptor.accept(stream).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(stream)).await.context("TLS handshake timeout")? {
             Ok(Some(tls_stream)) => {
                 info!("TLS handshake successful from {}", peer_addr);
                 tls_stream
@@ -731,6 +738,8 @@ async fn handle_connection(
     } else {
         Box::new(stream)
     };
+
+    drop(permit);
 
     // When a decoy site is configured, pre-read the HTTP request head so
     // non-WebSocket requests are answered with static files instead of a

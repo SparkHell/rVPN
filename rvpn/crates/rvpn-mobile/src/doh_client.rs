@@ -53,6 +53,8 @@ struct CacheEntry {
     failed: bool,
 }
 
+const DNS_QUERY_LIMIT: usize = 256;
+
 /// DNS-over-WebSocket client
 ///
 /// Maintains a persistent encrypted WebSocket connection to the server and
@@ -72,7 +74,7 @@ pub struct DohClient {
     /// Maximum number of entries in the DNS cache
     max_cache_size: usize,
     /// Channel to send outgoing DNS queries to the connection task
-    query_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<DnsQuery>>>>,
+    query_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<DnsQuery>>>>,
     /// Next query ID counter
     next_id: Arc<Mutex<u64>>,
 }
@@ -123,7 +125,7 @@ impl DohClient {
 
     /// Start the background connection task
     pub async fn start(&self) -> Result<()> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DnsQuery>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<DnsQuery>(DNS_QUERY_LIMIT);
         *self.query_tx.lock().await = Some(tx);
 
         let config = self.config.clone();
@@ -217,6 +219,8 @@ impl DohClient {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
+            pending.retain(|_, entry| !entry.reply_tx.is_closed());
+            anyhow::ensure!(pending.len() < DNS_QUERY_LIMIT, "DNS pending query limit reached");
             pending.insert(query_id, PendingQuery { reply_tx });
         }
 
@@ -224,9 +228,9 @@ impl DohClient {
         {
             let query_tx = self.query_tx.lock().await;
             if let Some(tx) = query_tx.as_ref() {
-                if tx.send(query).is_err() {
+                if tx.try_send(query).is_err() {
                     self.pending.lock().await.remove(&query_id);
-                    anyhow::bail!("DNS connection channel closed");
+                    anyhow::bail!("DNS connection queue full or closed");
                 }
             } else {
                 self.pending.lock().await.remove(&query_id);
@@ -236,8 +240,9 @@ impl DohClient {
 
         // Wait for response with timeout
         let response = tokio::time::timeout(Duration::from_secs(5), reply_rx)
-            .await
-            .context("DNS query timeout")?
+            .await;
+        self.pending.lock().await.remove(&query_id);
+        let response = response.context("DNS query timeout")?
             .context("DNS reply channel closed")?;
 
         if !response.success {
@@ -350,7 +355,7 @@ impl DohClient {
         server_ip: std::net::IpAddr,
         dns_path: &str,
         pending: &Arc<Mutex<HashMap<u64, PendingQuery>>>,
-        query_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DnsQuery>,
+        query_rx: &mut tokio::sync::mpsc::Receiver<DnsQuery>,
     ) -> Result<()> {
         let url = format!("wss://{}:{}{}", config.server_host, config.server_port, dns_path);
         info!("[DohClient] Connecting to {} (via IP {})", url, server_ip);
@@ -449,6 +454,7 @@ impl DohClient {
         // Run send/receive concurrently
         let send_loop = async {
             while let Some(query) = query_rx.recv().await {
+                if !pending.lock().await.get(&query.query_id).is_some_and(|p| !p.reply_tx.is_closed()) { continue; }
                 let query_bytes = match serde_json::to_vec(&query) {
                     Ok(b) => b,
                     Err(e) => {

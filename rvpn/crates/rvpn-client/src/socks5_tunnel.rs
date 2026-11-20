@@ -24,7 +24,7 @@ use rvpn_core::protocol::multiplex::{CreditWait, FlowSendCredits, FLOW_CREDIT_ST
 use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType};
 
 use crate::config::ServerIdentityConfig;
-use crate::identity_verification::{verify_server_identity, KnownHosts};
+use crate::identity_verification::check_server_identity;
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
     WebSocketWriter,
@@ -406,19 +406,8 @@ impl Socks5Tunnel {
                 // connects both persist without a caller-side rewrite.
                 if let Some(cfg) = server_identity_config {
                     let addr = format!("{}:{}", host, port);
-                    let mut known = KnownHosts::load(&cfg.known_hosts_file).unwrap_or_default();
-                    let (_res, ok) = verify_server_identity(
-                        &addr,
-                        &bundle,
-                        &mut known,
-                        cfg.fingerprint.as_deref(),
-                        cfg.trust_on_first_use,
-                        cfg.strict_mode,
-                    );
-                    if let Err(e) = known.save(&cfg.known_hosts_file) {
-                        tracing::warn!("Failed to persist known_hosts.json: {}", e);
-                    }
-                    if !ok && cfg.strict_mode {
+                    let (_res, ok) = check_server_identity(addr, &bundle, cfg).await?;
+                    if !ok && (cfg.strict || cfg.strict_mode) {
                         anyhow::bail!("Server identity verification failed");
                     }
                 }
