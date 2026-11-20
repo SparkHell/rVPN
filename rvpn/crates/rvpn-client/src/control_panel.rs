@@ -335,6 +335,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_ech_setting_can_be_saved_from_the_panel() {
+        let directory = tempfile::tempdir().unwrap();
+        let panel = panel(directory.path(), "toml");
+        std::fs::write(&panel.path, "[network]\nrequire_ech = true\n").unwrap();
+        let current = panel.configuration().unwrap();
+        assert_eq!(current["config"]["network"]["ech_mode"], "prefer");
+        assert!(current["config"]["network"].get("require_ech").is_none());
+        panel.command(&json!({"method":"config.save", "revision":current["revision"], "config":current["config"]})).await.unwrap();
+        assert_eq!(ClientConfig::load(&panel.path).unwrap().network.ech_mode, crate::config::EchMode::Prefer);
+    }
+
+    #[tokio::test]
     async fn snake_case_split_tunnel_fields_remain_editable() {
         let directory = tempfile::tempdir().unwrap();
         let panel = panel(directory.path(), "toml");
@@ -552,6 +564,10 @@ impl ControlPanel {
         let mut defaults = serde_json::to_value(parsed)?;
         let mut input = input;
         remove_retired_network_fields(&mut input);
+        if let Some(network) = input.get_mut("network").and_then(Value::as_object_mut) {
+            // The typed config already converted this alias to the canonical mode.
+            network.remove("require_ech");
+        }
         if let Some(Value::Object(split)) = input.get_mut("split_tunnel") {
             let canonical = defaults["split_tunnel"]
                 .as_object()

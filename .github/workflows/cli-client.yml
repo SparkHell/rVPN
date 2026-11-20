@@ -158,6 +158,9 @@ jobs:
       - name: Test gfwlist imports and domain routing
         run: cargo test --profile ci-test --locked --package rvpn-split-tunnel --lib --timings
 
+      - name: Test DNS proxy responses
+        run: "cargo test --profile ci-test --locked --package rvpn-client --bin rvpn dns_proxy::tests --timings"
+
       - name: Test WebSocket upgrade and close handling
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn websocket::tests --timings
 
@@ -337,6 +340,9 @@ jobs:
 
       - name: Test gfwlist imports and domain routing
         run: cargo test --profile ci-test --locked --package rvpn-split-tunnel --lib --timings
+
+      - name: Test DNS proxy responses
+        run: "cargo test --profile ci-test --locked --package rvpn-client --bin rvpn dns_proxy::tests --timings"
 
       - name: Test WebSocket upgrade and close handling
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn websocket::tests --timings

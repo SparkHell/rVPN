@@ -715,6 +715,7 @@ fn parse_dns_query(data: &[u8]) -> Result<(u16, String, u16)> {
         return Err(anyhow::anyhow!("DNS query too short ({} bytes)", data.len()));
     }
 
+    anyhow::ensure!(dns_question(data).is_some(), "Invalid DNS question");
     let txid = u16::from_be_bytes([data[0], data[1]]);
 
     // Walk the QNAME labels starting at byte 12
@@ -776,8 +777,9 @@ fn build_dns_response(query: &[u8], txid: u16, response: &DnsResponse) -> Vec<u8
 
     // Question section: properly parse QNAME length and copy only the question bytes
     // (not the OPT record that may be present in the original query)
-    let question_end = find_question_end(query, 12);
-    out.extend_from_slice(&query[12..question_end]);
+    if let Some(question) = dns_question(query) {
+        out.extend_from_slice(question);
+    }
 
     // Answer records — pointer 0xC00C refers to QNAME at offset 12
     let ttl = response.ttl.max(30).to_be_bytes();
@@ -796,24 +798,22 @@ fn build_dns_response(query: &[u8], txid: u16, response: &DnsResponse) -> Vec<u8
     out
 }
 
-/// Find the end of the question section in a DNS wire-format query.
-///
-/// Starts at the given offset (after the 12-byte header) and walks the QNAME
-/// to find where QTYPE/QCLASS begin. This correctly handles QNAME encoding
-/// and stops before any OPT record.
-fn find_question_end(query: &[u8], mut pos: usize) -> usize {
-    // Walk the QNAME: each label is [length: 1 byte][label: length bytes]
-    // Terminated by a null byte (0x00)
-    while pos < query.len() {
-        let len = query[pos];
-        if len == 0 {
-            // Null terminator found - QNAME ends, QTYPE/QCLASS follow (4 bytes)
-            return pos + 5; // 1 (null) + 2 (QTYPE) + 2 (QCLASS)
-        }
-        pos += 1 + len as usize; // Skip length byte + label bytes
+/// Return the complete, uncompressed question without any trailing EDNS data.
+fn dns_question(query: &[u8]) -> Option<&[u8]> {
+    if query.get(4..6)? != [0, 1] {
+        return None;
     }
-    // Malformed query - just return query.len()
-    query.len()
+    let mut pos = 12;
+    loop {
+        let len = *query.get(pos)? as usize;
+        if len == 0 {
+            return query.get(12..pos + 5);
+        }
+        if len > 63 {
+            return None;
+        }
+        pos += 1 + len;
+    }
 }
 
 /// Forward local/bypass queries using the explicit UDP/DoH upstream list.
@@ -824,30 +824,52 @@ async fn resolve_locally(
     nameservers.query(query).await
 }
 
-/// Build a minimal DNS NXDOMAIN response (for blocked ad/tracker domains)
-fn build_dns_nxdomain(_query: &[u8], txid: u16) -> Vec<u8> {
-    let mut out = vec![0u8; 12];
-    out[0] = (txid >> 8) as u8;
-    out[1] = (txid & 0xFF) as u8;
-    out[2] = 0x81; // QR=1, RD=1
-    out[3] = 0x83; // RA=1, RCODE=3 (NXDOMAIN)
-    out
+fn build_dns_nxdomain(query: &[u8], txid: u16) -> Vec<u8> {
+    build_dns_error(query, txid, 3)
 }
 
-/// Build a minimal DNS SERVFAIL response
-fn build_dns_servfail(_query: &[u8], txid: u16) -> Vec<u8> {
+fn build_dns_servfail(query: &[u8], txid: u16) -> Vec<u8> {
+    build_dns_error(query, txid, 2)
+}
+
+fn build_dns_error(query: &[u8], txid: u16, rcode: u8) -> Vec<u8> {
     let mut out = vec![0u8; 12];
-    out[0] = (txid >> 8) as u8;
-    out[1] = (txid & 0xFF) as u8;
-    out[2] = 0x81; // QR=1, RD=1
-    out[3] = 0x82; // RA=1, RCODE=2 (SERVFAIL)
-    // QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0 (zeros from vec! init)
+    out[0..2].copy_from_slice(&txid.to_be_bytes());
+    out[2] = 0x80 | (query.get(2).copied().unwrap_or_default() & 0x79);
+    out[3] = 0x80 | rcode;
+    if let Some(question) = dns_question(query) {
+        out[5] = 1;
+        out.extend_from_slice(question);
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_errors_echo_the_question_without_edns() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+        use hickory_proto::rr::{Name, RecordType};
+
+        let mut query = Message::new(42, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii("example.com.").unwrap(), RecordType::A));
+        let mut wire = query.to_vec().unwrap();
+        wire.extend_from_slice(&[0; 11]);
+        for (response, code) in [
+            (build_dns_nxdomain(&wire, 42), ResponseCode::NXDomain),
+            (build_dns_servfail(&wire, 42), ResponseCode::ServFail),
+        ] {
+            let parsed = Message::from_vec(&response).unwrap();
+            assert_eq!(parsed.metadata.id, 42);
+            assert_eq!(parsed.metadata.response_code, code);
+            assert!(!parsed.metadata.recursion_desired);
+            assert_eq!(parsed.queries, query.queries);
+            assert_eq!(response.len(), wire.len() - 11);
+        }
+        assert_eq!(build_dns_servfail(&wire[..13], 42).len(), 12);
+    }
 
     #[tokio::test]
     async fn listener_survives_closed_udp_peer_and_receives_large_datagrams() {
