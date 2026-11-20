@@ -339,9 +339,13 @@ async fn proxy_handshakes_and_http_framing() {
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
 
-        // The listener has closed. The proxy must report the connection failure.
+        // Reserve a port without listening so concurrent tests cannot bind it
+        // and the outbound connection cannot use it as its source port.
+        let refused = tokio::net::TcpSocket::new_v6().unwrap();
+        refused.bind("[::1]:0".parse().unwrap()).unwrap();
+        let refused_target = refused.local_addr().unwrap();
         let mut client = TcpStream::connect(http).await.unwrap();
-        client.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        client.write_all(format!("CONNECT {refused_target} HTTP/1.1\r\nHost: {refused_target}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
