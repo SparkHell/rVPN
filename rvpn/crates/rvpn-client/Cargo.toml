@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
+rust-version = "1.88"
 
 description = "R-VPN client implementation"
 
@@ -121,7 +121,7 @@ tokio-boring.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rcgen = "0.13"
-tokio-tungstenite = { version = "0.21", features = [] }
+tokio-tungstenite.workspace = true
 # test-util: paused-clock tests for the tunnel-pool drain backstop
 tokio = { workspace = true, features = ["test-util"] }
 # Test-only: also enable rvpn-tls's rustls backend so tests can observe the

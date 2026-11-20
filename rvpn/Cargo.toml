@@ -21,14 +21,13 @@ tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "net"] }
 
 # WebSocket
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
-tungstenite = "0.21"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+tungstenite = "0.24"
 
 # TLS
-rustls = { version = "0.22", default-features = false, features = ["tls12", "ring"] }
-tokio-rustls = "0.25"
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2.0"
-rustls-platform-verifier = "0.3"
 boring = "5"
 tokio-boring = "5"
 
@@ -53,7 +52,7 @@ snow = "0.10"
 
 # Networking
 fast-socks5 = "1.0"
-hickory-proto = "0.24"
+hickory-proto = "0.26.3"
 tun-rs = { version = "2.0", features = ["async"] }
 ip_network_table = "0.2"
 ip_network = "0.4"

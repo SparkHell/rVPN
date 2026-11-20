@@ -135,7 +135,7 @@ fn build_client_config(resumption: Option<&ResumptionStore>) -> Result<Arc<rustl
     // rustls's ring default offers TLS13_AES_256_GCM_SHA384 first; Chrome sends
     // TLS_AES_128_GCM_SHA256 first. Reordering these two lists is what makes
     // JA3-style hashers that key on cipher order stop distinguishing us from
-    // Chrome. Extension order and GREASE we can't reach from rustls 0.22.
+    // Chrome. This provider does not control extension order or GREASE.
     let base = rustls::crypto::ring::default_provider();
     let provider = rustls::crypto::CryptoProvider {
         cipher_suites: vec![
@@ -160,8 +160,7 @@ fn build_client_config(resumption: Option<&ResumptionStore>) -> Result<Arc<rustl
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    // ALPN: http/1.1 only (rustls 0.22 exposes this as a public field, not a
-    // builder method). Matches the boring backend's set_alpn_protos(b"\x08http/1.1").
+    // Match the boring backend's HTTP/1.1-only ALPN.
     // Advertising `h2` would let nginx pick HTTP/2 and break our manual WS upgrade.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
@@ -333,7 +332,7 @@ mod tests {
         /// verified. A resumed TLS 1.3 handshake carries NO Certificate
         /// message, so `verify_server_cert` is never invoked on a resume —
         /// the counter staying flat across a reconnect is positive proof of
-        /// resumption (rustls 0.22 has no `is_resumed()` accessor).
+        /// resumption.
         #[derive(Debug)]
         struct CountingVerifier {
             inner: Arc<WebPkiServerVerifier>,

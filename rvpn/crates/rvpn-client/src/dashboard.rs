@@ -371,13 +371,14 @@ pub fn record_dns_answer(domain: &str, qtype: u16, route: DnsDecision, cached: b
     with_state(|state| {
         if gfwlist { state.bump(&state.dns_gfwlist, 1); }
         let message = hickory_proto::op::Message::from_vec(wire).ok();
-        let answers: Vec<String> = message.iter().flat_map(|m| m.answers())
-            .filter_map(|r| r.data()).take(6).map(|r| r.to_string().chars().take(128).collect()).collect();
+        let answers: Vec<String> = message.iter().flat_map(|m| &m.answers)
+            .filter(|r| !matches!(r.data, hickory_proto::rr::RData::Update0(_)))
+            .take(6).map(|r| r.data.to_string().chars().take(128).collect()).collect();
         let record = serde_json::json!({
             "time":now_unix(), "domain":domain, "type":hickory_proto::rr::RecordType::from(qtype).to_string(),
             "route":match route { DnsDecision::Block => "广告拦截", DnsDecision::Bypass => "本地", DnsDecision::Tunnel => "隧道" },
             "cached":cached, "gfwlist":gfwlist, "ms":elapsed.as_millis(),
-            "rcode":message.map(|m| format!("{:?}", m.response_code())).unwrap_or_else(||"Invalid".into()), "answers":answers
+            "rcode":message.map(|m| format!("{:?}", m.metadata.response_code)).unwrap_or_else(||"Invalid".into()), "answers":answers
         });
         let mut recent = state.recent_dns.lock().unwrap_or_else(|e| e.into_inner());
         if recent.len() == 64 { recent.pop_back(); }

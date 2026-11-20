@@ -1564,7 +1564,7 @@ mod tests {
 
     /// The session's TLS config must carry its per-exit resumption store so
     /// reconnects (fresh `ClientConfig` each time) can still offer the cached
-    /// TLS 1.3 ticket as a PSK. rustls 0.22 exposes no accessor for the
+    /// TLS 1.3 ticket as a PSK. rustls exposes no accessor for the
     /// installed store, so assert on its `Debug` (our store formats as
     /// `ResumptionStore { .. }`; the default `ClientSessionMemoryCache` and
     /// `NoClientSessionStorage` format differently).

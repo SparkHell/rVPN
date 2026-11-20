@@ -257,7 +257,7 @@ impl DnsServer {
             .context("Failed to parse DNS query")?;
 
         // Check routing decision
-        let queries: Vec<&Query> = request.queries().iter().collect();
+        let queries: Vec<&Query> = request.queries.iter().collect();
         if queries.is_empty() {
             return Err(anyhow::anyhow!("No questions in query"));
         }
@@ -282,7 +282,7 @@ impl DnsServer {
         match decision {
             SplitTunnelRoutingDecision::Block => {
                 let mut response = self.make_base_response(&request);
-                response.set_response_code(ResponseCode::NXDomain);
+                response.metadata.response_code = ResponseCode::NXDomain;
                 response.to_vec().context("Failed to serialize block response")
             }
             SplitTunnelRoutingDecision::Bypass => {
@@ -329,7 +329,7 @@ impl DnsServer {
                     warn!("No DoH client for exit '{}' (domain {})", exit, domain);
                 }
                 let mut response = self.make_base_response(request);
-                response.set_response_code(ResponseCode::ServFail);
+                response.metadata.response_code = ResponseCode::ServFail;
                 return response.to_vec().context("Failed to serialize ServFail");
             }
         };
@@ -341,7 +341,7 @@ impl DnsServer {
                 self.note_routed_answer(exit, &cached, ttl);
             }
             let mut response = self.make_base_response(request);
-            response.set_response_code(ResponseCode::NoError);
+            response.metadata.response_code = ResponseCode::NoError;
             // First matching record only
             for addr in &cached {
                 match addr {
@@ -367,7 +367,7 @@ impl DnsServer {
                     self.note_routed_answer(exit, &addrs, ttl);
                 }
                 let mut response = self.make_base_response(request);
-                response.set_response_code(ResponseCode::NoError);
+                response.metadata.response_code = ResponseCode::NoError;
                 for addr in &addrs {
                     match addr {
                         IpAddr::V4(v4) if query_type == RecordType::A => {
@@ -386,7 +386,7 @@ impl DnsServer {
             Err(e) => {
                 warn!("DoH resolution failed for {}: {}", domain, e);
                 let mut response = self.make_base_response(request);
-                response.set_response_code(ResponseCode::ServFail);
+                response.metadata.response_code = ResponseCode::ServFail;
                 response.to_vec().context("Failed to serialize ServFail")
             }
         }
@@ -466,17 +466,17 @@ impl DnsServer {
         socket: &Arc<UdpSocket>,
     ) -> Result<()> {
         // Validate request
-        if request.message_type() != MessageType::Query {
+        if request.metadata.message_type != MessageType::Query {
             debug!("Ignoring non-query message");
             return Ok(());
         }
 
-        if request.op_code() != OpCode::Query {
+        if request.metadata.op_code != OpCode::Query {
             debug!("Ignoring query with non-standard opcode");
             return Ok(());
         }
 
-        let queries: Vec<&Query> = request.queries().iter().collect();
+        let queries: Vec<&Query> = request.queries.iter().collect();
         if queries.is_empty() {
             debug!("Ignoring query with no questions");
             return Ok(());
@@ -577,8 +577,8 @@ impl DnsServer {
         let response_bytes = response.to_vec()
             .context("Failed to serialize DNS response")?;
 
-        let answer_count = response.answers().len();
-        let rcode = response.response_code();
+        let answer_count = response.answers.len();
+        let rcode = response.metadata.response_code;
         if answer_count == 0 && decision == RoutingDecision::Tunnel {
             warn!("DNS tunnel query for {} returned 0 answers (rcode={:?}), possible DoH issue", name, rcode);
         }
@@ -642,7 +642,7 @@ impl DnsServer {
             if let Some(cached) = client.lookup_cached(domain, qtype_num).await {
                 debug!("DoH cache hit for tunnel domain {}", domain);
                 let mut response = self.make_base_response(request);
-                response.set_response_code(ResponseCode::NoError);
+                response.metadata.response_code = ResponseCode::NoError;
                 // Use DoH client's TTL (capped to reasonable max)
                 let ttl = client.get_cached_ttl(domain, qtype_num).await.unwrap_or(14400);
 
@@ -668,9 +668,9 @@ impl DnsServer {
                     }
                 }
 
-                if response.answers().is_empty() {
+                if response.answers.is_empty() {
                     debug!("No records of requested type for {}", domain);
-                    response.set_response_code(ResponseCode::NoError);
+                    response.metadata.response_code = ResponseCode::NoError;
                 }
                 return response;
             }
@@ -681,7 +681,7 @@ impl DnsServer {
                 match client.resolve(domain, qtype_num).await {
                     Ok(addrs) => {
                         let mut response = self.make_base_response(request);
-                        response.set_response_code(ResponseCode::NoError);
+                        response.metadata.response_code = ResponseCode::NoError;
                         // Use the actual TTL from the DoH response (cached by the client)
                         let ttl = client.get_cached_ttl(domain, qtype_num).await.unwrap_or(14400);
 
@@ -705,9 +705,9 @@ impl DnsServer {
                             }
                         }
 
-                        if response.answers().is_empty() {
+                        if response.answers.is_empty() {
                             debug!("No records of requested type for {}", domain);
-                            response.set_response_code(ResponseCode::NoError);
+                            response.metadata.response_code = ResponseCode::NoError;
                         }
 
                         response
@@ -749,7 +749,7 @@ impl DnsServer {
         if let Some(cached) = self.dns_resolver.lookup_cached(domain).await {
             if let Some(remaining_ttl) = self.dns_resolver.get_remaining_ttl(domain).await {
                 let mut response = self.make_base_response(request);
-                response.set_response_code(ResponseCode::NoError);
+                response.metadata.response_code = ResponseCode::NoError;
                 for addr in cached {
                     match (addr, query_type) {
                         (IpAddr::V4(v4), RecordType::A) => {
@@ -763,8 +763,8 @@ impl DnsServer {
                         _ => {}
                     }
                 }
-                if !response.answers().is_empty() {
-                    debug!("DNS cache hit for bypass domain {} ({} answers)", domain, response.answers().len());
+                if !response.answers.is_empty() {
+                    debug!("DNS cache hit for bypass domain {} ({} answers)", domain, response.answers.len());
                     return response;
                 }
             }
@@ -777,20 +777,13 @@ impl DnsServer {
                 let domain = domain.trim_end_matches('.');
                 let mut ips = Vec::new();
                 let mut min_ttl = u32::MAX;
-                for record in response.answers() {
-                    if let Some(rdata) = record.data() {
-                        match rdata {
-                            RData::A(a) => {
-                                ips.push(IpAddr::V4(a.0));
-                                min_ttl = min_ttl.min(record.ttl());
-                            }
-                            RData::AAAA(aaaa) => {
-                                ips.push(IpAddr::V6(aaaa.0));
-                                min_ttl = min_ttl.min(record.ttl());
-                            }
-                            _ => {}
-                        }
+                for record in &response.answers {
+                    match &record.data {
+                        RData::A(a) => ips.push(IpAddr::V4(a.0)),
+                        RData::AAAA(aaaa) => ips.push(IpAddr::V6(aaaa.0)),
+                        _ => continue,
                     }
+                    min_ttl = min_ttl.min(record.ttl);
                 }
                 if !ips.is_empty() && min_ttl != u32::MAX {
                     let ttl = std::time::Duration::from_secs(min_ttl.min(14400) as u64);
@@ -821,7 +814,7 @@ impl DnsServer {
                     match Message::from_vec(&response_bytes) {
                         Ok(response) => {
                             debug!("UDP forward received {} answers from {} for {}",
-                                   response.answer_count(), ns, response.queries().first().map(|q| q.name().to_ascii()).unwrap_or_default());
+                                   response.answers.len(), ns, response.queries.first().map(|q| q.name().to_ascii()).unwrap_or_default());
                             return Ok(response);
                         }
                         Err(e) => {
@@ -894,7 +887,7 @@ impl DnsServer {
         match self.dns_resolver.resolve(domain, 0).await {
             Ok(addrs) => {
                 let mut response = self.make_base_response(request);
-                response.set_response_code(ResponseCode::NoError);
+                response.metadata.response_code = ResponseCode::NoError;
                 let ttl = self.dns_resolver.get_remaining_ttl(domain).await.unwrap_or(14400);
 
                 for addr in &addrs {
@@ -935,25 +928,17 @@ impl DnsServer {
     }
 
     fn make_base_response(&self, request: &Message) -> Message {
-        let mut response = Message::new();
-        response.set_id(request.id());
-        response.set_message_type(MessageType::Response);
-        response.set_op_code(OpCode::Query);
-        response.set_authoritative(false);
-        response.set_recursion_desired(request.recursion_desired());
-        response.set_recursion_available(true);
-
-        // Copy questions
-        for q in request.queries() {
-            response.add_query(q.clone());
-        }
+        let mut response = Message::response(request.metadata.id, OpCode::Query);
+        response.metadata.recursion_desired = request.metadata.recursion_desired;
+        response.metadata.recursion_available = true;
+        response.queries.clone_from(&request.queries);
 
         response
     }
 
     fn make_error_response(&self, request: &Message, code: ResponseCode) -> Message {
         let mut response = self.make_base_response(request);
-        response.set_response_code(code);
+        response.metadata.response_code = code;
         response
     }
 }
@@ -966,10 +951,13 @@ mod tests {
     async fn test_routing_decision_with_split_tunnel() {
         use rvpn_split_tunnel::SplitTunnelConfig;
 
-        // Create a SplitTunnel config with built-in China domains enabled
+        // Use explicit rules so the test does not depend on bundled rule data.
         let config = SplitTunnelConfig {
             enabled: true,
-            builtin_bypass_countries: vec!["CN".to_string()],
+            builtin_bypass_countries: vec![],
+            bypass_domains: vec!["direct.example".into()],
+            tunnel_domains: vec!["tunnel.example".into()],
+            gfwlist_enabled: false,
             block_ads: false,
             ..Default::default()
         };
@@ -977,15 +965,16 @@ mod tests {
         let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
         let server = DnsServer::new(split_tunnel);
 
-        // Test China domain (should be bypass)
-        let name = Name::from_ascii("www.baidu.com").unwrap();
+        let name = Name::from_ascii("www.direct.example").unwrap();
         let decision = server.route_query(&name).await;
         assert_eq!(decision, RoutingDecision::Bypass);
 
-        // Test non-China domain (should be tunnel)
-        let name = Name::from_ascii("www.google.com").unwrap();
+        let name = Name::from_ascii("www.tunnel.example").unwrap();
         let decision = server.route_query(&name).await;
         assert_eq!(decision, RoutingDecision::Tunnel);
+
+        let name = Name::from_ascii("unmatched.example").unwrap();
+        assert_eq!(server.route_query(&name).await, RoutingDecision::Bypass);
     }
 
     #[tokio::test]
@@ -1014,10 +1003,7 @@ mod tests {
         // The Android service discovers the DNS proxy by querying the root
         // domain and expects a fast reply — it must be answered locally,
         // never routed upstream (DoH may be down or slow).
-        let mut request = Message::new();
-        request.set_id(0x1234);
-        request.set_message_type(MessageType::Query);
-        request.set_op_code(OpCode::Query);
+        let mut request = Message::new(0x1234, MessageType::Query, OpCode::Query);
         request.add_query(Query::query(Name::root(), RecordType::A));
 
         server.handle_query(request, client_addr, &server_socket).await.unwrap();
@@ -1029,8 +1015,8 @@ mod tests {
         ).await.unwrap().unwrap();
         let response = Message::from_vec(&buf[..len]).unwrap();
 
-        assert_eq!(response.id(), 0x1234);
-        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.metadata.id, 0x1234);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
     }
 
     #[tokio::test]
@@ -1057,10 +1043,7 @@ mod tests {
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client_socket.local_addr().unwrap();
 
-        let mut request = Message::new();
-        request.set_id(0xabcd);
-        request.set_message_type(MessageType::Query);
-        request.set_op_code(OpCode::Query);
+        let mut request = Message::new(0xabcd, MessageType::Query, OpCode::Query);
         let name = Name::from_ascii("www.google.com").unwrap();
         request.add_query(Query::query(name, RecordType::AAAA));
 
@@ -1073,8 +1056,8 @@ mod tests {
         ).await.unwrap().unwrap();
         let response = Message::from_vec(&buf[..len]).unwrap();
 
-        assert_eq!(response.response_code(), ResponseCode::NoError);
-        assert!(response.answers().is_empty());
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.answers.is_empty());
     }
 
     async fn test_split_tunnel() -> SplitTunnel {

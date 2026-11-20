@@ -33,8 +33,8 @@ sha2.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
-# Automatic Let's Encrypt certificates (TLS-ALPN-01). 0.9 tracks rustls 0.22.
-rustls-acme = { version = "0.9", default-features = false, features = ["ring"] }
+# Automatic Let's Encrypt certificates (TLS-ALPN-01).
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "webpki-roots"] }
 
 # Serialization
 serde.workspace = true
