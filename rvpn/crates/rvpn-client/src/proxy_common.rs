@@ -123,9 +123,9 @@ pub async fn open_target(
     let started = std::time::Instant::now();
     let mut route = None;
     let attempt = async {
-        let (decision, reason, addresses) = proxy.split_tunnel.explain_connection(host).await;
+        let (decision, reason, addresses, gfwlist) = proxy.split_tunnel.connection_route(host).await;
         route = Some((decision, reason));
-        open_target_inner(host, port, proxy, decision, &addresses).await
+        open_target_inner(host, port, proxy, decision, &addresses, gfwlist).await
     };
     let result = tokio::time::timeout(Duration::from_secs(30), attempt)
         .await
@@ -145,6 +145,7 @@ async fn open_target_inner(
     proxy: &ProxyHandle,
     decision: RoutingDecision,
     addresses: &[std::net::IpAddr],
+    gfwlist: bool,
 ) -> Result<tokio::io::DuplexStream> {
     let (client, mut relay_socket) = tokio::io::duplex(64 * 1024);
     match decision {
@@ -162,8 +163,7 @@ async fn open_target_inner(
             tokio::spawn(async move {
                 match tokio::io::copy_bidirectional(&mut relay_socket, &mut remote).await {
                     Ok((up, down)) => {
-                        crate::dashboard::record_bytes_up(up);
-                        crate::dashboard::record_bytes_down(down);
+                        crate::dashboard::record_bypass_bytes(up, down);
                     }
                     Err(e) => debug!("Direct relay ended: {e}"),
                 }
@@ -171,7 +171,7 @@ async fn open_target_inner(
             });
         }
         RoutingDecision::Tunnel => {
-            crate::dashboard::record_conn_tunneled();
+            crate::dashboard::record_conn_tunneled(gfwlist);
             if proxy.mode == Socks5Mode::Legacy {
                 open_legacy(relay_socket, host, port, proxy).await?;
             } else {

@@ -118,8 +118,13 @@ test.beforeEach(async ({ page }) => {
           counters: {
             bytes_down: 1048576,
             bytes_up: 102400,
+            tunnel_bytes: 524288,
             conns_accepted: 20,
             conns_completed: 12,
+            conns_tunneled: 14,
+            conns_bypassed: 5,
+            conns_blocked: 1,
+            conns_gfwlist: 9,
             dns_tunnel: 50,
             dns_bypass: 20,
             dns_block: 5,
@@ -193,7 +198,9 @@ test.beforeEach(async ({ page }) => {
 test('overview displays live values and can navigate to all configuration sections', async ({
   page,
 }) => {
-  await expect(page.getByText('01:01:01')).toBeVisible()
+  await expect(page.locator('article.metric').filter({ hasText: '已用代理流量' })).toContainText('512.0 KB')
+  await expect(page.locator('.dns-summary')).toContainText('20次连接分流')
+  await expect(page.locator('.dns-summary')).toContainText('本地 DNS 查询 75 次')
   await expect(page.getByText('1.0 MB', { exact: false })).toBeVisible()
   for (const label of [
     '服务器与路由',
@@ -383,6 +390,7 @@ test('split rules expose independent switches, immediate updates and DNS ratios'
   ).not.toBeChecked()
   await expect(page.locator('.dns-metrics')).toContainText('15 次 · 20.0%')
   await expect(page.locator('.dns-metrics')).toContainText('30 次 · 40.0%')
+  await expect(page.getByText('GFWList 命中 9 次，拦截 1 次', { exact: false })).toBeVisible()
   const httpRecord = page.getByRole('row').filter({ hasText: 'google.com:443' })
   await expect(httpRecord).toContainText(/HTTP.*隧道/)
   const socksRecord = page.getByRole('row').filter({ hasText: 'baidu.com:443' })

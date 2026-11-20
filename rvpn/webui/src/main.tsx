@@ -7,7 +7,6 @@ import {
   Check,
   ChevronRight,
   CircleHelp,
-  Clock3,
   ExternalLink,
   Globe2,
   Layers3,
@@ -36,7 +35,6 @@ import {
   options,
   sections,
   setPath,
-  uptime,
 } from './model'
 import type { Config, Session, Stats } from './model'
 import { useControl } from './useControl'
@@ -609,12 +607,12 @@ function Overview({
             sub: `已处理 ${counters.conns_accepted || 0} 个连接`,
           },
           {
-            label: '运行时长',
-            value: uptime(stats?.uptime_secs),
+            label: '已用代理流量',
+            value: bytes(counters.tunnel_bytes),
             unit: '',
-            icon: Clock3,
+            icon: Activity,
             color: 'green',
-            sub: '客户端进程在线时间',
+            sub: '本次运行 · 隧道上传与下载合计',
           },
         ].map((metric) => (
           <article className="metric" key={metric.label}>
@@ -680,33 +678,34 @@ function Overview({
         </section>
         <section className="panel">
           <div className="panel-heading">
-            <h2>DNS 与分流</h2>
+            <h2>连接分流与 DNS</h2>
             <ShieldCheck size={18} />
           </div>
           <div className="dns-summary">
             <strong>
-              {(counters.dns_tunnel || 0) +
-                (counters.dns_bypass || 0) +
-                (counters.dns_block || 0)}
-              <span>次 DNS 查询</span>
+              {(counters.conns_tunneled || 0) +
+                (counters.conns_bypassed || 0) +
+                (counters.conns_blocked || 0)}
+              <span>次连接分流</span>
             </strong>
-            <span>实时累计</span>
+            <span>本地 DNS 查询 {(counters.dns_tunnel || 0) +
+              (counters.dns_bypass || 0) + (counters.dns_block || 0)} 次</span>
           </div>
           <div className="dns-bars">
             {[
               {
-                name: '隧道解析',
-                value: counters.dns_tunnel || 0,
+                name: '隧道连接',
+                value: counters.conns_tunneled || 0,
                 color: 'blue-bg',
               },
               {
-                name: '直连解析',
-                value: counters.dns_bypass || 0,
+                name: '直连连接',
+                value: counters.conns_bypassed || 0,
                 color: 'green-bg',
               },
               {
                 name: '已拦截',
-                value: counters.dns_block || 0,
+                value: counters.conns_blocked || 0,
                 color: 'muted-bg',
               },
             ].map((item) => (
@@ -873,7 +872,7 @@ function DnsActivity({ stats }: { stats: Stats | null | undefined }) {
     <section className="panel config-panel dns-activity">
       <div className="panel-heading">
         <div>
-          <h2>DNS 查询统计</h2>
+          <h2>本地 DNS 代理查询统计</h2>
           <p>
             本次运行累计 {total} 次查询，当前排队 {counters.dns_queue_depth || 0}，过载拒绝 {counters.dns_overload || 0} 次。
           </p>
@@ -932,7 +931,7 @@ function DnsActivity({ stats }: { stats: Stats | null | undefined }) {
           </table>
         </div>
       ) : (
-        <p>等待本地 DNS 代理接收查询。</p>
+        <p>本地 DNS 代理尚未收到查询。HTTP 和 SOCKS5 代理可直接按域名分流。</p>
       )}
     </section>
   )
@@ -943,6 +942,7 @@ function ProxyActivity({ stats }: { stats: Stats | null | undefined }) {
   return (
     <section className="panel config-panel">
       <h2>最近代理连接</h2>
+      <p>本次运行的连接分流中，GFWList 命中 {stats?.counters.conns_gfwlist || 0} 次，拦截 {stats?.counters.conns_blocked || 0} 次。</p>
       {records?.length ? (
         <div className="dns-query-scroll">
           <table>

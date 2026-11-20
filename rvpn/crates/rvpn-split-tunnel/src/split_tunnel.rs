@@ -357,16 +357,22 @@ impl SplitTunnel {
     }
 
     pub async fn explain_connection(&self, host: &str) -> (RoutingDecision, &'static str, Vec<IpAddr>) {
+        let (decision, reason, ips, _) = self.connection_route(host).await;
+        (decision, reason, ips)
+    }
+
+    /// Includes whether GFWList selected the route, for connection accounting.
+    pub async fn connection_route(&self, host: &str) -> (RoutingDecision, &'static str, Vec<IpAddr>, bool) {
         if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
             let (decision, reason) = self.explain_ips(&[ip]).await;
-            return (decision, reason, vec![ip]);
+            return (decision, reason, vec![ip], false);
         }
-        if let Some((decision, _, reason)) = self.match_domain_rule(host).await {
-            return (decision, reason, Vec::new());
+        if let Some((decision, gfwlist, reason)) = self.match_domain_rule(host).await {
+            return (decision, reason, Vec::new(), gfwlist);
         }
         let ips = self.resolve_host_to_ips(host).await.unwrap_or_default();
         let (decision, reason) = self.explain_ips(&ips).await;
-        (decision, reason, ips)
+        (decision, reason, ips, false)
     }
 
     /// Check if a domain matches any pattern in the set
@@ -910,8 +916,10 @@ mod tests {
             proxy: HashSet::from(["proxy.example".into()]),
             exceptions: HashSet::from(["except.proxy.example".into()]), skipped:0,
         };
-        let routed = tokio::time::timeout(Duration::from_millis(100),split.decide_for_connection("www.proxy.example")).await.unwrap();
+        let (routed, _, _, gfwlist) = tokio::time::timeout(Duration::from_millis(100),
+            split.connection_route("www.proxy.example")).await.unwrap();
         assert_eq!(routed,RoutingDecision::Tunnel);
+        assert!(gfwlist);
         assert!(split.requires_tunnel("www.proxy.example").await);
         assert!(!split.requires_tunnel("except.proxy.example").await);
         assert_eq!(split.decide("www.proxy.example",&["127.0.0.1".parse().unwrap()]).await,RoutingDecision::Tunnel);
@@ -919,6 +927,7 @@ mod tests {
         assert_eq!(split.decide_by_host("www.proxy.example").await,RoutingDecision::Bypass);
         split.data.write().await.tunnel_domains.insert("proxy.example".into());
         assert_eq!(split.decide_by_host("www.proxy.example").await,RoutingDecision::Tunnel);
+        assert!(!split.connection_route("www.proxy.example").await.3);
     }
     use std::net::Ipv4Addr;
 

@@ -143,12 +143,15 @@ pub struct DashboardState {
     pub bytes_up: AtomicU64,
     /// Cumulative bytes relayed server → client.
     pub bytes_down: AtomicU64,
+    /// Payload bytes uploaded and downloaded through VPN tunnels.
+    tunnel_bytes: AtomicU64,
     /// Cumulative proxied connections accepted.
     pub conns_accepted: AtomicU64,
     /// Cumulative proxied connections finished.
     pub conns_completed: AtomicU64,
     /// Cumulative connections routed through the tunnel.
     pub conns_tunneled: AtomicU64,
+    conns_gfwlist: AtomicU64,
     /// Cumulative connections bypassed (direct).
     pub conns_bypassed: AtomicU64,
     /// Cumulative connections blocked (ad/tracker).
@@ -186,9 +189,11 @@ impl DashboardState {
         Self {
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
+            tunnel_bytes: AtomicU64::new(0),
             conns_accepted: AtomicU64::new(0),
             conns_completed: AtomicU64::new(0),
             conns_tunneled: AtomicU64::new(0),
+            conns_gfwlist: AtomicU64::new(0),
             conns_bypassed: AtomicU64::new(0),
             conns_blocked: AtomicU64::new(0),
             dns_tunnel: AtomicU64::new(0),
@@ -311,13 +316,26 @@ fn with_state(f: impl FnOnce(&DashboardState)) {
 /// Record `n` bytes relayed client → server.
 #[inline]
 pub fn record_bytes_up(n: u64) {
-    with_state(|s| s.bump(&s.bytes_up, n));
+    with_state(|s| {
+        s.bump(&s.bytes_up, n);
+        s.bump(&s.tunnel_bytes, n);
+    });
 }
 
 /// Record `n` bytes relayed server → client.
 #[inline]
 pub fn record_bytes_down(n: u64) {
-    with_state(|s| s.bump(&s.bytes_down, n));
+    with_state(|s| {
+        s.bump(&s.bytes_down, n);
+        s.bump(&s.tunnel_bytes, n);
+    });
+}
+
+pub fn record_bypass_bytes(up: u64, down: u64) {
+    with_state(|s| {
+        s.bump(&s.bytes_up, up);
+        s.bump(&s.bytes_down, down);
+    });
 }
 
 /// Record a newly accepted proxied connection.
@@ -334,8 +352,13 @@ pub fn record_conn_completed() {
 
 /// Record a connection routed through the tunnel.
 #[inline]
-pub fn record_conn_tunneled() {
-    with_state(|s| s.bump(&s.conns_tunneled, 1));
+pub fn record_conn_tunneled(gfwlist: bool) {
+    with_state(|s| {
+        s.bump(&s.conns_tunneled, 1);
+        if gfwlist {
+            s.bump(&s.conns_gfwlist, 1);
+        }
+    });
 }
 
 /// Record a connection bypassed (direct).
@@ -726,9 +749,11 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
         "counters": {
             "bytes_up": state.bytes_up.load(Ordering::Relaxed),
             "bytes_down": state.bytes_down.load(Ordering::Relaxed),
+            "tunnel_bytes": state.tunnel_bytes.load(Ordering::Relaxed),
             "conns_accepted": state.conns_accepted.load(Ordering::Relaxed),
             "conns_completed": state.conns_completed.load(Ordering::Relaxed),
             "conns_tunneled": state.conns_tunneled.load(Ordering::Relaxed),
+            "conns_gfwlist": state.conns_gfwlist.load(Ordering::Relaxed),
             "conns_bypassed": state.conns_bypassed.load(Ordering::Relaxed),
             "conns_blocked": state.conns_blocked.load(Ordering::Relaxed),
             "dns_tunnel": state.dns_tunnel.load(Ordering::Relaxed),
