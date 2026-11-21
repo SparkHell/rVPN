@@ -25,6 +25,45 @@ use crate::stream_relay::StreamRelay;
 use crate::tunnel_pool::TunnelPools;
 use rvpn_tls::TlsFingerprint;
 
+pub struct RunningMode {
+    mode: Socks5Mode,
+    pools: Option<Arc<TunnelPools>>,
+}
+
+#[derive(Default)]
+struct Listeners {
+    http: std::sync::Weak<RunningMode>,
+    socks5: std::sync::Weak<RunningMode>,
+}
+
+static LISTENERS: std::sync::LazyLock<std::sync::Mutex<Listeners>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub fn register_listener(protocol: ProxyProtocol, mode: Socks5Mode, pools: Option<Arc<TunnelPools>>) -> Arc<RunningMode> {
+    let listener = Arc::new(RunningMode { mode, pools });
+    let mut listeners = LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    match protocol {
+        ProxyProtocol::Http => listeners.http = Arc::downgrade(&listener),
+        ProxyProtocol::Socks5 => listeners.socks5 = Arc::downgrade(&listener),
+    }
+    listener
+}
+
+pub fn runtime_modes() -> serde_json::Value {
+    let listeners = LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    let http = listeners.http.upgrade();
+    let socks5 = listeners.socks5.upgrade();
+    let pool = [socks5.as_ref(), http.as_ref()].into_iter().flatten()
+        .find_map(|listener| listener.pools.as_ref())
+        .and_then(|pool| pool.current_load())
+        .map(|(ready, flows)| serde_json::json!({ "ready": ready, "flows": flows }));
+    serde_json::json!({
+        "socks5": socks5.map(|listener| listener.mode),
+        "http": http.map(|listener| listener.mode),
+        "pool": pool,
+    })
+}
+
 /// Lightweight handle passed to each connection handler.
 /// Contains everything needed to route traffic through the VPN tunnel.
 pub struct ProxyHandle {
@@ -112,6 +151,47 @@ pub enum ProxyProtocol {
     Socks5,
 }
 
+struct ConnectionTiming {
+    stage: &'static str,
+    since: std::time::Instant,
+    stages: Vec<(&'static str, u128)>,
+    reused: Option<bool>,
+}
+
+impl ConnectionTiming {
+    fn finish_stage(&mut self, next: &'static str) {
+        let now = std::time::Instant::now();
+        self.stages.push((self.stage, (now - self.since).as_millis()));
+        self.stage = next;
+        self.since = now;
+    }
+}
+
+/// Count successful writes as they happen and preserve TCP half-close semantics.
+async fn copy_direct(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    mut writer: impl tokio::io::AsyncWrite + Unpin,
+    upload: bool,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return writer.shutdown().await;
+        }
+        let mut offset = 0;
+        while offset < n {
+            let written = writer.write(&buf[offset..n]).await?;
+            if written == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            offset += written;
+            crate::dashboard::record_bypass_bytes(written as u64, upload);
+        }
+    }
+}
+
 /// Open a routed stream only after the destination has accepted the connection.
 pub async fn open_target(
     host: &str,
@@ -121,11 +201,17 @@ pub async fn open_target(
 ) -> Result<tokio::io::DuplexStream> {
     crate::dashboard::record_conn_accepted();
     let started = std::time::Instant::now();
+    let mut timing = ConnectionTiming {
+        stage: "分流",
+        since: started,
+        stages: Vec::with_capacity(3),
+        reused: None,
+    };
     let mut route = None;
     let attempt = async {
         let (decision, reason, addresses, gfwlist) = proxy.split_tunnel.connection_route(host).await;
         route = Some((decision, reason));
-        open_target_inner(host, port, proxy, decision, &addresses, gfwlist).await
+        open_target_inner(host, port, proxy, decision, &addresses, gfwlist, &mut timing).await
     };
     let result = tokio::time::timeout(Duration::from_secs(30), attempt)
         .await
@@ -133,8 +219,19 @@ pub async fn open_target(
             std::io::ErrorKind::TimedOut, "target connection timed out"
         ).into()));
     if let Some(protocol) = protocol {
-        crate::dashboard::record_proxy_connection(host, port, protocol, route,
-            result.is_ok(), started.elapsed());
+        timing.finish_stage("");
+        let diagnostics = crate::dashboard::ProxyDiagnostics {
+            stages: timing.stages,
+            failed_stage: result.as_ref().err()
+                .and_then(|error| error.downcast_ref::<crate::websocket::ConnectStage>())
+                .map(|stage| stage.0),
+            mode: route.filter(|(decision, _)| *decision == RoutingDecision::Tunnel)
+                .map(|_| proxy.mode),
+            reused: timing.reused,
+        };
+        crate::dashboard::record_proxy_connection(
+            host, port, protocol, route, result.is_ok(), started.elapsed(), diagnostics,
+        );
     }
     result
 }
@@ -146,8 +243,9 @@ async fn open_target_inner(
     decision: RoutingDecision,
     addresses: &[std::net::IpAddr],
     gfwlist: bool,
+    timing: &mut ConnectionTiming,
 ) -> Result<tokio::io::DuplexStream> {
-    let (client, mut relay_socket) = tokio::io::duplex(64 * 1024);
+    let (client, relay_socket) = tokio::io::duplex(64 * 1024);
     match decision {
         RoutingDecision::Block => {
             crate::dashboard::record_conn_blocked();
@@ -159,31 +257,40 @@ async fn open_target_inner(
         }
         RoutingDecision::Bypass => {
             crate::dashboard::record_conn_bypassed();
-            let mut remote = crate::websocket::connect_direct_tcp(host, port, addresses).await?;
+            timing.finish_stage("目标连接");
+            let remote = crate::websocket::connect_direct_tcp(host, port, addresses).await?;
+            let active = crate::dashboard::ActiveConnection::start();
             tokio::spawn(async move {
-                match tokio::io::copy_bidirectional(&mut relay_socket, &mut remote).await {
-                    Ok((up, down)) => {
-                        crate::dashboard::record_bypass_bytes(up, down);
-                    }
-                    Err(e) => debug!("Direct relay ended: {e}"),
+                let _active = active;
+                let (local_read, local_write) = tokio::io::split(relay_socket);
+                let (remote_read, remote_write) = remote.into_split();
+                if let Err(e) = tokio::try_join!(
+                    copy_direct(local_read, remote_write, true),
+                    copy_direct(remote_read, local_write, false),
+                ) {
+                    debug!("Direct relay ended: {e}");
                 }
-                crate::dashboard::record_conn_completed();
             });
         }
         RoutingDecision::Tunnel => {
             crate::dashboard::record_conn_tunneled(gfwlist);
+            timing.finish_stage("获取隧道");
             if proxy.mode == Socks5Mode::Legacy {
-                open_legacy(relay_socket, host, port, proxy).await?;
+                timing.reused = Some(false);
+                open_legacy(relay_socket, host, port, proxy, timing).await?;
             } else {
-                let tunnel = if proxy.mode == Socks5Mode::Pooled {
+                let (tunnel, reused) = if proxy.mode == Socks5Mode::Pooled {
                     pooled_tunnel(host, proxy).await?
                 } else {
                     multiplexed_tunnel(proxy).await?
                 };
+                timing.reused = Some(reused);
+                timing.finish_stage("目标连接");
                 let flow = tunnel.open_flow(host, port).await?;
+                let active = crate::dashboard::ActiveConnection::start();
                 tokio::spawn(async move {
+                    let _active = active;
                     socks5_tunnel::relay_flow(relay_socket, flow, &tunnel).await;
-                    crate::dashboard::record_conn_completed();
                 });
             }
         }
@@ -205,7 +312,7 @@ pub async fn route_connection(
     Ok(())
 }
 
-async fn multiplexed_tunnel(proxy: &ProxyHandle) -> Result<Arc<Socks5Tunnel>> {
+async fn multiplexed_tunnel(proxy: &ProxyHandle) -> Result<(Arc<Socks5Tunnel>, bool)> {
     let tunnel = {
         let mux_path = if proxy.mux_path.is_empty() {
             let base = proxy.server_path.trim_end_matches('/');
@@ -227,6 +334,7 @@ async fn multiplexed_tunnel(proxy: &ProxyHandle) -> Result<Arc<Socks5Tunnel>> {
             }
         }
 
+        let reused = guard.is_some();
         if guard.is_none() {
             // Retry tunnel creation up to 3 times if it dies immediately
             // (e.g. server closes connection right after X3DH)
@@ -289,13 +397,13 @@ async fn multiplexed_tunnel(proxy: &ProxyHandle) -> Result<Arc<Socks5Tunnel>> {
                 ))).context(format!("Failed to create multiplexed tunnel (mux_path='{}')", mux_path));
             }
         }
-        Arc::clone(guard.as_ref().unwrap())
+        (Arc::clone(guard.as_ref().unwrap()), reused)
     };
 
     Ok(tunnel)
 }
 
-async fn pooled_tunnel(target_host: &str, proxy: &ProxyHandle) -> Result<Arc<Socks5Tunnel>> {
+async fn pooled_tunnel(target_host: &str, proxy: &ProxyHandle) -> Result<(Arc<Socks5Tunnel>, bool)> {
     let pools = proxy
         .tunnel_pools
         .as_ref()
@@ -303,7 +411,7 @@ async fn pooled_tunnel(target_host: &str, proxy: &ProxyHandle) -> Result<Arc<Soc
     let exit_name = proxy.router.choose(target_host);
     let tunnel = pools
         .get_or_default(exit_name)
-        .pick_tunnel()
+        .pick_with_reuse()
         .await
         .with_context(|| format!("Failed to pick pooled tunnel via exit '{}'", exit_name))?;
 
@@ -319,6 +427,7 @@ async fn open_legacy(
     target_host: &str,
     port: u16,
     proxy: &ProxyHandle,
+    timing: &mut ConnectionTiming,
 ) -> Result<()> {
     let server = proxy.pool.get_or_default(proxy.router.choose(target_host));
 
@@ -343,6 +452,7 @@ async fn open_legacy(
     .await
     .with_context(|| format!("Failed to connect StreamRelay to server '{}'", server.name))?;
 
+    timing.finish_stage("目标连接");
     let mut request = vec![0]; // Confirmed TCP connect command. Older servers reject it.
     request.extend(encode_target_address(&format!("{target_host}:{port}"))?);
     relay.send_frame(&ws_writer, &request).await?;
@@ -351,12 +461,13 @@ async fn open_legacy(
         .await
         .context("legacy server did not confirm target connection")?;
     anyhow::ensure!(status == [0], "legacy server could not connect to target");
+    let active = crate::dashboard::ActiveConnection::start();
     tokio::spawn(async move {
+        let _active = active;
         if let Err(e) = relay.relay(socket, ws_reader, ws_writer).await {
             debug!("Legacy relay ended: {e}");
         }
         ws_tasks.shutdown().await;
-        crate::dashboard::record_conn_completed();
     });
     Ok(())
 }

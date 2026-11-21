@@ -106,6 +106,9 @@ impl HttpProxy {
     }
 
     pub(crate) async fn run_with_listener(&self, listener: TcpListener) -> Result<()> {
+        let _mode = proxy_common::register_listener(
+            proxy_common::ProxyProtocol::Http, self.mode, self.tunnel_pools.clone(),
+        );
 
         info!("HTTP proxy listening on {}", self.listen_addr);
 

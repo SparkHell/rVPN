@@ -526,7 +526,7 @@ function Overview({
   const counters = stats?.counters || {}
   const active = Math.max(
     0,
-    (counters.conns_accepted || 0) - (counters.conns_completed || 0),
+    counters.conns_active ?? ((counters.conns_accepted || 0) - (counters.conns_completed || 0)),
   )
   const latest = stats?.buckets.at(-1)
   return (
@@ -861,39 +861,42 @@ function RouteInspection({
 
 function DnsActivity({ stats }: { stats: Stats | null | undefined }) {
   const counters = stats?.counters || {}
-  const total =
+  const queries =
     (counters.dns_tunnel || 0) +
     (counters.dns_bypass || 0) +
     (counters.dns_block || 0)
+  const connections = (counters.conns_bypassed || 0) +
+    (counters.conns_tunneled || 0) + (counters.conns_blocked || 0)
+  const total = queries + connections
   const metrics = [
-    ['缓存命中', counters.dns_cache_hits || 0],
-    ['广告拦截', counters.dns_block || 0],
-    ['GFWList 命中', counters.dns_gfwlist || 0],
+    ['直连命中', counters.dns_direct || 0, counters.conns_bypassed || 0],
+    ['广告拦截', counters.dns_block || 0, counters.conns_blocked || 0],
+    ['GFWList 命中', counters.dns_gfwlist || 0, counters.conns_gfwlist || 0],
   ] as const
   return (
     <section className="panel config-panel dns-activity">
       <div className="panel-heading">
         <div>
-          <h2>本地 DNS 代理查询统计</h2>
+          <h2>DNS 与代理分流统计</h2>
           <p>
-            本次运行累计 {total} 次查询，当前排队 {counters.dns_queue_depth || 0}，过载拒绝 {counters.dns_overload || 0} 次。
+            本次运行共 {total} 次分流，含 {queries} 次 DNS 查询和 {connections} 次代理连接。DNS 当前排队 {counters.dns_queue_depth || 0}，过载拒绝 {counters.dns_overload || 0} 次。
           </p>
         </div>
       </div>
       <div className="dns-metrics">
-        {metrics.map(([label, count]) => (
-          <div key={label}>
-            <strong>{label}</strong>
-            <span>
-              {count} 次 · {total ? ((100 * count) / total).toFixed(1) : '0'}%
-            </span>
-            <progress
-              aria-label={label}
-              value={count}
-              max={Math.max(total, 1)}
-            />
-          </div>
-        ))}
+        {metrics.map(([label, dns, proxy]) => {
+          const count = dns + proxy
+          return (
+            <div key={label}>
+              <strong>{label}</strong>
+              <span>
+                {count} 次 · {total ? ((100 * count) / total).toFixed(1) : '0'}%
+              </span>
+              <small>DNS {dns} 次 · 连接 {proxy} 次</small>
+              <progress aria-label={label} value={count} max={Math.max(total, 1)} />
+            </div>
+          )
+        })}
       </div>
       <h3>最近解析</h3>
       {stats?.recent_dns?.length ? (
@@ -940,10 +943,13 @@ function DnsActivity({ stats }: { stats: Stats | null | undefined }) {
 }
 
 function ProxyActivity({ stats }: { stats: Stats | null | undefined }) {
+  const modes = stats?.proxy_modes
   const records = stats?.recent_proxy
   return (
     <section className="panel config-panel">
       <h2>最近代理连接</h2>
+      {modes && <p>生效模式 · SOCKS5 {modes.socks5 || '未启用'} · HTTP {modes.http || '未启用'}
+        {modes.pool && ` · 就绪隧道 ${modes.pool.ready} 条 · 池内活跃连接 ${modes.pool.flows} 条`}</p>}
       <p>本次运行的连接分流中，GFWList 命中 {stats?.counters.conns_gfwlist || 0} 次，拦截 {stats?.counters.conns_blocked || 0} 次。</p>
       {records?.length ? (
         <div className="dns-query-scroll">
@@ -962,8 +968,12 @@ function ProxyActivity({ stats }: { stats: Stats | null | undefined }) {
                   <td>{entry.host.includes(':') ? `[${entry.host}]` : entry.host}:{entry.port}</td>
                   <td>{entry.protocol}</td>
                   <td>{entry.route} · {entry.reason}</td>
-                  <td>{entry.route === '拦截' ? '已拦截' : entry.connected ? '已连接' : '失败'}</td>
-                  <td>{entry.ms} ms</td>
+                  <td>{entry.route === '拦截' ? '已拦截' : entry.connected ? '已连接' : '失败'}{entry.failed_stage && <div>{entry.failed_stage}</div>}</td>
+                  <td>{entry.stages?.length ? <details>
+                    <summary>{entry.ms} ms{entry.reused != null && (entry.reused ? ' · 复用' : ' · 新建')}</summary>
+                    {entry.mode && <div>{entry.mode}</div>}
+                    {entry.stages.map(([stage, ms]) => <div key={stage}>{stage} {ms} ms</div>)}
+                  </details> : <>{entry.ms} ms</>}</td>
                 </tr>
               ))}
             </tbody>

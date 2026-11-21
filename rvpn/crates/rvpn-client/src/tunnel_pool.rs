@@ -297,7 +297,12 @@ impl<T: PoolTunnel> TunnelPool<T> {
     /// tunnel (soft cap — it may be briefly exceeded). If no tunnel is
     /// assignable, one is established synchronously (first-flow latency)
     /// and the pool is then pre-warmed up to `pool_size` in the background.
+    #[allow(dead_code)]
     pub async fn pick_tunnel(&self) -> Result<Arc<T>> {
+        Ok(self.pick_with_reuse().await?.0)
+    }
+
+    pub async fn pick_with_reuse(&self) -> Result<(Arc<T>, bool)> {
         {
             let mut inner = self.inner.lock().await;
             let pruned = inner.prune_dead();
@@ -321,7 +326,7 @@ impl<T: PoolTunnel> TunnelPool<T> {
             if let Some(e) = under_cap {
                 let t = Arc::clone(&e.tunnel);
                 ensure_target(&self.ctx(), &mut inner);
-                return Ok(t);
+                return Ok((t, true));
             }
 
             let assignable = inner.assignable_count();
@@ -343,7 +348,7 @@ impl<T: PoolTunnel> TunnelPool<T> {
                     .map(|e| Arc::clone(&e.tunnel))
                     .expect("assignable non-empty");
                 ensure_target(&self.ctx(), &mut inner);
-                return Ok(t);
+                return Ok((t, true));
             }
 
             // No assignable tunnels: reserve a connecting slot so concurrent
@@ -365,7 +370,7 @@ impl<T: PoolTunnel> TunnelPool<T> {
                 info!("pool '{}': first tunnel established", self.name);
                 spawn_watcher(self.ctx(), &t);
                 ensure_target(&self.ctx(), &mut inner);
-                Ok(t)
+                Ok((t, false))
             }
             Err(e) => {
                 inner.backoff_attempt += 1;
@@ -680,6 +685,17 @@ impl TunnelPools {
             pools,
             default_name: DEFAULT_SERVER_NAME.to_string(),
         }
+    }
+
+    pub fn current_load(&self) -> Option<(usize, usize)> {
+        let mut ready = 0;
+        let mut flows = 0;
+        for pool in self.pools.values() {
+            let inner = pool.inner.try_lock().ok()?;
+            ready += inner.assignable_count();
+            flows += inner.tunnels.iter().map(|e| e.tunnel.active_flow_count()).sum::<usize>();
+        }
+        Some((ready, flows))
     }
 
     /// Return the pool for `name`, falling back to the default exit.

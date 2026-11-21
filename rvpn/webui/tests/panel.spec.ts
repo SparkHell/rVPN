@@ -129,12 +129,14 @@ test.beforeEach(async ({ page }) => {
             conns_gfwlist: 9,
             dns_tunnel: 50,
             dns_bypass: 20,
+            dns_direct: 18,
             dns_block: 5,
             dns_cache_hits: 15,
             dns_gfwlist: 30,
           },
+          proxy_modes: { socks5: 'pooled', http: 'pooled', pool: { ready: 2, flows: 1 } },
           recent_proxy: [
-            { id: 1, time: 1, host: 'google.com', port: 443, protocol: 'HTTP', route: '隧道', reason: '命中 GFWList', connected: true, ms: 20 },
+            { id: 1, time: 1, host: 'google.com', port: 443, protocol: 'HTTP', route: '隧道', reason: '命中 GFWList', connected: true, ms: 20, mode: "pooled", reused: true, stages: [["分流", 2], ["获取隧道", 3], ["目标连接", 15]] },
             { id: 2, time: 1, host: 'baidu.com', port: 443, protocol: 'SOCKS5', route: '直连', reason: '目标地址均命中直连网段', connected: true, ms: 5 },
           ],
           buckets: [],
@@ -395,8 +397,14 @@ test('split rules expose independent switches, immediate updates and DNS ratios'
   await expect(
     page.getByRole('switch', { name: 'GFWList 代理规则' }),
   ).not.toBeChecked()
-  await expect(page.locator('.dns-metrics')).toContainText('15 次 · 20.0%')
-  await expect(page.locator('.dns-metrics')).toContainText('30 次 · 40.0%')
+  await expect(page.locator('.dns-activity')).toContainText('95 次分流，含 75 次 DNS 查询和 20 次代理连接')
+  const direct = page.locator('.dns-metrics > div').filter({ hasText: '直连命中' })
+  await expect(direct).toContainText('23 次 · 24.2%')
+  await expect(direct).toContainText('DNS 18 次 · 连接 5 次')
+  await expect(page.locator('.dns-metrics')).toContainText('39 次 · 41.1%')
+  await expect(page.getByText('就绪隧道 2 条', { exact: false })).toBeVisible()
+  await page.getByText('20 ms · 复用').click()
+  await expect(page.getByText('目标连接 15 ms')).toBeVisible()
   await expect(page.getByText('GFWList 命中 9 次，拦截 1 次', { exact: false })).toBeVisible()
   const httpRecord = page.getByRole('row').filter({ hasText: 'google.com:443' })
   await expect(httpRecord).toContainText(/HTTP.*隧道/)

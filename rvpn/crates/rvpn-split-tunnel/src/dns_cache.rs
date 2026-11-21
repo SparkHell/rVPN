@@ -27,9 +27,12 @@ struct DnsEntry {
     failed: bool,
 }
 
+type EndpointLookup = tokio::sync::OnceCell<Result<Vec<SocketAddr>, String>>;
+
 /// DNS resolver with caching
 #[derive(Debug)]
 pub struct DnsResolver {
+    endpoint_lookups: std::sync::Mutex<HashMap<(String, u16), std::sync::Weak<EndpointLookup>>>,
     cache: Arc<RwLock<HashMap<String, DnsEntry>>>,
     cache_enabled: bool,
     cache_ttl: Duration,
@@ -532,6 +535,7 @@ impl DnsResolver {
             info!("DnsResolver using custom nameservers: {:?}", nameservers);
         }
         Self {
+            endpoint_lookups: Default::default(),
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_enabled,
             cache_ttl: Duration::from_secs(cache_ttl_secs),
@@ -602,6 +606,24 @@ impl DnsResolver {
             }
         }
         anyhow::bail!("Too many HTTPS or CNAME redirects")
+    }
+
+    /// Share simultaneous VPN endpoint lookups, including with the DNS cache disabled.
+    pub async fn resolve_endpoint(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+        let key = (host.trim_end_matches('.').to_ascii_lowercase(), port);
+        let cell = {
+            let mut entries = self.endpoint_lookups.lock().unwrap_or_else(|e| e.into_inner());
+            entries.retain(|_, entry| entry.strong_count() > 0);
+            let entry = entries.entry(key).or_default();
+            entry.upgrade().unwrap_or_else(|| {
+                let cell = Arc::new(EndpointLookup::new());
+                *entry = Arc::downgrade(&cell);
+                cell
+            })
+        };
+        cell.get_or_init(|| async {
+            self.resolve(host, port).await.map_err(|error| format!("{error:#}"))
+        }).await.clone().map_err(anyhow::Error::msg)
     }
 
     /// Resolve a hostname to IP addresses.
@@ -1372,6 +1394,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_endpoint_queries_share_an_uncached_lookup() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = DnsResolver::new(false, 300, 100, false, true, vec![])
+            .with_nameservers(&[upstream.local_addr().unwrap().to_string()]).unwrap();
+        let reply = async {
+            let mut buf = [0; 512];
+            let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let mut answer = buf[..len].to_vec();
+            answer[2] |= 0x80;
+            answer[7] = 1;
+            answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+            upstream.send_to(&answer, peer).await.unwrap();
+        };
+        let queries = async {
+            tokio::join!(resolver.resolve_endpoint("endpoint.example", 443),
+                         resolver.resolve_endpoint("ENDPOINT.example", 443))
+        };
+        let ((), (a, b)) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(reply, queries)
+        }).await.unwrap();
+        assert_eq!(a.unwrap(), b.unwrap());
+        assert_eq!(upstream.try_recv(&mut [0; 512]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 
     #[tokio::test]

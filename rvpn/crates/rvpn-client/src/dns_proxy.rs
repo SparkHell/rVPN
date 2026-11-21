@@ -419,7 +419,8 @@ impl DnsProxy {
                                 RoutingDecision::Tunnel if qtype == 1 => DnsDecision::Tunnel,
                                 _ => DnsDecision::Bypass,
                             };
-                            crate::dashboard::record_dns_answer(&domain, qtype, route, cache_hit, gfwlist, query_start.elapsed(), &wire);
+                            crate::dashboard::record_dns_answer(&domain, qtype, route, cache_hit, gfwlist,
+                                decision == RoutingDecision::Bypass, query_start.elapsed(), &wire);
                             if let Err(e) = socket_clone.send_to(&wire, src).await {
                                 debug!("DNS proxy: failed to send response to {}: {}", src, e);
                             }

@@ -306,8 +306,9 @@ next routing decision and survive restarts. The bundled rules work offline
 before the first update. AdGuard imports domain blocking and exception rules.
 The existing custom ad block file remains available with ad blocking enabled.
 
-DNS statistics count completed queries received by the local DNS proxy. The
-percentages use all completed queries as the denominator. The panel keeps the
+Routing statistics count each completed local DNS query and each routed proxy
+connection separately. Direct, blocked, and GFWList percentages use their
+combined total as the denominator. Each metric shows both contributions. The panel keeps the
 latest 64 results in process memory and displays up to six answers per query.
 
 CI downloads and validates the upstream GFWList during the shared rule-data
@@ -625,6 +626,8 @@ cargo run --release --package rvpn-client -- --config client.toml
 ```
 
 This starts a SOCKS5 proxy on `127.0.0.1:1080`. Configure your browser or system to use it.
+
+The **SOCKS5 proxy → Tunnel connection mode** setting selects one tunnel per connection (`legacy`), a shared tunnel (`multiplex`), or a pool per exit (`pooled`). The HTTP proxy inherits this setting unless its single-exit multiplex override is enabled. The recent proxy connections panel shows each listener’s effective mode. Expand a connection’s elapsed time to inspect routing, tunnel acquisition and destination connection times, and whether it reused a tunnel.
 
 Upgrade the server first when using legacy proxy mode. New desktop clients wait for an encrypted target-connection acknowledgement before granting SOCKS5 or HTTP CONNECT requests. Updated servers also accept the original legacy request format from older clients.
 

@@ -51,40 +51,52 @@ pub(crate) fn should_block_address(addr: &IpAddr, allowed: &[IpNetwork]) -> bool
 
 /// Connect to the first available address in parallel (Happy Eyeballs-style).
 ///
-/// Spawns a task per address with a 5-second timeout. Returns the first
-/// successful `TcpStream`. Prevents a single blackholed address from stalling
-/// the entire flow for 10 seconds.
+/// Stagger attempts across address families within a shared five-second budget.
 async fn connect_fastest(
     addrs: Vec<SocketAddr>,
     allowed_cidr: &[IpNetwork],
     target: &str,
 ) -> Result<TcpStream> {
-    let mut join_set = JoinSet::new();
-    let mut blocked_count = 0;
-
-    for addr in addrs {
-        if should_block_address(&addr.ip(), allowed_cidr) {
-            blocked_count += 1;
-            continue;
+    let total = addrs.len();
+    let mut candidates: Vec<_> = addrs.into_iter()
+        .filter(|addr| !should_block_address(&addr.ip(), allowed_cidr))
+        .collect();
+    let blocked_count = total - candidates.len();
+    if let Some(first) = candidates.first() {
+        if let Some(other) = candidates.iter().position(|addr| addr.is_ipv4() != first.is_ipv4()) {
+            candidates.swap(1, other);
         }
-        join_set.spawn(async move {
-            match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
-                Ok(Ok(stream)) => Ok(stream),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Connection timeout",
-                )),
-            }
-        });
     }
-
+    let mut candidates = candidates.into_iter().peekable();
+    let mut pending = JoinSet::new();
     let mut last_error = None;
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(e)) => last_error = Some(e),
-            Err(_) => {}
+    let mut next_attempt = tokio::time::Instant::now();
+    let deadline = next_attempt + Duration::from_secs(5);
+    while !pending.is_empty() || candidates.peek().is_some() {
+        tokio::select! {
+            biased;
+            Some(result) = pending.join_next(), if !pending.is_empty() => {
+                match result {
+                    Ok(Ok(stream)) => return Ok(stream),
+                    Ok(Err(error)) => last_error = Some(error),
+                    Err(error) => last_error = Some(std::io::Error::other(error)),
+                }
+                next_attempt = tokio::time::Instant::now();
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                last_error = Some(std::io::ErrorKind::TimedOut.into());
+                break;
+            }
+            _ = tokio::time::sleep_until(next_attempt), if candidates.peek().is_some() && pending.len() < 2 => {
+                let addr = candidates.next().expect("candidate available");
+                // Leave time for later candidates if both leading addresses blackhole.
+                let waves = 1 + candidates.len().div_ceil(2) as u32;
+                let budget = deadline.saturating_duration_since(tokio::time::Instant::now()) / waves;
+                pending.spawn(async move {
+                    timeout(budget, TcpStream::connect(addr)).await?
+                });
+                next_attempt = tokio::time::Instant::now() + Duration::from_millis(200);
+            }
         }
     }
 
@@ -122,33 +134,26 @@ struct TargetAddress {
 struct DnsEntry {
     addrs: Vec<SocketAddr>,
     cached_at: Instant,
-    #[allow(dead_code)]
     ttl: Duration,
 }
 
 /// DNS resolver with caching
-type DnsCache = std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, DnsEntry>>>;
+type DnsCache = std::sync::Arc<tokio::sync::Mutex<lru::LruCache<String, DnsEntry>>>;
 
-/// Hard cap on DNS cache size. Without this, an attacker could flood the server
-/// with unique hostnames to grow the map unboundedly. Entries are TTL-based
-/// (5-minute default), so a legitimate workload rarely approaches this.
-const DNS_CACHE_MAX_ENTRIES: usize = 10_000;
+fn new_dns_cache() -> DnsCache {
+    std::sync::Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+        std::num::NonZeroUsize::new(10_000).unwrap(),
+    )))
+}
 
-/// Prune expired DNS entries and cap the map size. Called before every insert
-/// so the cache never grows past MAX_ENTRIES. Cheap: single HashMap scan on
-/// DNS-miss path only (cache hits skip this).
-fn prune_dns_cache(cache: &mut std::collections::HashMap<String, DnsEntry>) {
-    cache.retain(|_, entry| entry.cached_at.elapsed() < entry.ttl);
-    if cache.len() >= DNS_CACHE_MAX_ENTRIES {
-        // Evict oldest to make room. Rare path; scanning all keys is fine.
-        if let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, e)| e.cached_at)
-            .map(|(k, _)| k.clone())
-        {
-            cache.remove(&oldest_key);
-        }
+async fn cached_addresses(cache: &DnsCache, key: &str) -> Option<Vec<SocketAddr>> {
+    let mut entries = cache.lock().await;
+    let entry = entries.get(key)?;
+    if entry.cached_at.elapsed() >= entry.ttl {
+        entries.pop(key);
+        return None;
     }
+    Some(entry.addrs.clone())
 }
 
 /// Simplified VPN handler - Brook-style architecture with X3DH + Double Ratchet
@@ -234,9 +239,7 @@ impl VpnHandler {
                 max_connections_per_ip,
                 max_handshakes_per_minute,
             )),
-            dns_cache: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            dns_cache: new_dns_cache(),
             x3dh_responder,
         })
     }
@@ -788,21 +791,9 @@ impl VpnHandler {
         let cache_key = format!("{}:{}", target.host, target.port);
         let allowed_cidr = &self.config.tun.proxy_allow_cidrs;
 
-        // Check DNS cache
-        let addrs: Vec<SocketAddr> = {
-            let cache = self.dns_cache.lock().await;
-            if let Some(entry) = cache.get(&cache_key) {
-                if entry.cached_at.elapsed() < Duration::from_secs(300) {
-                    debug!("DNS cache hit for {}", target.host);
-                    entry.addrs.clone()
-                } else {
-                    drop(cache);
-                    self.resolve_and_cache(&target.host, target.port).await?
-                }
-            } else {
-                drop(cache);
-                self.resolve_and_cache(&target.host, target.port).await?
-            }
+        let addrs = match cached_addresses(&self.dns_cache, &cache_key).await {
+            Some(addrs) => addrs,
+            None => self.resolve_and_cache(&target.host, target.port).await?,
         };
 
         // Connect to the first available address in parallel
@@ -832,8 +823,7 @@ impl VpnHandler {
         };
 
         let mut cache = self.dns_cache.lock().await;
-        prune_dns_cache(&mut cache);
-        cache.insert(format!("{}:{}", host, port), entry);
+        cache.put(format!("{}:{}", host, port), entry);
 
         Ok(addrs)
     }
@@ -1472,7 +1462,7 @@ impl MultiplexerHandler {
         Ok(Self {
             config,
             x3dh_responder,
-            dns_cache: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dns_cache: new_dns_cache(),
         })
     }
 
@@ -2871,19 +2861,9 @@ where
         let addrs: Vec<SocketAddr> = if let Some(addr) = Self::parse_socket_addr_literal(target) {
             vec![addr]
         } else {
-            let cache_key = target.to_string();
-            let cache = dns_cache.lock().await;
-            if let Some(entry) = cache.get(&cache_key) {
-                if entry.cached_at.elapsed() < Duration::from_secs(300) {
-                    debug!("DNS cache hit for {}", target);
-                    entry.addrs.clone()
-                } else {
-                    drop(cache);
-                    Self::resolve_and_cache(target, dns_cache).await?
-                }
-            } else {
-                drop(cache);
-                Self::resolve_and_cache(target, dns_cache).await?
+            match cached_addresses(dns_cache, target).await {
+                Some(addrs) => addrs,
+                None => Self::resolve_and_cache(target, dns_cache).await?,
             }
         };
 
@@ -2915,8 +2895,7 @@ where
         };
 
         let mut cache = dns_cache.lock().await;
-        prune_dns_cache(&mut cache);
-        cache.insert(target.to_string(), entry);
+        cache.put(target.to_string(), entry);
 
         Ok(addrs)
     }
@@ -4305,6 +4284,31 @@ impl DnsHandler {
 #[cfg(test)]
 mod tcp_pool_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_dns_entry_is_removed_on_lookup() {
+        let cache = new_dns_cache();
+        cache.lock().await.put("host:443".into(), DnsEntry {
+            addrs: vec!["192.0.2.1:443".parse().unwrap()],
+            cached_at: Instant::now(),
+            ttl: Duration::ZERO,
+        });
+        assert!(cached_addresses(&cache, "host:443").await.is_none());
+        assert!(cache.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dial_falls_back_after_refusal_and_preserves_address_policy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = closed.local_addr().unwrap();
+        drop(closed);
+        assert!(connect_fastest(vec![address], &[], "test").await.is_err());
+        let allowed = ["127.0.0.1/32".parse().unwrap()];
+        let stream = connect_fastest(vec![refused, address], &allowed, "test").await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), address);
+    }
 
     async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -14,6 +14,7 @@ name = "rvpn-server"
 path = "src/main.rs"
 
 [dependencies]
+lru.workspace = true
 rvpn-core = { path = "../rvpn-core" }
 rvpn-logging = { path = "../rvpn-logging" }
 

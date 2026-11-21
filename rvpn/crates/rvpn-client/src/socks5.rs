@@ -194,6 +194,9 @@ impl Socks5Proxy {
     }
 
     pub(crate) async fn run_with_listener(&self, listener: TcpListener) -> Result<()> {
+        let _mode = proxy_common::register_listener(
+            proxy_common::ProxyProtocol::Socks5, self.mode, self.tunnel_pools.clone(),
+        );
 
         info!("SOCKS5 proxy listening on {}", self.listen_addr);
 

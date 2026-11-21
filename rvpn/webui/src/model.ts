@@ -34,6 +34,7 @@ export function dashboardUrl(
   return next.origin
 }
 export type Stats = {
+  proxy_modes?: { http?: string | null; socks5?: string | null; pool?: { ready: number; flows: number } | null } | null
   recent_proxy?: {
     id: number
     time: number
@@ -43,6 +44,10 @@ export type Stats = {
     route: string
     reason: string
     connected: boolean
+    stages?: [string, number][]
+    mode?: string | null
+    failed_stage?: string | null
+    reused?: boolean | null
     ms: number
   }[]
   recent_dns?: {

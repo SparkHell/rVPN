@@ -137,6 +137,17 @@ fn pin_endpoint_routes(addresses: &[std::net::SocketAddr]) -> Result<()> {
 }
 
 #[cfg(not(target_os = "android"))]
+#[derive(Debug)]
+pub(crate) struct ConnectStage(pub &'static str);
+
+#[cfg(not(target_os = "android"))]
+impl std::fmt::Display for ConnectStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed", self.0)
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 pub(crate) async fn connect_stage<T, E>(
     stage: &'static str,
     limit: Duration,
@@ -157,7 +168,7 @@ where
             stage, elapsed_ms, error = %format_args!("{error:#}"), "VPN connection stage failed"
         ),
     }
-    result.with_context(|| format!("{stage} failed"))
+    result.context(ConnectStage(stage))
 }
 
 /// Direct connections use the configured DoH resolver too, avoiding a second
@@ -183,12 +194,24 @@ pub async fn connect_direct_tcp(
 }
 
 #[cfg(not(target_os = "android"))]
+#[derive(Debug)]
+struct SharedAddressFailure;
+
+#[cfg(not(target_os = "android"))]
+impl std::fmt::Display for SharedAddressFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VPN endpoint address lookup failed for both TLS paths")
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 async fn with_ech_fallback<T>(
     ech: impl std::future::Future<Output = Result<T>>,
     ordinary_tls: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     match ech.await {
         Ok(connection) => { crate::dashboard::record_tls_status("ECH".into()); Ok(connection) },
+        Err(error) if error.is::<SharedAddressFailure>() => Err(error),
         Err(error) => {
             tracing::warn!("ECH unavailable; retrying with standard TLS: {error:#}");
             let connection = ordinary_tls.await?;
@@ -300,7 +323,7 @@ pub async fn connect_websocket(
         let addresses = connect_stage("dns_address", limit, async {
             let target = origin.trim_matches(['[', ']']);
             if let Some(resolver) = &dns.resolver {
-                resolver.resolve(target, port).await
+                resolver.resolve_endpoint(target, port).await
             } else {
                 Ok(tokio::net::lookup_host((target, port)).await?.collect())
             }
@@ -315,7 +338,11 @@ pub async fn connect_websocket(
             let resolver = dns.ech_resolver.as_ref().context("No DoH upstream configured for ECH")?;
             let (target, target_port, config) =
                 connect_stage("dns_https", limit, resolver.resolve_ech(origin, port)).await?;
-            let addresses = connect_stage("dns_address", limit, resolver.resolve(&target, target_port)).await?;
+            let lookup = connect_stage("dns_address", limit, resolver.resolve_endpoint(&target, target_port)).await;
+            let same_endpoint = target.trim_end_matches('.').eq_ignore_ascii_case(origin)
+                && target_port == port
+                && dns.resolver.as_ref().is_some_and(|ordinary| std::sync::Arc::ptr_eq(ordinary, resolver));
+            let addresses = if same_endpoint { lookup.context(SharedAddressFailure)? } else { lookup? };
             remember_server_addresses(&dns, origin, &addresses).await;
             pin_endpoint_routes(&addresses)?;
             dial_tls(&addresses, fingerprint, sni, resumption, Some(&config)).await
@@ -608,6 +635,11 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     #[tokio::test]
     async fn ech_falls_back_to_tls_when_lookup_or_handshake_fails() {
+        let shared = with_ech_fallback::<()>(
+            async { Err(anyhow::anyhow!("upstream unreachable").context(SharedAddressFailure)) },
+            async { panic!("identical address lookup already failed") },
+        ).await.unwrap_err();
+        assert!(shared.is::<SharedAddressFailure>());
         for reason in ["missing HTTPS record", "ECH handshake rejected"] {
             let connection = with_ech_fallback(async { anyhow::bail!(reason) }, async { Ok("TLS") }).await;
             assert_eq!(connection.unwrap(), "TLS");

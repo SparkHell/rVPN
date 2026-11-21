@@ -124,7 +124,7 @@ struct Counters {
     bytes_up: u64,
     bytes_down: u64,
     conns_accepted: u64,
-    conns_completed: u64,
+    conns_active: u64,
     dns_tunnel: u64,
     dns_bypass: u64,
     dns_block: u64,
@@ -149,6 +149,7 @@ pub struct DashboardState {
     pub conns_accepted: AtomicU64,
     /// Cumulative proxied connections finished.
     pub conns_completed: AtomicU64,
+    conns_active: AtomicU64,
     /// Cumulative connections routed through the tunnel.
     pub conns_tunneled: AtomicU64,
     conns_gfwlist: AtomicU64,
@@ -165,6 +166,7 @@ pub struct DashboardState {
     /// Cumulative DNS cache hits.
     pub dns_cache_hits: AtomicU64,
     dns_gfwlist: AtomicU64,
+    dns_direct: AtomicU64,
     recent_dns: Mutex<VecDeque<serde_json::Value>>,
     recent_proxy: Mutex<VecDeque<ProxyConnection>>,
     /// Cumulative DNS latency, microseconds (all recorded queries).
@@ -192,6 +194,7 @@ impl DashboardState {
             tunnel_bytes: AtomicU64::new(0),
             conns_accepted: AtomicU64::new(0),
             conns_completed: AtomicU64::new(0),
+            conns_active: AtomicU64::new(0),
             conns_tunneled: AtomicU64::new(0),
             conns_gfwlist: AtomicU64::new(0),
             conns_bypassed: AtomicU64::new(0),
@@ -201,6 +204,7 @@ impl DashboardState {
             dns_block: AtomicU64::new(0),
             dns_cache_hits: AtomicU64::new(0),
             dns_gfwlist: AtomicU64::new(0),
+            dns_direct: AtomicU64::new(0),
             recent_dns: Mutex::new(VecDeque::with_capacity(64)),
             recent_proxy: Mutex::new(VecDeque::with_capacity(64)),
             dns_latency_us_total: AtomicU64::new(0),
@@ -239,7 +243,7 @@ impl DashboardState {
             bytes_up: self.bytes_up.load(Ordering::Relaxed),
             bytes_down: self.bytes_down.load(Ordering::Relaxed),
             conns_accepted: self.conns_accepted.load(Ordering::Relaxed),
-            conns_completed: self.conns_completed.load(Ordering::Relaxed),
+            conns_active: self.conns_active.load(Ordering::Relaxed),
             dns_tunnel: self.dns_tunnel.load(Ordering::Relaxed),
             dns_bypass: self.dns_bypass.load(Ordering::Relaxed),
             dns_block: self.dns_block.load(Ordering::Relaxed),
@@ -258,7 +262,7 @@ impl DashboardState {
             bytes_up: cur.bytes_up.saturating_sub(prev.bytes_up),
             bytes_down: cur.bytes_down.saturating_sub(prev.bytes_down),
             conns_accepted: cur.conns_accepted.saturating_sub(prev.conns_accepted),
-            conns_active: cur.conns_accepted as i64 - cur.conns_completed as i64,
+            conns_active: cur.conns_active as i64,
             dns_tunnel: cur.dns_tunnel.saturating_sub(prev.dns_tunnel),
             dns_bypass: cur.dns_bypass.saturating_sub(prev.dns_bypass),
             dns_block: cur.dns_block.saturating_sub(prev.dns_block),
@@ -331,11 +335,8 @@ pub fn record_bytes_down(n: u64) {
     });
 }
 
-pub fn record_bypass_bytes(up: u64, down: u64) {
-    with_state(|s| {
-        s.bump(&s.bytes_up, up);
-        s.bump(&s.bytes_down, down);
-    });
+pub fn record_bypass_bytes(bytes: u64, upload: bool) {
+    with_state(|s| s.bump(if upload { &s.bytes_up } else { &s.bytes_down }, bytes));
 }
 
 /// Record a newly accepted proxied connection.
@@ -344,10 +345,29 @@ pub fn record_conn_accepted() {
     with_state(|s| s.bump(&s.conns_accepted, 1));
 }
 
-/// Record a finished proxied connection.
-#[inline]
-pub fn record_conn_completed() {
-    with_state(|s| s.bump(&s.conns_completed, 1));
+/// Owns the active count for the lifetime of an established relay task.
+pub struct ActiveConnection<'a>(Option<&'a DashboardState>);
+
+impl<'a> ActiveConnection<'a> {
+    pub fn start() -> Self {
+        Self::for_state(DASHBOARD.get().map(Arc::as_ref))
+    }
+
+    fn for_state(state: Option<&'a DashboardState>) -> Self {
+        if let Some(state) = state {
+            state.conns_active.fetch_add(1, Ordering::Relaxed);
+        }
+        Self(state)
+    }
+}
+
+impl Drop for ActiveConnection<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = self.0 {
+            state.conns_active.fetch_sub(1, Ordering::Relaxed);
+            state.bump(&state.conns_completed, 1);
+        }
+    }
 }
 
 /// Record a connection routed through the tunnel.
@@ -408,6 +428,14 @@ pub fn record_dns(decision: DnsDecision, cache_hit: bool, latency: Duration) {
 type ProxyProtocol = crate::proxy_common::ProxyProtocol;
 
 #[derive(serde::Serialize)]
+pub struct ProxyDiagnostics {
+    pub stages: Vec<(&'static str, u128)>,
+    pub failed_stage: Option<&'static str>,
+    pub mode: Option<crate::config::Socks5Mode>,
+    pub reused: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
 struct ProxyConnection {
     id: u64,
     time: u64,
@@ -417,6 +445,8 @@ struct ProxyConnection {
     route: &'static str,
     reason: &'static str,
     connected: bool,
+    #[serde(flatten)]
+    diagnostics: ProxyDiagnostics,
     ms: u128,
 }
 
@@ -428,6 +458,7 @@ pub fn record_proxy_connection(
     decision: Option<(rvpn_split_tunnel::RoutingDecision, &'static str)>,
     connected: bool,
     elapsed: Duration,
+    diagnostics: ProxyDiagnostics,
 ) {
     use rvpn_split_tunnel::RoutingDecision;
     let (route, reason) = match decision {
@@ -454,16 +485,18 @@ pub fn record_proxy_connection(
             route,
             reason,
             connected,
+            diagnostics,
             ms: elapsed.as_millis(),
         });
     });
 }
 
 /// Keep only the most recent completed DNS requests in memory.
-pub fn record_dns_answer(domain: &str, qtype: u16, route: DnsDecision, cached: bool, gfwlist: bool, elapsed: Duration, wire: &[u8]) {
+pub fn record_dns_answer(domain: &str, qtype: u16, route: DnsDecision, cached: bool, gfwlist: bool, direct: bool, elapsed: Duration, wire: &[u8]) {
     record_dns(route, cached, elapsed);
     with_state(|state| {
         if gfwlist { state.bump(&state.dns_gfwlist, 1); }
+        if direct { state.bump(&state.dns_direct, 1); }
         let message = hickory_proto::op::Message::from_vec(wire).ok();
         let answers: Vec<String> = message.iter().flat_map(|m| &m.answers)
             .filter(|r| !matches!(r.data, hickory_proto::rr::RData::Update0(_)))
@@ -740,7 +773,12 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
         })
         .collect();
 
+    #[cfg(not(target_os = "android"))]
+    let modes = crate::proxy_common::runtime_modes();
+    #[cfg(target_os = "android")]
+    let modes = serde_json::Value::Null;
     serde_json::json!({
+        "proxy_modes": modes,
         "tun_ready": TUN_READY.load(Ordering::Relaxed),
         "last_tls": LAST_TLS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         "recent_proxy": *state.recent_proxy.lock().unwrap_or_else(|e| e.into_inner()),
@@ -751,6 +789,7 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
             "bytes_down": state.bytes_down.load(Ordering::Relaxed),
             "tunnel_bytes": state.tunnel_bytes.load(Ordering::Relaxed),
             "conns_accepted": state.conns_accepted.load(Ordering::Relaxed),
+            "conns_active": state.conns_active.load(Ordering::Relaxed),
             "conns_completed": state.conns_completed.load(Ordering::Relaxed),
             "conns_tunneled": state.conns_tunneled.load(Ordering::Relaxed),
             "conns_gfwlist": state.conns_gfwlist.load(Ordering::Relaxed),
@@ -760,6 +799,7 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
             "dns_bypass": state.dns_bypass.load(Ordering::Relaxed),
             "dns_block": state.dns_block.load(Ordering::Relaxed),
             "dns_gfwlist": state.dns_gfwlist.load(Ordering::Relaxed),
+            "dns_direct": state.dns_direct.load(Ordering::Relaxed),
             "dns_queue_depth": DNS_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |depth| depth()),
             "dns_overload": DNS_OVERLOAD.load(Ordering::Relaxed),
             "dns_cache_hits": state.dns_cache_hits.load(Ordering::Relaxed),
@@ -1203,8 +1243,7 @@ fn render_windowed(
 fn render_summary(state: &DashboardState, now: u64) -> String {
     let uptime = now.saturating_sub(state.started_at.load(Ordering::Relaxed));
     let accepted = state.conns_accepted.load(Ordering::Relaxed);
-    let completed = state.conns_completed.load(Ordering::Relaxed);
-    let active = accepted as i64 - completed as i64;
+    let active = state.conns_active.load(Ordering::Relaxed);
     let cards = [
         ("uptime", format_uptime(uptime)),
         (
@@ -1478,12 +1517,24 @@ mod tests {
     }
 
     #[test]
+    fn active_connections_follow_established_relays_only() {
+        let state = DashboardState::new();
+        state.bump(&state.conns_accepted, 3);
+        state.bump(&state.conns_blocked, 1);
+        let relay = ActiveConnection::for_state(Some(&state));
+        assert_eq!(state.snapshot_counters().conns_active, 1);
+        drop(relay);
+        assert_eq!(state.snapshot_counters().conns_active, 0);
+        assert_eq!(state.conns_completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn sample_computes_deltas_and_gauge() {
         let state = DashboardState::new();
         state.bump(&state.bytes_up, 1000);
         state.bump(&state.bytes_down, 5000);
         state.bump(&state.conns_accepted, 3);
-        state.bump(&state.conns_completed, 1);
+        state.conns_active.store(2, Ordering::Relaxed);
         state.bump(&state.dns_tunnel, 7);
         state.bump(&state.handshakes_ok, 2);
 
@@ -1499,7 +1550,7 @@ mod tests {
 
         // Second sample: deltas vs the previous sample, not from zero.
         state.bump(&state.bytes_up, 500);
-        state.bump(&state.conns_completed, 2);
+        state.conns_active.store(0, Ordering::Relaxed);
         let (b2, _) = state.sample(&prev, 1_700_000_007);
         assert_eq!(b2.ts, 1_700_000_005);
         assert_eq!(b2.bytes_up, 500);
