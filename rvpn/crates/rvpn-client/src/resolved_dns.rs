@@ -1,7 +1,11 @@
 //! Per-link unicast servers used by clients of systemd-resolved's native API.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    process::{Command, Output},
+};
 
 const LOCAL: [&str; 2] = ["127.0.0.1", "::1"];
 
@@ -17,20 +21,45 @@ struct Link {
     servers: Vec<String>,
 }
 
-fn resolvectl(args: &[&str]) -> Result<String> {
-    let output = Command::new("/usr/bin/resolvectl")
+fn resolvectl_output(args: &[&str]) -> Result<Output> {
+    Command::new("/usr/bin/resolvectl")
         .args(["--no-pager", "--"])
         .args(args)
         .env("LC_ALL", "C")
         .env("SYSTEMD_COLORS", "0")
         .output()
-        .context("系统正在使用 systemd-resolved，需要 resolvectl 管理链路 DNS")?;
+        .context("无法运行 resolvectl 检查或管理 systemd-resolved 的链路 DNS")
+}
+
+fn checked_output(output: Output) -> Result<String> {
     ensure!(
         output.status.success(),
         "resolvectl: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn resolvectl(args: &[&str]) -> Result<String> {
+    checked_output(resolvectl_output(args)?)
+}
+
+fn capture_links(output: Output) -> Result<Option<BTreeMap<u32, Link>>> {
+    // Runtime files can outlive the service. Only an explicit D-Bus service
+    // absence permits falling back to file-only takeover.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr
+            .trim_end()
+            .ends_with("Unit dbus-org.freedesktop.resolve1.service not found.")
+            || stderr.trim_end().ends_with(
+                "The name org.freedesktop.resolve1 was not provided by any .service files",
+            )
+        {
+            return Ok(None);
+        }
+    }
+    links(&checked_output(output)?).map(Some)
 }
 
 fn links(output: &str) -> Result<BTreeMap<u32, Link>> {
@@ -71,7 +100,9 @@ impl Snapshot {
         {
             return Ok(None);
         }
-        let mut previous = links(&resolvectl(&["dns"])?)?;
+        let Some(mut previous) = capture_links(resolvectl_output(&["dns"])?)? else {
+            return Ok(None);
+        };
         previous.retain(|_, link| !link.servers.is_empty() && link.servers != LOCAL);
         Ok(Some(Self {
             boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?,
@@ -140,6 +171,25 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn capture_skips_missing_service_but_reports_other_errors() {
+        let failed = |stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert!(capture_links(failed(
+            "Failed to get global data: Unit dbus-org.freedesktop.resolve1.service not found.\n",
+        ))
+        .unwrap()
+        .is_none());
+        let error =
+            capture_links(failed("Failed to get global data: Access denied\n")).unwrap_err();
+        assert!(error.to_string().contains("Access denied"));
+    }
+
     #[test]
     fn reads_per_link_servers_with_ports_scopes_and_tls_names() {
         let list = links(
