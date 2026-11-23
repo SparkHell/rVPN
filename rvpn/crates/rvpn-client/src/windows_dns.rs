@@ -1,5 +1,10 @@
 //! Scope Windows DNS changes to a running proxy generation.
-use std::{collections::BTreeMap, io, ptr};
+use std::{
+    collections::BTreeMap,
+    io,
+    mem::{offset_of, size_of},
+    ptr::{self, NonNull},
+};
 
 use anyhow::{Context, Result};
 use windows_sys::{
@@ -134,23 +139,34 @@ fn static_dns(registry_id: &str, ipv6: bool) -> Result<String> {
 }
 
 fn default_route_adapters() -> Result<Vec<Adapter>> {
-    struct RouteTable(*mut MIB_IPFORWARD_TABLE2);
+    struct RouteTable(NonNull<MIB_IPFORWARD_TABLE2>);
     impl Drop for RouteTable {
         fn drop(&mut self) {
-            unsafe { FreeMibTable(self.0.cast()) }
+            unsafe { FreeMibTable(self.0.as_ptr().cast()) }
         }
     }
 
     let mut table = ptr::null_mut();
     status(unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) })
         .context("无法读取 Windows 默认路由")?;
-    let table = RouteTable(table);
+    let table = RouteTable(NonNull::new(table).context("Windows 返回了空路由表指针")?);
+    let table_ptr = table.0.as_ptr();
+    // The successful API call supplies the initialized header and row count.
+    let count = unsafe { (*table_ptr).NumEntries } as usize;
+    anyhow::ensure!(count != 0, "没有带默认路由的 Windows 网卡");
+    let row_offset = offset_of!(MIB_IPFORWARD_TABLE2, Table);
+    anyhow::ensure!(
+        count <= (isize::MAX as usize - row_offset) / size_of::<MIB_IPFORWARD_ROW2>(),
+        "Windows 路由表条目数量超出范围"
+    );
     let mut adapters = BTreeMap::new();
-    // IP Helper allocates a variable-length table, released by FreeMibTable.
+    // Use the SDK field offset for alignment, then address the trailing rows
+    // from the whole allocation. The binding declares Table as a one-row array.
+    // RouteTable keeps the allocation live until all rows have been read.
     let routes: &[MIB_IPFORWARD_ROW2] = unsafe {
         std::slice::from_raw_parts(
-            ptr::addr_of!((*table.0).Table).cast(),
-            (*table.0).NumEntries as usize,
+            table_ptr.cast::<u8>().add(row_offset).cast(),
+            count,
         )
     };
     for route in routes
