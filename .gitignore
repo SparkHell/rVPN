@@ -1,4 +1,5 @@
 /rvpn/target/
+/rvpn/rvpn
 /rvpn/webui/node_modules/
 /rvpn/webui/test-results/
 /rvpn/webui/playwright-report/
