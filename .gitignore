@@ -5,3 +5,4 @@
 /rvpn/webui/*.tsbuildinfo
 
 /scripts/__pycache__/
+dev.sh
