@@ -21,6 +21,10 @@ on:
       - scripts/update_rule_data.py
       - scripts/test_update_rule_data.py
       - scripts/test_endpoint_roundtrip.py
+      - scripts/install-server.sh
+      - scripts/install_server.py
+      - scripts/caddy_ech.py
+      - scripts/test_install_server.py
       - scripts/check-release-linkage.py
   pull_request:
     paths:
@@ -35,6 +39,10 @@ on:
       - scripts/update_rule_data.py
       - scripts/test_update_rule_data.py
       - scripts/test_endpoint_roundtrip.py
+      - scripts/install-server.sh
+      - scripts/install_server.py
+      - scripts/caddy_ech.py
+      - scripts/test_install_server.py
       - scripts/check-release-linkage.py
 
 permissions:
@@ -71,6 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: python3 -B -m unittest discover -s scripts -p 'test_update_rule_data.py'
+      - run: python3 -B scripts/test_install_server.py
       - run: python3 -B scripts/update_rule_data.py --output-dir generated-rules
       - uses: actions/upload-artifact@v7
         with:
@@ -373,7 +382,7 @@ jobs:
 
       - name: Test local SOCKS5 data and server restart recovery
         if: matrix.artifact == 'linux-x86_64'
-        run: python3 ../scripts/test_endpoint_roundtrip.py --client target/release/rvpn --server target/release/rvpn-server
+        run: python3 ../scripts/test_endpoint_roundtrip.py --deployment-link --client target/release/rvpn --server target/release/rvpn-server
 
       - name: Upload build timing reports
         if: always()
@@ -493,6 +502,9 @@ jobs:
               if [[ "$name" == rvpn-client-* ]]; then
                 [[ -s "$dir/rules/filter_1.txt" && -s "$dir/rules/filter_2.txt" && -s "$dir/rules/gfwlist.txt" ]]
                 tar -czf "dist/${name}.tar.gz" -C "$dir" "$binary" "${binary}.sha256" "$config" rules
+              elif [[ "$name" == rvpn-server-linux-* ]]; then
+                cp scripts/install-server.sh scripts/install_server.py scripts/caddy_ech.py "$dir/"
+                tar -czf "dist/${name}.tar.gz" -C "$dir" "$binary" "${binary}.sha256" "$config" install-server.sh install_server.py caddy_ech.py
               else
                 tar -czf "dist/${name}.tar.gz" -C "$dir" "$binary" "${binary}.sha256" "$config"
               fi

@@ -202,6 +202,72 @@ Server `--identity`, `--rotate-from`, and explicit `--output` CLI overrides keep
 their working-directory semantics. `keygen` and `prekey-bundle` can run without
 a configuration; normal startup reports missing or invalid configurations.
 
+### Interactive Linux server deployment
+
+On a Debian or Ubuntu systemd host (x86_64 or ARM64), point a public domain's
+A/AAAA records at the server and allow inbound TCP ports 80 and 443. From the
+repository run:
+
+```bash
+sudo bash scripts/install-server.sh
+```
+
+Linux server release archives built with this installer include the installer and its Python modules;
+after checking the archive against the release SHA256SUMS.txt and extracting
+it, run `sudo bash install-server.sh` beside the binary. The installer checks
+the bundled binary checksum. From a source checkout it fetches the nightly
+release, or pass `--release TAG` to select a published version.
+
+The installer detects web listeners, shows the proposed changes, and asks for
+confirmation. It can install Caddy, add a new HTTPS site, or insert a route in
+an existing single-domain Caddyfile site (including imported files).
+Caddy obtains and renews certificates. The backend binds to loopback.
+Choose the default `/cw/ws`, enter `r` for a random path, or specify your own.
+The WebSocket paths for proxy, DNS, TUN and multiplexing are reserved together.
+Existing deployments keep their configuration and server identity.
+
+On a fresh host the installer recommends an optional MirrorProxy mirror site.
+Caddy serves its homepage and APIs on the same domain. MirrorProxy uses its own
+systemd service and data directory. Initial administrator credentials are in
+`/etc/rvpn/mirrorproxy.env` (root only). Skipping it installs a basic homepage.
+
+When the installer sets up Caddy on a fresh host, it offers an optional ECH
+wizard after verifying HTTPS. It looks up the closest delegated DNS zone and
+suggests Cloudflare, AliDNS, Tencent Cloud DNSPod, or Route 53 from the NS
+records. Confirm or select the provider, then enter a public outer TLS name
+pointing to this Caddy host. The deployment name needs a direct A/AAAA record.
+For a CDN-terminated connection, configure ECH at the CDN instead.
+
+With confirmation, the installer requests a custom Linux build from Caddy's
+official build service, checks its version and DNS module, validates the
+configuration, and restarts Caddy. The custom executable is installed at
+`/usr/local/lib/rvpn/caddy`; package updates to the distribution executable do
+not upgrade this build. DNS credentials are entered without echo and stored
+in `/etc/rvpn/caddy-dns.env` (0600). ECH publication uses Caddy's global TLS
+settings and can affect all sites served by this instance. Use credentials
+scoped to the intended zones. If activation fails, the wizard restores the
+previous Caddyfile and systemd command.
+
+Run `sudo bash scripts/install-server.sh --setup-ech` to resume, replace DNS
+credentials, or check the deployment name's HTTPS record. Allow time for DNS
+propagation. Verify negotiation using the rVPN client with DoH and
+`[network].ech_mode = "required"`.
+
+After HTTPS and WebSocket checks succeed, copy the printed `rVPN://…` link.
+Run the installer with `--show-link` to display it again. The link contains the
+actual WSS address and public prekey bundle. In the desktop panel, open
+**服务器与路由 → 导入服务器链接**, paste the link, then save and apply. From the CLI:
+
+```bash
+rvpn -c client.toml import 'rVPN://…'
+rvpn -c client.toml import 'rVPN://…' --replace-primary
+```
+
+First import can create a configuration. Subsequent imports add named servers
+by default. CLI imports take effect when the client loads that configuration.
+For startup or certificate diagnostics use
+`journalctl -u rvpn-server -u caddy -u rvpn-mirrorproxy`.
+
 ### First-run key initialization
 
 Normal startup automatically creates a missing client `identity_key_file`.

@@ -149,7 +149,7 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     let protocol = if tls_acceptor.is_some() { "wss" } else { "ws" };
     info!("Server listening on {}://{}", protocol, addr);
     info!("WebSocket endpoint: {}", config.websocket_path);
-    info!("WebSocket endpoint (desktop SOCKS): /api/v1/ws");
+    info!("WebSocket endpoint (desktop SOCKS): {}", config.websocket_path);
     info!("WebSocket endpoint (mobile TUN): {}", tun_path);
     info!("WebSocket endpoint (DNS proxy): {}", dns_path);
     info!("WebSocket endpoint (SOCKS5 mux): {}", mux_path);

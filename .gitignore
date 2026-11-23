@@ -3,3 +3,5 @@
 /rvpn/webui/test-results/
 /rvpn/webui/playwright-report/
 /rvpn/webui/*.tsbuildinfo
+
+/scripts/__pycache__/

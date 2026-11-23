@@ -128,9 +128,11 @@ def run_case(args, use_caddy, scenario="restart"):
              "subjectAltName=DNS:localhost,IP:127.0.0.1", "-out", cert, "-keyout", key],
             check=True, capture_output=True,
         )
+        ws_path = "/cw/test-fixture/ws" if args.deployment_link else "/api/v1/ws"
         server_config = {
             "server": {
                 "bind_address": f"127.0.0.1:{server_port}",
+                "websocket_path": ws_path,
                 "tls_cert_file": str(cert) if not use_caddy else str(work / "no-cert.pem"),
                 "tls_key_file": str(key) if not use_caddy else str(work / "no-key.pem"),
                 "identity_key_file": str(work / "server.key"),
@@ -167,12 +169,16 @@ def run_case(args, use_caddy, scenario="restart"):
 
         if use_caddy:
             caddyfile = work / "Caddyfile"
+            proxy = f"reverse_proxy 127.0.0.1:{server_port}\n"
+            if args.deployment_link:
+                from install_server import snippet
+                proxy = snippet({"path": ws_path, "port": server_port}) + 'handle {\n respond "original site"\n}\n'
             caddyfile.write_text(
                 "{\n  admin off\n  auto_https disable_redirects\n}\n"
                 f"https://:{public_port} {{\n"
                 "  bind 127.0.0.1\n"
                 f"  tls {cert} {key}\n"
-                f"  reverse_proxy 127.0.0.1:{server_port}\n"
+                f"  {proxy}"
                 "}\n"
             )
             caddy = stack.enter_context(launch(
@@ -182,7 +188,7 @@ def run_case(args, use_caddy, scenario="restart"):
             wait_port(public_port, caddy)
 
         client_config = {
-            "server_address": f"wss://127.0.0.1:{public_port}/api/v1/ws",
+            "server_address": f"wss://127.0.0.1:{public_port}{ws_path}",
             "sni_hostname": "localhost",
             "identity_key_file": str(work / "client.key"),
             "prekey_bundle": str(work / "bundle.json"),
@@ -206,6 +212,27 @@ def run_case(args, use_caddy, scenario="restart"):
         if scenario == "upgrade-rejected":
             client_config["server_address"] += "/invalid"
         (work / "client.json").write_text(json.dumps(client_config))
+        if args.deployment_link:
+            from install_server import link, upgrade
+            address = client_config.pop("server_address")
+            client_config.pop("prekey_bundle")
+            client_config.pop("sni_hostname")
+            (work / "client.json").write_text(json.dumps(client_config))
+            public_link = link(address, json.loads((work / "bundle.json").read_text()))
+            import_command = [args.client, "-c", work / "client.json", "import", public_link]
+            subprocess.run(import_command, check=True, capture_output=True)
+            imported = (work / "client.json").read_bytes()
+            assert subprocess.run(import_command, capture_output=True).returncode != 0
+            assert (work / "client.json").read_bytes() == imported
+            if use_caddy:
+                from http.client import HTTPSConnection
+                for suffix in ("", "/dns", "/tun", "/mux"):
+                    upgrade("localhost", public_port, ws_path + suffix, local_tls=True)
+                for path in ("/", "/api/config", ws_path, ws_path + "-other"):
+                    conn = HTTPSConnection("localhost", public_port, context=ssl.create_default_context(cafile=cert))
+                    conn.request("GET", path)
+                    assert conn.getresponse().read() == b"original site"
+                    conn.close()
         client = stack.enter_context(launch(
             [args.client, "-v", "-c", work / "client.json"], work, "client",
             {**os.environ, "SSL_CERT_FILE": str(cert)},
@@ -304,9 +331,12 @@ def main():
     parser.add_argument("--client", type=Path, required=True)
     parser.add_argument("--server", type=Path, required=True)
     parser.add_argument("--caddy", type=Path, help="also test a local Caddy TLS frontend")
+    parser.add_argument("--deployment-link", action="store_true", help="exercise installer routes and real CLI import (Linux)")
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--measure", action="store_true", help="repeat isolated loopback scenarios and report all outcomes as JSON")
     args = parser.parse_args()
+    if args.deployment_link and args.measure:
+        parser.error("--deployment-link and --measure exercise different scenarios")
     if args.samples < 1:
         parser.error("--samples must be positive")
     for name in ("client", "server", "caddy"):
