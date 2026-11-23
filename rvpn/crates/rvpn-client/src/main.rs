@@ -379,7 +379,7 @@ async fn bind_dns_proxy(
     let dns = std::sync::Arc::new(dns_proxy::DnsProxy::new(
         address, proxy.server_host().to_string(), proxy.server_port(), proxy.server_path(),
         proxy.tls_fingerprint(), proxy.identity_key(), proxy.server_bundle(), proxy.split_tunnel(),
-        proxy.dns_resolver(), nameservers, extra_hosts, doh_hosts,
+        proxy.dns_resolver(), nameservers, extra_hosts, doh_hosts, config.dns_proxy.host_records()?,
     ));
     let socket = tokio::net::UdpSocket::bind(address).await
         .with_context(|| format!("Failed to bind DNS proxy to {address}"))?;

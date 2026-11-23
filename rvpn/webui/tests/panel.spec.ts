@@ -38,6 +38,7 @@ const config = {
   dns_proxy: {
     enabled: true,
     takeover_system_dns: false,
+    custom_hosts: [],
     listen_address: '127.0.0.1:53',
     nameservers: ['https://1.1.1.1/dns-query', '223.5.5.5:53'],
   },
@@ -157,13 +158,20 @@ test.beforeEach(async ({ page }) => {
         return
       }
       if (request.method === 'config.save') {
-        if (request.config.server_address === 'wss://reject.invalid/ws') {
+        const error =
+          request.config.server_address === 'wss://reject.invalid/ws'
+            ? '端口被占用'
+            : request.config.dns_proxy.takeover_system_dns &&
+                request.config.dns_proxy.nameservers.includes('203.0.113.53:53')
+              ? '无法绑定本地 DNS 端口'
+              : null
+        if (error) {
           ws.send(
             JSON.stringify({
               type: 'response',
               id: request.id,
               ok: false,
-              error: '配置应用失败，已恢复原配置文件：端口被占用',
+              error: `配置应用失败，已恢复原配置文件：${error}`,
             }),
           )
           return
@@ -342,6 +350,24 @@ test('failed apply keeps the edited form available for correction', async ({
   ).toBeEnabled()
 })
 
+test('failed system DNS takeover restores the switch and preserves other edits', async ({
+  page,
+}) => {
+  await page.locator('nav').getByRole('button', { name: 'DNS 与网络' }).click()
+  const takeover = page.getByRole('switch', { name: '接管系统 DNS' })
+  const upstream = page.getByLabel('DNS 上游')
+  await upstream.fill('203.0.113.53:53')
+  await takeover.click()
+  await expect(takeover).toBeChecked()
+  const save = page.getByRole('button', { name: '保存并应用', exact: true })
+  await save.click()
+  await expect(page.getByRole('alert')).toContainText('已恢复原配置文件')
+  await expect(takeover).not.toBeChecked()
+  await expect(page.getByLabel('监听地址')).toBeEnabled()
+  await expect(upstream).toHaveValue('203.0.113.53:53')
+  await expect(save).toBeEnabled()
+})
+
 test('disabling the panel acknowledges success and stops reconnecting', async ({
   page,
 }) => {
@@ -505,4 +531,82 @@ test('maps policies from V2Ray and Shadowrocket before merging their rules', asy
   await expect(page.getByRole('status')).toContainText('覆盖 1 条反向规则')
   await page.getByRole('button', { name: '保存并应用', exact: true }).click()
   await expect(page.getByRole('status')).toContainText('配置已保存')
+})
+
+test('custom DNS records can be added, searched, edited and deleted', async ({ page }) => {
+  await page.locator('nav').getByRole('button', { name: 'DNS 与网络' }).click()
+  const group = page.getByRole('group', { name: '自定义域名解析' })
+  const domain = group.getByLabel('域名', { exact: true })
+  const value = group.getByLabel('键值', { exact: true })
+  const add = group.getByRole('button', { name: '添加解析记录' })
+  const table = group.getByRole('table')
+  const save = page.getByRole('button', { name: '保存并应用', exact: true })
+
+  const formControls = await Promise.all(
+    [domain, value, add].map((control) => control.boundingBox()),
+  )
+  const bottomEdges = formControls.map((box) => box!.y + box!.height)
+  expect(Math.max(...bottomEdges) - Math.min(...bottomEdges)).toBeLessThan(2)
+
+  await expect(group.getByRole('combobox')).toHaveCount(0)
+  await domain.fill('nas.test')
+  await value.fill('192.0.2.256')
+  await add.click()
+  await expect(group.getByRole('alert')).toHaveText('请输入有效的 IPv4 或 IPv6 地址。')
+  await value.fill('192.0.2.1')
+  await add.click()
+  const ipv4 = table.getByRole('row').filter({ hasText: '192.0.2.1' })
+  await expect(ipv4.getByRole('cell', { name: 'A', exact: true })).toBeVisible()
+
+  await domain.fill('NAS.TEST.')
+  await value.fill('192.0.2.2')
+  await add.click()
+  await expect(group.getByRole('alert')).toHaveText('该域名已存在 A 记录。')
+  await value.fill('2001:db8::1')
+  await add.click()
+  await expect(table.getByRole('cell', { name: 'AAAA', exact: true })).toBeVisible()
+  await save.click()
+  await expect(save).toBeDisabled()
+
+  const search = group.getByLabel('查找解析记录')
+  await search.fill('missing')
+  await expect(table.getByText('没有匹配的解析记录。')).toBeVisible()
+  await search.fill('NAS')
+  await expect(ipv4).toBeVisible()
+  await ipv4.getByRole('button', { name: '编辑' }).click()
+  const edit = page.getByRole('dialog', { name: '编辑解析记录' })
+  await expect(edit.getByRole('combobox')).toHaveCount(0)
+  await expect(edit.getByLabel('域名')).toHaveValue('nas.test')
+  await expect(edit.getByLabel('键值')).toHaveValue('192.0.2.1')
+  await edit.getByLabel('键值').fill('192.0.2.2')
+  await edit.getByRole('button', { name: '保存修改' }).click()
+  await expect(edit).toBeHidden()
+  await save.click()
+  await expect(save).toBeDisabled()
+
+  const edited = table.getByRole('row').filter({ hasText: '192.0.2.2' })
+  await edited.getByRole('button', { name: '删除' }).click()
+  const confirm = page.getByRole('dialog', { name: '删除解析记录？' })
+  await expect(confirm).toContainText('192.0.2.2')
+  await confirm.getByRole('button', { name: '取消' }).click()
+  await expect(edited).toBeVisible()
+  await expect(save).toBeDisabled()
+  await edited.getByRole('button', { name: '删除' }).click()
+  await confirm.getByRole('button', { name: '确认删除' }).click()
+  await save.click()
+  await expect(save).toBeDisabled()
+  await expect(edited).toHaveCount(0)
+  await expect(table.getByRole('cell', { name: '2001:db8::1' })).toBeVisible()
+})
+
+test('custom DNS records fit the mobile settings page', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.getByRole('button', { name: '切换导航' }).click()
+  await page.locator('nav').getByRole('button', { name: 'DNS 与网络' }).click()
+  const group = page.getByRole('group', { name: '自定义域名解析' })
+  await group.getByLabel('域名', { exact: true }).fill('*.long-subdomain.example.test')
+  await group.getByLabel('键值', { exact: true }).fill('2001:db8:abcd:1234:abcd:1234:abcd:1234')
+  await group.getByRole('button', { name: '添加解析记录' }).click()
+  await expect(group.getByRole('cell', { name: 'AAAA', exact: true })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390)
 })

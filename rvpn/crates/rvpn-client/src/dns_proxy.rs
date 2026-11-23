@@ -31,6 +31,7 @@ use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketRea
 
 /// Payload type bytes for DNS messages — must match server's DnsHandler
 const DNS_QUERY_LIMIT: usize = 256;
+const BLOCKED_DNS_TTL: u32 = 24 * 60 * 60;
 const PAYLOAD_DNS_QUERY: u8 = 0x08;
 const PAYLOAD_DNS_RESPONSE: u8 = 0x09;
 
@@ -76,6 +77,7 @@ async fn receive_datagram(
 /// When split tunnel is enabled, bypass/block domains are handled locally
 /// without touching the tunnel.
 pub struct DnsProxy {
+    custom_hosts: Arc<crate::config::HostRecords>,
     listen_addr: SocketAddr,
     server_host: String,
     server_port: u16,
@@ -120,6 +122,7 @@ impl DnsProxy {
         nameservers: rvpn_split_tunnel::dns_cache::DnsUpstreams,
         extra_server_hosts: Vec<String>,
         doh_hosts: Vec<String>,
+        custom_hosts: crate::config::HostRecords,
     ) -> Self {
         // Derive DNS path from base WebSocket path, stripping any mux/tun suffix
         let base_path = server_path.trim_end_matches('/');
@@ -153,6 +156,7 @@ impl DnsProxy {
             nameservers,
             server_hosts: Arc::new(server_hosts),
             doh_hosts: Arc::new(doh_hosts),
+            custom_hosts: Arc::new(custom_hosts),
             resumption: ResumptionStore::new(),
         }
     }
@@ -236,6 +240,7 @@ impl DnsProxy {
             let dns_resolver_clone = Arc::clone(&self.dns_resolver);
             let nameservers_clone = self.nameservers.clone();
             let server_hosts_clone = Arc::clone(&self.server_hosts);
+            let custom_hosts = Arc::clone(&self.custom_hosts);
             let doh_hosts = Arc::clone(&self.doh_hosts);
             #[cfg(target_os = "linux")]
             let tun_owner = Arc::clone(self);
@@ -264,7 +269,17 @@ impl DnsProxy {
                             };
 
                             let mut cache_hit = false;
-                            let wire = 'answer: { match decision {
+                            let wire = 'answer: {
+                                if decision != RoutingDecision::Block && matches!(qtype, 1 | 28)
+                                    && dns_question(&data).is_some_and(|q| q.ends_with(&[0, 1])) {
+                                    if let Some(addresses) = matching_host_records(&custom_hosts, host) {
+                                        break 'answer match addresses[usize::from(qtype == 28)] {
+                                            Some(ip) => custom_address_answer(&data, dns_txid, ip),
+                                            None => build_dns_error(&data, dns_txid, 0),
+                                        };
+                                    }
+                                }
+                                match decision {
                                 RoutingDecision::Bypass => {
                                     // Resolve locally — bypass domain should not go through tunnel
                                     debug!("DNS proxy: resolving {} locally (bypass)", domain);
@@ -927,11 +942,55 @@ async fn resolve_locally(
 }
 
 fn build_dns_nxdomain(query: &[u8], txid: u16) -> Vec<u8> {
-    build_dns_error(query, txid, 3)
+    let mut wire = build_dns_error(query, txid, 3);
+    if !dns_question(query).is_some_and(|question| question.ends_with(&[0, 1])) {
+        return wire;
+    }
+
+    // Scope the synthetic SOA to the queried name. Its TTL and minimum
+    // both carry the negative-cache lifetime.
+    wire[9] = 1;
+    wire.extend_from_slice(&[0xc0, 12, 0, 6, 0, 1]); // Query name, SOA, IN
+    wire.extend_from_slice(&BLOCKED_DNS_TTL.to_be_bytes());
+    wire.extend_from_slice(&22u16.to_be_bytes());
+    wire.extend_from_slice(&[0, 0]); // Root names for MNAME and RNAME
+    for field in [0u32, 0, 0, 0, BLOCKED_DNS_TTL] {
+        wire.extend_from_slice(&field.to_be_bytes());
+    }
+    wire
 }
 
 fn build_dns_servfail(query: &[u8], txid: u16) -> Vec<u8> {
     build_dns_error(query, txid, 2)
+}
+
+fn matching_host_records<'a>(
+    records: &'a crate::config::HostRecords,
+    host: &str,
+) -> Option<&'a [Option<IpAddr>; 2]> {
+    if records.is_empty() { return None; }
+    let host = host.to_ascii_lowercase();
+    if let Some(addresses) = records.get(&host) { return Some(addresses); }
+    // Check suffixes on label boundaries, longest first. Skip the apex itself.
+    for (dot, _) in host.match_indices('.') {
+        let pattern = format!("*{}", &host[dot..]);
+        if let Some(addresses) = records.get(&pattern) { return Some(addresses); }
+    }
+    None
+}
+
+fn custom_address_answer(query: &[u8], txid: u16, ip: IpAddr) -> Vec<u8> {
+    let mut wire = build_dns_error(query, txid, 0);
+    wire[7] = 1;
+    let (kind, bytes) = match ip {
+        IpAddr::V4(addr) => (1u8, addr.octets().to_vec()),
+        IpAddr::V6(addr) => (28, addr.octets().to_vec()),
+    };
+    wire.extend_from_slice(&[0xc0, 12, 0, kind, 0, 1]);
+    wire.extend_from_slice(&30u32.to_be_bytes());
+    wire.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    wire.extend_from_slice(&bytes);
+    wire
 }
 
 fn build_dns_error(query: &[u8], txid: u16, rcode: u8) -> Vec<u8> {
@@ -981,19 +1040,70 @@ mod tests {
         tokio::try_join!(crate::check_dns_loopback(&v4), crate::check_dns_loopback(&v6)).unwrap();
         let addresses = [v4.local_addr().unwrap(), v6.local_addr().unwrap()];
         let resolver = Arc::new(DnsResolver::new(true, 300, 100, false, true, vec![]));
+        let ad_list = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ad_list.path(), "blocked.test\n").unwrap();
         let rules = crate::split_tunnel::SplitTunnelConfig {
-            enabled: true, tunnel_domains: vec!["routing.test".into()], ..Default::default()
+            enabled: true,
+            block_ads: true,
+            ad_block_file: Some(ad_list.path().into()),
+            tunnel_domains: vec!["routing.test".into()],
+            ..Default::default()
         };
         let split = Arc::new(SplitTunnel::new(rules, resolver.clone()).await.unwrap());
         let proxy = DnsProxy::new(addresses[0], "127.0.0.1".into(), 1, "/ws",
             TlsFingerprint::default(), Arc::new(IdentityKey::generate()),
             Arc::new(X3DHResponder::new().get_public_bundle()), split, resolver,
             rvpn_split_tunnel::dns_cache::DnsUpstreams::new(&["127.0.0.1:1".into()]).unwrap(),
-            vec![], vec![]);
+            vec![], vec![], crate::config::DnsProxyConfig {
+                custom_hosts: vec!["Internal.EXAMPLE.TEST. 192.0.2.5".into(), "internal.example.test 2001:db8::5".into(),
+                    "*.EXAMPLE.TEST 192.0.2.6".into(), "*.abc.example.test. 2001:db8::7".into()],
+                ..Default::default()
+            }.host_records().unwrap());
         let service = tokio::spawn(Arc::new(proxy).run_with_sockets(v4, Some(v6)));
         for address in addresses {
             let client = UdpSocket::bind(SocketAddr::new(address.ip(), 0)).await.unwrap();
             client.connect(address).await.unwrap();
+            for (host, kind, expected) in [
+                ("internal.example.test", RecordType::A, "192.0.2.5"),
+                ("internal.example.test", RecordType::AAAA, "2001:db8::5"),
+                ("abc.example.test", RecordType::A, "192.0.2.6"),
+                ("api.abc.example.test", RecordType::AAAA, "2001:db8::7"),
+                ("v1.API.abc.example.test", RecordType::AAAA, "2001:db8::7"),
+            ] {
+                let mut query = Message::new(42, MessageType::Query, OpCode::Query);
+                query.add_query(Query::query(Name::from_ascii(host).unwrap(), kind));
+                client.send(&query.to_vec().unwrap()).await.unwrap();
+                let mut buf = [0; 512];
+                let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await.unwrap().unwrap();
+                let answer = Message::from_vec(&buf[..n]).unwrap();
+                assert_eq!(answer.answers[0].data.to_string(), expected);
+            }
+            for kind in [RecordType::A, RecordType::AAAA] {
+                let mut query = Message::new(43, MessageType::Query, OpCode::Query);
+                let name = Name::from_ascii("blocked.test.").unwrap();
+                query.add_query(Query::query(name.clone(), kind));
+                client.send(&query.to_vec().unwrap()).await.unwrap();
+
+                let mut buf = [0; 512];
+                let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let answer = Message::from_vec(&buf[..n]).unwrap();
+                assert_eq!(answer.metadata.id, 43);
+                assert_eq!(answer.metadata.response_code, ResponseCode::NXDomain);
+                assert_eq!(answer.queries, query.queries);
+                assert!(answer.answers.is_empty());
+                let [authority] = answer.authorities.as_slice() else {
+                    panic!("blocked response must include one authority record");
+                };
+                assert_eq!(authority.name, name);
+                assert_eq!(authority.ttl, 86_400);
+                let hickory_proto::rr::RData::SOA(soa) = &authority.data else {
+                    panic!("blocked response authority must be an SOA record");
+                };
+                assert_eq!(soa.minimum, 86_400);
+            }
             // Tunnel AAAA produces NODATA locally and requires no external resolver.
             let mut query = Message::new(123, MessageType::Query, OpCode::Query);
             query.add_query(Query::query(Name::from_ascii("routing.test.").unwrap(), RecordType::AAAA));
@@ -1026,8 +1136,10 @@ mod tests {
             assert_eq!(parsed.metadata.response_code, code);
             assert!(!parsed.metadata.recursion_desired);
             assert_eq!(parsed.queries, query.queries);
-            assert_eq!(response.len(), wire.len() - 11);
+            assert_eq!(parsed.authorities.len(), usize::from(code == ResponseCode::NXDomain));
+            assert!(parsed.edns.is_none());
         }
+        assert_eq!(build_dns_nxdomain(&wire[..13], 42).len(), 12);
         assert_eq!(build_dns_servfail(&wire[..13], 42).len(), 12);
     }
 

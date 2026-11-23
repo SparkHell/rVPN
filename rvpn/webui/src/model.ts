@@ -211,6 +211,7 @@ export const labels: Record<string, string> = {
   rotate_after_mb: '连接轮换流量（MB）',
   rotation_jitter: '轮换抖动比例',
   nameservers: 'DNS 上游',
+  custom_hosts: '自定义域名解析',
   ipv6_enabled: '启用 IPv6',
   dns_cache_enabled: 'DNS 缓存',
   dns_cache_size: '最大缓存条数',

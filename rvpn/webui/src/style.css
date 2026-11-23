@@ -1512,3 +1512,165 @@ footer > span:last-child {
   min-height: 40px;
   padding: 8px;
 }
+
+.host-records {
+  min-width: 0;
+}
+
+.host-record-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.host-record-form > .button {
+  min-height: 42px;
+}
+
+.host-record-hint {
+  margin: 9px 0 18px;
+  color: #9aa1b1;
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.host-record-list {
+  border: 1px solid #3a3d44;
+  border-radius: 8px;
+  background: #1f2023;
+}
+
+.host-record-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  color: #b2b8c4;
+  font-size: 12px;
+}
+
+.host-record-search {
+  flex: 0 1 240px;
+}
+
+.host-record-search svg {
+  position: absolute;
+  top: 50%;
+  left: 10px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.host-record-search > input {
+  min-height: 34px;
+  padding: 6px 10px 6px 33px;
+}
+
+.host-record-table {
+  overflow-x: auto;
+}
+
+.host-record-table table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 12px;
+}
+
+.host-record-table :is(th, td) {
+  padding: 10px 12px;
+  border-top: 1px solid #383b42;
+  overflow-wrap: anywhere;
+}
+
+.host-record-table th {
+  background: #2a2c30;
+  color: #b2b8c4;
+}
+
+.host-record-table :is(th, td):last-child {
+  width: 1%;
+}
+
+.host-record-type {
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: #1d362b;
+  color: #8cdeae;
+  font: 600 11px ui-monospace, monospace;
+}
+
+.host-record-actions,
+.host-record-dialog-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.host-record-delete,
+.host-record-error,
+.host-record-dialog .host-record-error {
+  color: #ffabb0;
+}
+
+.host-record-table .host-record-empty {
+  padding: 20px 12px;
+  text-align: center;
+  color: #9aa1b1;
+}
+
+.host-record-error {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+
+.host-record-dialog {
+  position: fixed;
+  inset: 0;
+  width: min(440px, calc(100% - 32px));
+  margin: auto;
+  color: #e8eaf0;
+}
+
+.host-record-dialog::backdrop {
+  background: #0009;
+}
+
+.host-record-dialog strong {
+  overflow-wrap: anywhere;
+  color: #e8eaf0;
+}
+
+.host-record-edit-fields {
+  display: grid;
+  gap: 12px;
+}
+
+.host-record-dialog-actions {
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+
+.host-record-confirm-delete {
+  background: #ad3947;
+  color: #fff;
+}
+
+.host-record-confirm-delete:hover {
+  background: #be4452;
+}
+
+@media (max-width: 760px) {
+  .host-records {
+    padding: 12px;
+  }
+
+  .host-record-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .host-record-form > .button {
+    justify-self: start;
+  }
+}

@@ -40,6 +40,7 @@ import type { Config, Session, Stats } from './model'
 import { useControl } from './useControl'
 import { prepareRuleImport } from './ruleImport'
 import type { RouteAction, RuleFormat } from './ruleImport'
+import { HostRecords } from './HostRecords'
 import './style.css'
 
 const icons = {
@@ -155,6 +156,8 @@ function Field({
         (labels[section] || section)
       : labels[name] || name
   const switchHint = hints[name]
+  if (section === 'dns_proxy' && name === 'custom_hosts' && Array.isArray(value))
+    return <HostRecords rows={value} onChange={onChange} />
   if (typeof value === 'boolean')
     return (
       <div className="field switch-field" data-disabled={disabled || undefined}>
@@ -1141,6 +1144,9 @@ function App() {
   }
   async function save(validateOnly = false) {
     if (!draft || !base) return
+    const takeover = (draft.dns_proxy as Config | undefined)?.takeover_system_dns
+    const savedTakeover = (base.config.dns_proxy as Config | undefined)
+      ?.takeover_system_dns
     setBusy(true)
     setNotice(null)
     try {
@@ -1177,6 +1183,22 @@ function App() {
       }
     } catch (error) {
       setNotice({ text: (error as Error).message, error: true })
+      if (!validateOnly && takeover !== savedTakeover) {
+        try {
+          const fresh = (await request('config.get')) as Session
+          const restored = (fresh.config.dns_proxy as Config | undefined)
+            ?.takeover_system_dns
+          setSession(fresh)
+          setDraft((current) => {
+            const dns = current?.dns_proxy as Config | undefined
+            if (!current || dns?.takeover_system_dns !== takeover)
+              return current
+            return setPath(current, ['dns_proxy', 'takeover_system_dns'], restored)
+          })
+        } catch {
+          // Keep the draft when the saved configuration cannot be confirmed.
+        }
+      }
     } finally {
       setBusy(false)
     }

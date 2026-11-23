@@ -756,6 +756,10 @@ pub struct DnsProxyConfig {
     /// CN users may want to put local ISP DNS first for better latency.
     #[serde(default = "default_dns_proxy_nameservers")]
     pub nameservers: Vec<String>,
+
+    /// Exact or wildcard hostname and address pairs, one address per family per hostname.
+    #[serde(default)]
+    pub custom_hosts: Vec<String>,
 }
 
 impl Default for DnsProxyConfig {
@@ -765,9 +769,12 @@ impl Default for DnsProxyConfig {
             takeover_system_dns: false,
             listen_address: default_dns_proxy_listen(),
             nameservers: default_dns_proxy_nameservers(),
+            custom_hosts: Vec::new(),
         }
     }
 }
+
+pub type HostRecords = std::collections::HashMap<String, [Option<std::net::IpAddr>; 2]>;
 
 impl DnsProxyConfig {
     pub(crate) const SYSTEM_DNS_V4: &str = "127.0.0.1:53";
@@ -777,7 +784,29 @@ impl DnsProxyConfig {
         self.enabled && self.takeover_system_dns
     }
 
+    pub fn host_records(&self) -> anyhow::Result<HostRecords> {
+        let mut records = HostRecords::new();
+        for (index, line) in self.custom_hosts.iter().enumerate() {
+            let row = index + 1;
+            let mut parts = line.split_whitespace();
+            let name = parts.next().unwrap_or_default();
+            let host = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+            let suffix = host.strip_prefix("*.").unwrap_or(&host);
+            anyhow::ensure!(host.len() <= 253 && suffix.split('.').all(|label|
+                !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')),
+                "自定义解析第 {row} 行域名无效");
+            let ip: std::net::IpAddr = parts.next().unwrap_or_default().parse()
+                .map_err(|_| anyhow::anyhow!("自定义解析第 {row} 行 IP 地址无效"))?;
+            anyhow::ensure!(parts.next().is_none(), "自定义解析第 {row} 行只允许一个地址");
+            let addresses = records.entry(host).or_default();
+            anyhow::ensure!(addresses[usize::from(ip.is_ipv6())].replace(ip).is_none(), "自定义解析第 {row} 行域名与地址类型重复");
+        }
+        Ok(records)
+    }
+
     pub fn validate_system_dns(&self, tun: &TunConfig) -> anyhow::Result<()> {
+        self.host_records()?;
         if self.takes_over_system_dns() {
             anyhow::ensure!(cfg!(any(windows, target_os = "macos", target_os = "linux")), "此平台不支持系统 DNS 接管");
             anyhow::ensure!(!tun.enabled || cfg!(target_os = "linux"), "TUN 模式目前仅支持 Linux");
