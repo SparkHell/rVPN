@@ -31,6 +31,7 @@ mod proxy_common;
 mod router;
 mod runtime_control;
 mod server_pool;
+mod server_link;
 mod service;
 mod socks5;
 mod socks5_tunnel;
@@ -121,6 +122,12 @@ struct Args {
 /// Subcommands
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Import a public rVPN deployment link
+    Import {
+        link: String,
+        #[arg(long)]
+        replace_primary: bool,
+    },
     /// Install or manage the system service (requires administrator/root)
     Service {
         #[command(subcommand)]
@@ -161,6 +168,10 @@ fn main() -> Result<ExitCode> {
     args.config = config::resolve_path(&args.config, executable_dir);
     if let Some(bundle) = &mut args.bundle {
         *bundle = config::resolve_path(bundle, executable_dir);
+    }
+    if let Some(Commands::Import { link, replace_primary }) = &args.command {
+        server_link::import(&args.config, link, *replace_primary)?;
+        return Ok(ExitCode::SUCCESS);
     }
     if let Some(Commands::Service { action }) = &args.command {
         anyhow::ensure!(

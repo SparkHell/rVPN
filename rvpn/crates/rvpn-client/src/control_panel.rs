@@ -67,7 +67,7 @@ fn remove_retired_fields(config: &mut Value) {
     }
 }
 
-fn without_nulls(value: Value) -> Value {
+pub(crate) fn without_nulls(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.into_iter()
@@ -681,6 +681,9 @@ impl ControlPanel {
                 let store = config.split_tunnel.subscriptions.context("规则订阅尚未初始化")?;
                 Ok(json!({"domains":store.update(source, proxy.as_str()).await?}))
             }
+            "server.import" => crate::server_link::prepare(&self.path, &request["config"],
+                request["link"].as_str().context("缺少服务器链接")?,
+                request["replace_primary"].as_bool().unwrap_or(false)),
             "config.get" => self.configuration(),
             "config.validate" => {
                 validate(&request["config"])?;
@@ -689,6 +692,8 @@ impl ControlPanel {
             "config.save" => {
                 validate(&request["config"])?;
                 let _lock = self.writes.lock().await;
+                let mut file_lock = fslock::LockFile::open(&self.path.with_extension("import.lock"))?;
+                anyhow::ensure!(file_lock.try_lock()?, "其他程序正在保存配置，请稍后再试");
                 let (_, current) = self.read()?;
                 anyhow::ensure!(
                     request["revision"].as_str() == Some(&current),

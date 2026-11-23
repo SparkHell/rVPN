@@ -1006,6 +1006,8 @@ function App() {
   )
 
   const [page, setPage] = useState('overview')
+  const [serverLink, setServerLink] = useState('')
+  const [replacePrimary, setReplacePrimary] = useState(false)
   const [draft, setDraft] = useState<Config | null>(null)
   const [base, setBase] = useState<Session | null>(null)
   const [search, setSearch] = useState('')
@@ -1061,6 +1063,26 @@ function App() {
       setBusy(false)
     }
   }
+  async function importServer() {
+    if (!draft) return
+    setBusy(true)
+    try {
+      const result = await request('server.import', {
+        config: draft,
+        link: serverLink,
+        replace_primary: replacePrimary,
+      }) as { patch: Config; address: string; fingerprint: string }
+      setDraft(current => current && ({ ...current, ...result.patch }))
+      setNotice({ text: `${result.address} · ${result.fingerprint}，点击「保存并应用」生效。` })
+      setServerLink('')
+      setReplacePrimary(false)
+    } catch (error) {
+      setNotice({ error: true, text: String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
   function applyRuleImport(
     prepared: ReturnType<typeof prepareRuleImport>,
     choices?: ReadonlyMap<string, RouteAction>,
@@ -1372,6 +1394,24 @@ function App() {
                 </button>
               </div>
               <div className="config-sections">
+                {page === 'connection' && !search && (
+                  <section className="panel config-panel">
+                    <div className="panel-heading"><h2>导入服务器链接</h2></div>
+                    <div className="fields">
+                      <label className="field wide">服务器链接
+                        <input value={serverLink} placeholder="rVPN://…" onChange={e => setServerLink(e.target.value)} />
+                      </label>
+                      <label><input type="checkbox" checked={replacePrimary} onChange={e => setReplacePrimary(e.target.checked)} /> 替换主服务器</label>
+                      <button
+                        className="button secondary"
+                        disabled={busy || !connected || !serverLink.trim()}
+                        onClick={() => void importServer()}
+                      >
+                        导入到草稿
+                      </button>
+                    </div>
+                  </section>
+                )}
                 {page === 'split' && !search && (
                   <>
                     <section className="panel config-panel">
