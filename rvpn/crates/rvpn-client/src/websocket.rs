@@ -242,6 +242,10 @@ impl WebSocketWriter {
     }
 
     /// Check if the underlying channel has been closed (writer task exited)
+    #[cfg_attr(
+        not(any(target_os = "linux", test)),
+        allow(dead_code, reason = "Used by the public library's TUN implementation")
+    )]
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }

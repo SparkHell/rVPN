@@ -1,7 +1,9 @@
 //! Apply manual DNS overrides to the primary IPv4 and IPv6 network services.
+use std::net::IpAddr;
+
+#[cfg(target_os = "macos")]
 use std::{
     io::Write,
-    net::IpAddr,
     process::{Command, Stdio},
 };
 
@@ -16,6 +18,7 @@ pub(crate) struct SystemDns {
 }
 
 impl SystemDns {
+    #[cfg(target_os = "macos")]
     pub(crate) fn take_over() -> Result<Self> {
         Self::apply(primary_services(scutil_show)?, networksetup)
     }
@@ -104,6 +107,7 @@ fn primary_services(show: fn(&str) -> Result<String>) -> Result<Vec<String>> {
     Ok(services)
 }
 
+#[cfg(target_os = "macos")]
 fn networksetup(args: &[&str]) -> Result<String> {
     output(
         Command::new("/usr/sbin/networksetup")
@@ -120,6 +124,7 @@ fn property<'a>(dictionary: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|(key, value)| (key == name).then_some(value.trim()))
 }
 
+#[cfg(target_os = "macos")]
 fn scutil_show(key: &str) -> Result<String> {
     let mut child = Command::new("/usr/sbin/scutil")
         .env("LC_ALL", "C")
@@ -134,6 +139,7 @@ fn scutil_show(key: &str) -> Result<String> {
     output(child.wait_with_output()?)
 }
 
+#[cfg(target_os = "macos")]
 fn output(result: std::process::Output) -> Result<String> {
     let stdout = String::from_utf8(result.stdout)?;
     ensure!(

@@ -20,7 +20,7 @@ mod dns_proxy;
 mod windows_dns;
 #[cfg(any(target_os = "macos", test))]
 mod macos_dns;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 mod resolved_dns;
 #[cfg(target_os = "linux")]
 mod linux_dns;
@@ -39,9 +39,11 @@ mod split_tunnel;
 mod stats;
 mod stream_relay;
 // TLS re-exported from rvpn-tls crate
+#[cfg(target_os = "linux")]
 mod tun;
 #[cfg(target_os = "linux")]
 mod tun_routes;
+#[cfg(target_os = "linux")]
 mod tunnel;
 mod tunnel_pool;
 mod websocket;
@@ -56,6 +58,7 @@ mod websocket;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Maximum reconnection attempts before giving up
+#[cfg(target_os = "linux")]
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 
 use std::net::SocketAddr;
@@ -64,7 +67,9 @@ use std::process::{id as process_id, ExitCode};
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use tracing::{error, info, warn};
+#[cfg(target_os = "linux")]
+use tracing::warn;
+use tracing::{error, info};
 
 use config::ClientConfig;
 use socks5::Socks5Proxy;

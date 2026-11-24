@@ -174,7 +174,7 @@ jobs:
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn websocket::tests --timings
 
       - name: Test tunnel address and connection recovery
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn tunnel::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib tunnel::tests --timings
 
       - name: Test server file logging
         run: cargo test --profile ci-test --locked --package rvpn-server --test logging --timings
@@ -357,7 +357,7 @@ jobs:
         run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn websocket::tests --timings
 
       - name: Test tunnel address and connection recovery
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn tunnel::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib tunnel::tests --timings
 
       - name: Test server file logging
         run: cargo test --profile ci-test --locked --package rvpn-server --test logging --timings
