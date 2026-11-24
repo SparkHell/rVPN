@@ -11,7 +11,8 @@ TARGETS = (
     "macos-x86_64", "macos-aarch64",
 )
 WINDOWS_SYSTEM_DLLS = {
-    "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cfgmgr32.dll",
+    # Windows bindings can import CoTaskMemFree directly from combase.dll.
+    "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "cfgmgr32.dll", "combase.dll",
     "crypt32.dll", "dbghelp.dll", "iphlpapi.dll", "kernel32.dll",
     "ntdll.dll", "ole32.dll", "secur32.dll", "setupapi.dll", "shell32.dll",
     "user32.dll", "userenv.dll", "version.dll", "ws2_32.dll",
