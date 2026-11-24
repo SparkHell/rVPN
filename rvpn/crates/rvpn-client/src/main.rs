@@ -258,6 +258,10 @@ async fn async_main(args: Args) -> Result<ExitCode> {
     } else {
         ClientConfig::default()
     };
+    #[cfg(target_os = "macos")]
+    if starting_client && startup_problem.is_none() {
+        service::authorize_foreground(&config);
+    }
     let logging = match rvpn_logging::init_client_startup(&config.logging, args.verbose, "rvpn-client") {
         Ok(logging) => logging,
         Err(error) if starting_client => {
@@ -268,7 +272,7 @@ async fn async_main(args: Args) -> Result<ExitCode> {
     };
     let result = run_client(args, config, startup_problem, &logging).await;
     if let Err(error) = &result {
-        let _ = service::report_startup(None, Some(format!("{error:#}")));
+        let _ = service::report_startup(None, Some(format!("{error:#}")), None);
     }
     match result {
         Ok(()) => Ok(ExitCode::SUCCESS),
@@ -323,7 +327,11 @@ async fn run_client(
 }
 
 /// Run in SOCKS5 proxy mode (Brook-style)
-async fn run_socks5(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()>) -> Result<()> {
+async fn run_socks5(
+    config: ClientConfig,
+    ready: tokio::sync::oneshot::Sender<Option<String>>,
+    allow_dns_failure: bool,
+) -> Result<()> {
     info!("Starting R-VPN Client in SOCKS5 mode (Brook-style)");
     info!("Server: {}", config.server_address);
 
@@ -385,23 +393,41 @@ async fn run_socks5(config: ClientConfig, ready: tokio::sync::oneshot::Sender<()
         });
     }
 
-    let dns = if config.dns_proxy.enabled {
-        let (dns, primary, secondary) = bind_dns_proxy(&config, &proxy).await?;
-        Some(tokio::spawn(dns.run_with_sockets(primary, secondary)))
+    let mut dns_warning = None;
+    let (_system_dns, dns) = if config.dns_proxy.enabled {
+        let start_dns = async {
+            let takeover = config.dns_proxy.takes_over_system_dns();
+            #[cfg(target_os = "macos")]
+            anyhow::ensure!(!takeover || unsafe { libc::geteuid() } == 0,
+                "macOS 系统 DNS 接管需要管理员权限。请从终端重新运行 ./rvpn 并授权，或关闭接管并使用高位 DNS 端口");
+
+            let (dns, primary, secondary) = bind_dns_proxy(&config, &proxy).await?;
+            #[cfg(windows)]
+            let system_dns = takeover.then(windows_dns::SystemDns::take_over).transpose()?;
+            #[cfg(target_os = "macos")]
+            let system_dns = takeover.then(macos_dns::SystemDns::take_over).transpose()?;
+            #[cfg(target_os = "linux")]
+            let system_dns = if takeover {
+                linux_dns::SystemDns::install(config.dns_proxy.effective_listener().parse()?, true)?
+            } else {
+                None
+            };
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+            let system_dns: Option<()> = { let _ = takeover; None };
+            Ok::<_, anyhow::Error>((system_dns, Some(tokio::spawn(dns.run_with_sockets(primary, secondary)))))
+        };
+        match start_dns.await {
+            Ok(active) => active,
+            Err(error) if allow_dns_failure => {
+                dns_warning = Some(format!("DNS 未启动，代理已启动。{error:#}"));
+                (None, None)
+            }
+            Err(error) => return Err(error),
+        }
     } else {
-        None
+        (None, None)
     };
-    #[cfg(windows)]
-    let _system_dns = config.dns_proxy.takes_over_system_dns()
-        .then(windows_dns::SystemDns::take_over).transpose()?;
-    #[cfg(target_os = "macos")]
-    let _system_dns = config.dns_proxy.takes_over_system_dns()
-        .then(macos_dns::SystemDns::take_over).transpose()?;
-    #[cfg(target_os = "linux")]
-    let _system_dns = if config.dns_proxy.takes_over_system_dns() {
-        linux_dns::SystemDns::install(config.dns_proxy.effective_listener().parse()?, true)?
-    } else { None };
-    let _ = ready.send(());
+    let _ = ready.send(dns_warning);
     tokio::select! {
         result = proxy.run_with_listener(socks_listener) => result,
         result = async {
@@ -440,25 +466,34 @@ async fn bind_dns_proxy(
         proxy.tls_fingerprint(), proxy.identity_key(), proxy.server_bundle(), proxy.split_tunnel(),
         proxy.dns_resolver(), nameservers, extra_hosts, doh_hosts, config.dns_proxy.host_records()?,
     ));
-    let socket = tokio::net::UdpSocket::bind(address).await
-        .with_context(|| format!("Failed to bind DNS proxy to {address}"))?;
+    let socket = bind_dns_listener(address).await?;
     let secondary = if config.dns_proxy.takes_over_system_dns() {
-        let address = config::DnsProxyConfig::SYSTEM_DNS_V6;
-        let secondary = tokio::net::UdpSocket::bind(address).await
-            .with_context(|| format!("Failed to bind DNS proxy to {address}"))?;
+        let address = config::DnsProxyConfig::SYSTEM_DNS_V6.parse()?;
+        let secondary = bind_dns_listener(address).await?;
         tokio::try_join!(check_dns_loopback(&socket), check_dns_loopback(&secondary))?;
         Some(secondary)
     } else { None };
     Ok((dns, socket, secondary))
 }
 
+async fn bind_dns_listener(address: SocketAddr) -> Result<tokio::net::UdpSocket> {
+    tokio::net::UdpSocket::bind(address).await.map_err(|error| {
+        let detail = match error.kind() {
+            std::io::ErrorKind::AddrInUse => "端口已占用",
+            std::io::ErrorKind::PermissionDenied => "权限不足",
+            _ => "无法绑定",
+        };
+        anyhow::Error::new(error).context(format!("DNS UDP 监听 {address} 失败，{detail}"))
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
-async fn run_tun(_: ClientConfig, _: tokio::sync::oneshot::Sender<()>) -> Result<()> {
+async fn run_tun(_: ClientConfig, _: tokio::sync::oneshot::Sender<Option<String>>) -> Result<()> {
     anyhow::bail!("Managed desktop TUN routing and DNS currently require Linux")
 }
 
 #[cfg(target_os = "linux")]
-async fn run_tun(mut config: ClientConfig, ready: tokio::sync::oneshot::Sender<()>) -> Result<()> {
+async fn run_tun(mut config: ClientConfig, ready: tokio::sync::oneshot::Sender<Option<String>>) -> Result<()> {
     use std::sync::Arc;
     use tun::TunDevice;
     use tunnel::VpnTunnel;
@@ -534,7 +569,7 @@ async fn run_tun(mut config: ClientConfig, ready: tokio::sync::oneshot::Sender<(
                 let _status = OnDrop::new(|| dashboard::TUN_READY.store(false, std::sync::atomic::Ordering::Relaxed));
                 failures = 0;
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(());
+                    let _ = ready.send(None);
                 }
                 let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
                 tokio::select! {

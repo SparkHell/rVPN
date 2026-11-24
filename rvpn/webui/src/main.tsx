@@ -1425,6 +1425,16 @@ function App() {
               )}
             </div>
           ) : null}
+          {session?.runtime.dns_warning && !stats?.runtime_error && (
+            <div className="notice" role="status">
+              <span>{session.runtime.dns_warning}</span>
+              {page !== 'dns' && (
+                <button className="button tertiary" onClick={() => navigate('dns')}>
+                  打开 DNS 设置
+                </button>
+              )}
+            </div>
+          )}
           {page === 'overview' ? (
             <Overview
               session={session}
@@ -1829,6 +1839,7 @@ function App() {
                       busy ||
                       (!dirty &&
                         !base?.pending_changes &&
+                        !session?.runtime.dns_warning &&
                         !stats?.runtime_error)
                     }
                     onClick={() => void save()}

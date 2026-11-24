@@ -313,9 +313,9 @@ inconsistent complete key sets cause an explicit error. The `keygen` and
 ### Client system service
 
 The CLI supports systemd on Linux, Windows Service Control Manager, and a
-system LaunchDaemon on macOS. Run these commands as root (Unix, for example with
-`sudo`). Windows automatically requests UAC authorization for install, uninstall,
-start, and stop when the terminal is not elevated:
+system LaunchDaemon on macOS. For install, uninstall, start, and stop, macOS
+requests administrator authentication with `sudo` in the terminal. Windows uses
+UAC. On Linux, run these operations as root, for example with `sudo`.
 
 ```text
 rvpn --config /absolute/path/client.toml service install
@@ -502,6 +502,16 @@ default-route adapters on Windows, the primary IPv4 and IPv6 network services
 on macOS, and the system resolver configuration on Linux. Disabling takeover
 or stopping the client normally restores the previous configuration.
 Takeover defaults to off.
+
+With the desktop SOCKS5 and HTTP proxies, the first start or first Web UI
+apply can succeed even when DNS setup fails. The terminal, service startup
+report and Web UI identify the DNS error. If port 53 is in use, free the
+port for system takeover or turn off takeover and use an available unprivileged
+port such as `127.0.0.1:1053` for local DNS. On macOS, running `./rvpn` in a
+terminal requests `sudo` authorization when the saved configuration has system
+DNS takeover enabled. If you decline, the client continues with user privileges.
+If you first enable takeover from an unprivileged Web UI session, save the
+configuration and run `./rvpn` again to request authorization.
 
 On Linux, rVPN preserves the original `/etc/resolv.conf` file or symlink.
 When systemd-resolved is active, it also uses `resolvectl` to update and

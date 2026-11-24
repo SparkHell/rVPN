@@ -42,13 +42,14 @@ impl Overrides {
 
 struct Worker {
     stop: watch::Sender<bool>,
-    ready: oneshot::Receiver<()>,
+    ready: oneshot::Receiver<Option<String>>,
     done: oneshot::Receiver<std::result::Result<(), String>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    dns_warning: Option<String>,
 }
 
 impl Worker {
-    fn start(config: ClientConfig) -> Result<Self> {
+    fn start(config: ClientConfig, allow_dns_failure: bool) -> Result<Self> {
         config.dns_proxy.validate_system_dns(&config.tun)?;
         anyhow::ensure!(
             config.performance.worker_threads > 0,
@@ -73,7 +74,7 @@ impl Worker {
                                 crate::run_tun(config, ready_tx).await
                             } else {
                                 crate::websocket::configure_endpoint_dns(&config)?;
-                                crate::run_socks5(config, ready_tx).await
+                                crate::run_socks5(config, ready_tx, allow_dns_failure).await
                             }
                         } => result,
                     }
@@ -90,13 +91,14 @@ impl Worker {
             ready,
             done,
             thread: Some(thread),
+            dns_warning: None,
         })
     }
 
-    async fn wait_ready(&mut self) -> Result<()> {
+    async fn wait_ready(&mut self) -> Result<Option<String>> {
         tokio::select! {
             result = &mut self.ready => match result {
-                Ok(()) => Ok(()),
+                Ok(dns_warning) => Ok(dns_warning),
                 Err(_) => Err(anyhow::anyhow!((&mut self.done).await.unwrap_or_else(|_| Err("Network worker exited unexpectedly".into())).err().unwrap_or_else(|| "Network stopped before readiness".into()))),
             },
             result = &mut self.done => Err(anyhow::anyhow!(result.unwrap_or_else(|_| Err("Network worker exited unexpectedly".into())).err().unwrap_or_else(|| "Network stopped before readiness".into()))),
@@ -240,15 +242,21 @@ pub(crate) fn awaits_server_import(config: &ClientConfig) -> bool {
     config.server_address == crate::config::DEFAULT_SERVER_ADDRESS && config.prekey_bundle.is_none()
 }
 
-async fn start_ready(config: ClientConfig) -> Result<Worker> {
+async fn start_ready(config: ClientConfig, allow_dns_failure: bool) -> Result<Worker> {
     #[cfg(target_os = "linux")]
     if unsafe { libc::geteuid() } == 0 || config.tun.enabled || config.dns_proxy.takes_over_system_dns() {
         crate::linux_dns::recover().context("Failed to recover system DNS")?;
         crate::tun_routes::recover().context("Failed to recover TUN routes")?;
     }
-    let mut worker = Worker::start(config)?;
+    let mut worker = Worker::start(config, allow_dns_failure)?;
     match tokio::time::timeout(Duration::from_secs(15), worker.wait_ready()).await {
-        Ok(Ok(())) => Ok(worker),
+        Ok(Ok(dns_warning)) => {
+            if let Some(warning) = &dns_warning {
+                eprintln!("{warning}");
+            }
+            worker.dns_warning = dns_warning;
+            Ok(worker)
+        }
         failure => {
             worker.stop().await;
             match failure {
@@ -304,10 +312,11 @@ pub async fn run(
         println!("请在 Web 控制面板导入 rVPN:// 服务器链接，然后保存并应用。");
         Ok(None)
     } else {
-        start_ready(config.clone()).await.map(Some)
+        start_ready(config.clone(), true).await.map(Some)
     };
     let mut worker = match initial_network {
         Ok(Some(worker)) => {
+            panel.set_dns_warning(worker.dns_warning.clone());
             logging.use_runtime_settings(&config.logging)?;
             tracing::info!("R-VPN Client v{} started", env!("CARGO_PKG_VERSION"));
             Some(worker)
@@ -330,6 +339,7 @@ pub async fn run(
     crate::service::report_startup(
         listener.as_ref().and_then(|panel| panel.local_address),
         startup_error,
+        worker.as_ref().and_then(|worker| worker.dns_warning.as_deref()),
     )?;
     #[cfg(windows)]
     crate::service::windows::ready()?;
@@ -341,7 +351,8 @@ pub async fn run(
                 let error = match completed { Ok(Err(error)) => error, _ => "VPN network runtime stopped".into() };
                 if listener.is_none() { anyhow::bail!(error) }
                 tracing::error!("{error}");
-                let _ = crate::service::report_startup(listener.as_ref().and_then(|panel| panel.local_address), Some(error.clone()));
+                let _ = crate::service::report_startup(listener.as_ref().and_then(|panel| panel.local_address), Some(error.clone()), None);
+                panel.set_dns_warning(None);
                 panel.set_runtime_error(error);
             }
             Some(mut request) = requests.recv() => {
@@ -370,11 +381,14 @@ pub async fn run(
                     let prepared_listener = if same_address { None } else { bind_panel(&candidate).await? };
                     let mut old_network = serde_json::to_value(&config)?;
                     let mut new_network = serde_json::to_value(&candidate)?;
+                    let retry_dns = old_network == new_network
+                        && worker.as_ref().is_some_and(|worker| worker.dns_warning.is_some());
                     for value in [&mut old_network, &mut new_network] { value.as_object_mut().unwrap().remove("logging"); value.as_object_mut().unwrap().remove("dashboard"); }
-                    let rebuild = old_network != new_network || worker.is_none();
+                    let rebuild = old_network != new_network || worker.is_none() || retry_dns;
                     if rebuild {
+                        let allow_dns_failure = worker.is_none() || old_network["dns_proxy"] == new_network["dns_proxy"];
                         if let Some(old) = worker.take() { old.stop().await; }
-                        match start_ready(candidate.clone()).await {
+                        match start_ready(candidate.clone(), allow_dns_failure).await {
                             Ok(new_worker) => {
                                 if !started {
                                     match logging.prepare(&candidate.logging) {
@@ -389,9 +403,15 @@ pub async fn run(
                             }
                             Err(error) if !started => return Err(error),
                             Err(error) => {
-                                match start_ready(config.clone()).await {
-                                    Ok(restored) => worker = Some(restored),
-                                    Err(restore) => panel.set_runtime_error(format!("应用失败：{error:#}；恢复网络失败：{restore:#}")),
+                                match start_ready(config.clone(), true).await {
+                                    Ok(restored) => {
+                                        panel.set_dns_warning(restored.dns_warning.clone());
+                                        worker = Some(restored);
+                                    }
+                                    Err(restore) => {
+                                        panel.set_dns_warning(None);
+                                        panel.set_runtime_error(format!("应用失败：{error:#}；恢复网络失败：{restore:#}"));
+                                    }
                                 }
                                 return Err(error.context("网络未切换到新配置，已尝试恢复原运行配置"));
                             }
@@ -406,8 +426,9 @@ pub async fn run(
                         listener = prepared_listener.map(|socket| serve_panel(socket, &candidate, state.clone(), panel.clone()));
                     }
                     config = candidate;
-                    panel.set_active(config.clone(), request.revision);
-                    if let Err(error) = crate::service::report_startup(listener.as_ref().and_then(|panel| panel.local_address), None) {
+                    let dns_warning = worker.as_ref().and_then(|worker| worker.dns_warning.as_deref());
+                    panel.set_active(config.clone(), request.revision, dns_warning.map(str::to_owned));
+                    if let Err(error) = crate::service::report_startup(listener.as_ref().and_then(|panel| panel.local_address), None, dns_warning) {
                         tracing::warn!("Could not update service startup report: {error:#}");
                     }
                     tracing::info!("Client configuration applied without process restart (network rebuilt: {rebuild})");

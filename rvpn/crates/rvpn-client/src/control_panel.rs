@@ -30,7 +30,7 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 pub struct ControlPanel {
     path: PathBuf,
     setup_listen_override: Option<String>,
-    active: std::sync::RwLock<(ClientConfig, String)>,
+    active: std::sync::RwLock<(ClientConfig, String, Option<String>)>,
     writes: Mutex<()>,
     runtime_error: std::sync::Mutex<Option<String>>,
     applier: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<ApplyRequest>>>,
@@ -51,6 +51,24 @@ pub(crate) fn setup_config() -> ClientConfig {
 
 fn revision(bytes: &[u8]) -> String {
     hex::encode(Sha1::digest(bytes))
+}
+
+fn preserve_config_metadata(file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::{os::fd::AsRawFd, os::unix::fs::MetadataExt};
+
+        // An elevated foreground run must leave the user's config editable
+        // after disabling system DNS and returning to an ordinary launch.
+        if unsafe { libc::geteuid() } == 0 {
+            let result = unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error()).context("无法保留配置文件所有者");
+            }
+        }
+    }
+    file.set_permissions(metadata.permissions())?;
+    Ok(())
 }
 
 fn merge_defaults(defaults: &mut Value, input: Value) {
@@ -557,9 +575,13 @@ impl ControlPanel {
         *self.applier.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
     }
 
-    pub fn set_active(&self, config: ClientConfig, revision: String) {
-        *self.active.write().unwrap_or_else(|e| e.into_inner()) = (config, revision);
+    pub fn set_active(&self, config: ClientConfig, revision: String, dns_warning: Option<String>) {
+        *self.active.write().unwrap_or_else(|e| e.into_inner()) = (config, revision, dns_warning);
         *self.runtime_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    pub fn set_dns_warning(&self, warning: Option<String>) {
+        self.active.write().unwrap_or_else(|e| e.into_inner()).2 = warning;
     }
 
     pub fn set_dashboard(&self, dashboard: crate::config::DashboardConfig) {
@@ -593,7 +615,7 @@ impl ControlPanel {
         Ok(Self {
             path,
             setup_listen_override,
-            active: std::sync::RwLock::new((active, revision(&bytes))),
+            active: std::sync::RwLock::new((active, revision(&bytes), None)),
             writes: Mutex::new(()),
             runtime_error: std::sync::Mutex::new(None),
             applier: std::sync::Mutex::new(None),
@@ -669,7 +691,8 @@ impl ControlPanel {
                 "awaiting_server_import":awaiting_import,
                 "socks5":running.socks5.listen_address,"http_proxy":running.http_proxy.listen_address,
                 "system_dns_supported":cfg!(any(windows, target_os = "linux", target_os = "macos")),
-                "dns_proxy":running.dns_proxy.effective_listener(),"dashboard":running.dashboard}, "version":env!("CARGO_PKG_VERSION")}),
+                "dns_proxy":running.dns_proxy.effective_listener(),"dns_warning":active.2,
+                "dashboard":running.dashboard}, "version":env!("CARGO_PKG_VERSION")}),
         )
     }
 
@@ -737,9 +760,8 @@ impl ControlPanel {
                 // Preserve file permissions and replace atomically on every OS.
                 let parent = self.path.parent().context("配置文件没有父目录")?;
                 let mut file = tempfile::NamedTempFile::new_in(parent)?;
-                if let Ok(metadata) = std::fs::metadata(&self.path) {
-                    file.as_file().set_permissions(metadata.permissions())?;
-                }
+                let metadata = std::fs::metadata(&self.path)?;
+                preserve_config_metadata(file.as_file(), &metadata)?;
                 use std::io::Write;
                 file.write_all(body.as_bytes())?;
                 file.as_file().sync_all()?;
@@ -770,9 +792,7 @@ impl ControlPanel {
                     .await;
                     if let Err(error) = result {
                         let mut rollback = tempfile::NamedTempFile::new_in(parent)?;
-                        rollback
-                            .as_file()
-                            .set_permissions(std::fs::metadata(&self.path)?.permissions())?;
+                        preserve_config_metadata(rollback.as_file(), &metadata)?;
                         rollback.write_all(&previous)?;
                         rollback.as_file().sync_all()?;
                         rollback.persist(&self.path).context("无法恢复原配置文件")?;

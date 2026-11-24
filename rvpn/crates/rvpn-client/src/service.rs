@@ -19,6 +19,79 @@ pub enum ServiceAction {
     },
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
+fn privileged_action(action: &ServiceAction) -> Option<&'static str> {
+    match action {
+        ServiceAction::Install => Some("install"),
+        ServiceAction::Uninstall => Some("uninstall"),
+        ServiceAction::Start => Some("start"),
+        ServiceAction::Stop => Some("stop"),
+        ServiceAction::Status | ServiceAction::Run { .. } => None,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_sudo(exe: &Path, non_interactive: bool) -> Command {
+    let mut command = Command::new("/usr/bin/sudo");
+    if non_interactive {
+        command.arg("-n");
+    }
+    command.arg("--").arg(exe);
+    command
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_elevation_command(exe: &Path, config: &Path, action: &str) -> Command {
+    let mut command = macos_sudo(exe, false);
+    command
+        .arg("--config")
+        .arg(config)
+        .args(["service", action]);
+    command
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn foreground_requests_admin(config: &crate::config::ClientConfig) -> bool {
+    !config.tun.enabled
+        && config.dns_proxy.takes_over_system_dns()
+        && config.dns_proxy.validate_system_dns(&config.tun).is_ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn authorize_foreground(config: &crate::config::ClientConfig) {
+    use std::io::IsTerminal;
+    use std::os::unix::process::CommandExt;
+
+    if unsafe { libc::geteuid() } == 0
+        || std::env::var_os("RVPN_SYSTEM_SERVICE").is_some()
+        || !std::io::stdin().is_terminal()
+        || !std::io::stderr().is_terminal()
+        || !foreground_requests_admin(config)
+    {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("无法定位客户端以请求管理员权限：{error}");
+            return;
+        }
+    };
+    eprintln!("系统 DNS 接管需要管理员权限，正在通过 sudo 请求授权…");
+    // Authenticate before replacing this process so refusing authorization
+    // still leaves the normal foreground startup and Web UI available.
+    // During the prompt, Ctrl-C cancels sudo instead of killing the client too.
+    let _interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    match Command::new("/usr/bin/sudo").arg("-v").status() {
+        Ok(status) if status.success() => {
+            let error = macos_sudo(&exe, true).args(std::env::args_os().skip(1)).exec();
+            eprintln!("无法启动管理员客户端，将继续以普通权限运行：{error}");
+        }
+        Ok(_) => eprintln!("未取得管理员授权，将继续以普通权限运行。"),
+        Err(error) => eprintln!("无法请求管理员权限，将继续以普通权限运行：{error}"),
+    }
+}
+
 #[cfg(any(unix, test))]
 fn output(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
@@ -99,11 +172,21 @@ fn write_definition(path: &Path, contents: &str) -> Result<()> {
 
 pub fn execute(action: &ServiceAction, config: &Path) -> Result<()> {
     #[cfg(windows)]
-    if !matches!(action, ServiceAction::Run { .. } | ServiceAction::Status)
-        && !windows::is_elevated()
+    if privileged_action(action).is_some() && !windows::is_elevated()
     {
         println!("需要管理员权限，正在请求 UAC 授权…");
         return windows::elevate(action, config);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(action) = privileged_action(action) {
+        if unsafe { libc::geteuid() } != 0 {
+            println!("需要管理员权限，正在通过 sudo 请求授权…");
+            let status = macos_elevation_command(&std::env::current_exe()?, config, action)
+                .status()
+                .context("无法通过 sudo 请求 macOS 管理员权限")?;
+            anyhow::ensure!(status.success(), "macOS 服务操作未完成（sudo {status}）");
+            return Ok(());
+        }
     }
     if matches!(action, ServiceAction::Start) {
         crate::config::ClientConfig::load(&installed_config(config)?)
@@ -129,7 +212,9 @@ pub fn execute(action: &ServiceAction, config: &Path) -> Result<()> {
             let config = crate::config::ClientConfig::load(&path)?;
             let report =
                 wait_startup(&report_directory()?).map_err(|error| startup_error(error, since))?;
-            println!("服务已启动。");
+            if report.error.is_none() {
+                println!("服务已启动。");
+            }
             if let Some(url) = report.webui {
                 println!("WebUI：{url}");
             } else if !config.dashboard.enabled {
@@ -137,6 +222,9 @@ pub fn execute(action: &ServiceAction, config: &Path) -> Result<()> {
             }
             if let Some(error) = report.error {
                 anyhow::bail!("{error}");
+            }
+            if let Some(warning) = report.dns_warning {
+                eprintln!("{warning}");
             }
         }
         ServiceAction::Stop => println!("服务已停止。"),
@@ -177,9 +265,14 @@ struct StartupReport {
     pid: u32,
     webui: Option<String>,
     error: Option<String>,
+    dns_warning: Option<String>,
 }
 
-pub fn report_startup(address: Option<std::net::SocketAddr>, error: Option<String>) -> Result<()> {
+pub fn report_startup(
+    address: Option<std::net::SocketAddr>,
+    error: Option<String>,
+    dns_warning: Option<&str>,
+) -> Result<()> {
     #[cfg(windows)]
     let managed = windows::is_service();
     #[cfg(unix)]
@@ -199,6 +292,7 @@ pub fn report_startup(address: Option<std::net::SocketAddr>, error: Option<Strin
         pid: std::process::id(),
         webui: address.map(crate::runtime_control::panel_url),
         error,
+        dns_warning: dns_warning.map(str::to_owned),
     };
     let mut file = tempfile::NamedTempFile::new_in(&directory)?;
     serde_json::to_writer(&mut file, &report)?;
@@ -623,13 +717,7 @@ pub mod windows {
 
     pub fn elevate(action: &ServiceAction, config: &Path) -> Result<()> {
         use base64::Engine;
-        let action = match action {
-            ServiceAction::Install => "install",
-            ServiceAction::Uninstall => "uninstall",
-            ServiceAction::Start => "start",
-            ServiceAction::Stop => "stop",
-            _ => anyhow::bail!("This service action cannot be elevated"),
-        };
+        let action = privileged_action(action).context("This service action cannot be elevated")?;
         let log = tempfile::NamedTempFile::new()
             .context("Cannot create UAC output file")?
             .into_temp_path();
@@ -967,6 +1055,7 @@ mod tests {
             pid: 42,
             webui: Some("http://[::1]:54321/".into()),
             error: Some("VPN 启动失败：invalid key".into()),
+            dns_warning: None,
         };
         std::fs::write(
             temp.path().join("service-startup.json"),
@@ -977,6 +1066,47 @@ mod tests {
         let report = read_startup(temp.path(), 42).unwrap().unwrap();
         assert_eq!(report.webui.as_deref(), Some("http://[::1]:54321/"));
         assert_eq!(report.error.as_deref(), Some("VPN 启动失败：invalid key"));
+    }
+
+    #[test]
+    fn macos_sudo_preserves_arguments_and_elevates_only_service_mutations() {
+        let exe = Path::new("/opt/r vpn/rvpn");
+        let config = Path::new("/tmp/a $vpn's 配置.toml");
+        let action = privileged_action(&ServiceAction::Install).unwrap();
+        let command = macos_elevation_command(exe, config, action);
+        assert_eq!(command.get_program(), "/usr/bin/sudo");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), [
+            std::ffi::OsStr::new("--"), exe.as_os_str(), std::ffi::OsStr::new("--config"),
+            config.as_os_str(), std::ffi::OsStr::new("service"), std::ffi::OsStr::new("install"),
+        ]);
+        assert!(privileged_action(&ServiceAction::Status).is_none());
+        assert!(privileged_action(&ServiceAction::Run { working_directory: PathBuf::new() }).is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn foreground_authorization_requires_a_valid_system_dns_opt_in() {
+        let mut config = crate::config::ClientConfig::default();
+        assert!(!foreground_requests_admin(&config));
+        config.dns_proxy.enabled = true;
+        config.dns_proxy.listen_address = "127.0.0.1:53".into();
+        assert!(!foreground_requests_admin(&config));
+        config.dns_proxy.takeover_system_dns = true;
+        assert!(foreground_requests_admin(&config));
+        config.dns_proxy.nameservers = vec!["127.0.0.1:53".into()];
+        assert!(!foreground_requests_admin(&config));
+        config.dns_proxy.nameservers = vec!["https://223.6.6.6/dns-query".into()];
+        config.tun.enabled = true;
+        assert!(!foreground_requests_admin(&config));
+
+        let exe = Path::new("/opt/r vpn/rvpn");
+        let mut command = macos_sudo(exe, true);
+        command.args(["-c", "config with spaces.toml", "-vv"]);
+        assert_eq!(command.get_args().collect::<Vec<_>>(), [
+            std::ffi::OsStr::new("-n"), std::ffi::OsStr::new("--"), exe.as_os_str(),
+            std::ffi::OsStr::new("-c"), std::ffi::OsStr::new("config with spaces.toml"),
+            std::ffi::OsStr::new("-vv"),
+        ]);
     }
 
     #[test]

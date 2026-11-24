@@ -17,6 +17,7 @@ export type Session = {
     socks5: string
     http_proxy: string
     dns_proxy: string
+    dns_warning?: string | null
   }
 }
 

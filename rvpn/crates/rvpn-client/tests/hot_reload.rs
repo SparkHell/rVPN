@@ -525,6 +525,42 @@ async fn saving_repaired_configuration_recovers_a_stopped_network() {
 }
 
 #[tokio::test]
+async fn first_apply_starts_both_proxies_when_the_dns_port_is_busy() {
+    let (_directory, mut child, panel, socks) = fixture(true);
+    let pid = child.0.id();
+    let (mut socket, mut current) = connect(panel).await;
+    let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dns = occupied.local_addr().unwrap();
+    let http = address();
+    let mut config = current["config"].clone();
+    config["prekey_bundle"] = json!("./bundle.json");
+    config["http_proxy"]["enabled"] = json!(true);
+    config["http_proxy"]["listen_address"] = json!(http.to_string());
+    config["dns_proxy"]["enabled"] = json!(true);
+    config["dns_proxy"]["listen_address"] = json!(dns.to_string());
+
+    let saved = save(&mut socket, &mut current, config).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let warning = current["runtime"]["dns_warning"].as_str().unwrap();
+    assert!(warning.contains(&dns.to_string()), "{warning}");
+    assert!(warning.contains("端口已占用"), "{warning}");
+    assert!(TcpStream::connect(socks).await.is_ok());
+    assert!(TcpStream::connect(http).await.is_ok());
+
+    // Retry the saved settings when the UDP port is free, without restarting.
+    drop(occupied);
+    let config = current["config"].clone();
+    let saved = save(&mut socket, &mut current, config).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert!(current["runtime"]["dns_warning"].is_null());
+    assert!(tokio::net::UdpSocket::bind(dns).await.is_err());
+    assert!(TcpStream::connect(socks).await.is_ok());
+    assert!(TcpStream::connect(http).await.is_ok());
+    assert!(child.0.try_wait().unwrap().is_none());
+    assert_eq!(child.0.id(), pid);
+}
+
+#[tokio::test]
 async fn access_policy_changes_revoke_existing_and_new_panel_sessions() {
     let (_directory, mut child, panel, socks) = fixture(false);
     let (mut socket, mut current) = connect(panel).await;
