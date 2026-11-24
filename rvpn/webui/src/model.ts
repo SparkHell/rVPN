@@ -5,9 +5,11 @@ export type Session = {
   path: string
   restart_required: boolean
   pending_changes?: boolean
+  config_error?: boolean
   access_allowed?: boolean
   version: string
   runtime: {
+    awaiting_server_import?: boolean
     system_dns_supported?: boolean
     dashboard?: { enabled: boolean; listen_address: string }
     server_address: string

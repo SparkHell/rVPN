@@ -1,176 +1,281 @@
-//! CLI first-run initialization without a VPN connection or existing keys.
-use std::process::Command;
+//! Exercise desktop startup and setup through the embedded panel's WebSocket.
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use std::{
+    net::SocketAddr,
+    path::Path,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    tungstenite::{client::IntoClientRequest, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
-#[tokio::test]
-async fn control_panel_remains_available_after_vpn_startup_failure() {
-    use futures_util::StreamExt;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let directory = tempfile::tempdir().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    let config = directory.path().join("client.toml");
-    std::fs::write(directory.path().join("invalid.key"), "invalid identity").unwrap();
-    std::fs::write(&config, format!("identity_key_file = './invalid.key'\ndata_dir = './data'\n[logging]\ndirectory = './logs'\n[dashboard]\nenabled = true\nlisten_address = '{address}'\n")).unwrap();
-    struct Process(std::process::Child);
-    impl Drop for Process {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct Process(Child);
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
-    let mut child = Process(
-        Command::new(env!("CARGO_BIN_EXE_rvpn"))
-            .args(["-c", config.to_str().unwrap()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+}
+
+async fn start(directory: &Path, command: &mut Command) -> (Process, SocketAddr, Socket, Value) {
+    let stdout = directory.join("stdout");
+    let stderr = directory.join("stderr");
+    command
+        .stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut process = Process(loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            // A runner can briefly report ETXTBSY for a freshly copied binary.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!("{error}"),
+        }
+    });
+    let (address, socket, session) = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "Client exited before configuration could be repaired"
+                process.0.try_wait().unwrap().is_none(),
+                "{}",
+                std::fs::read_to_string(&stderr).unwrap()
             );
-            let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
-            request
-                .headers_mut()
-                .insert("origin", format!("http://{address}").parse().unwrap());
-            if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(request).await {
-                loop {
-                    let event: serde_json::Value =
-                        serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
-                            .unwrap();
-                    if event["type"] == "stats" && event["data"]["runtime_error"].is_string() {
-                        assert!(event["data"]["runtime_error"]
-                            .as_str()
-                            .unwrap()
-                            .contains("identity"));
-                        return;
-                    }
+            let output = std::fs::read_to_string(&stdout).unwrap_or_default();
+            if let Some(address) = output.lines().find_map(|line| {
+                line.split_once("http://")?
+                    .1
+                    .strip_suffix('/')?
+                    .parse::<SocketAddr>()
+                    .ok()
+            }) {
+                let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
+                request
+                    .headers_mut()
+                    .insert("origin", format!("http://{address}").parse().unwrap());
+                if let Ok((mut socket, _)) = tokio_tungstenite::connect_async(request).await {
+                    let session = next(&mut socket, "session").await;
+                    return (address, socket, session["data"].clone());
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
     })
     .await
     .unwrap();
-    assert!(!directory.path().join("logs").exists());
+    (process, address, socket, session)
 }
 
-#[test]
-fn client_startup_errors_use_stderr_without_creating_log_files() {
-    for enabled in [true, false] {
+async fn next(socket: &mut Socket, kind: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            if event["type"] == kind {
+                return event;
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn rpc(socket: &mut Socket, request: Value) -> Value {
+    socket
+        .send(Message::Text(request.to_string()))
+        .await
+        .unwrap();
+    next(socket, "response").await
+}
+
+fn free_address() -> SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fresh_example_and_broken_configs_can_import_apply_and_export() {
+    let example = include_str!("../../../../config/client.toml.example");
+    let legacy = format!(
+        "server_address = 'wss://vpn.example.com/api/v1/ws'\nprekey_bundle = './prekey-bundle.json'\n{example}"
+    );
+    let bundle = rvpn_core::crypto::X3DHResponder::new().get_public_bundle();
+    let link_data = json!({"v":1,"address":"wss://127.0.0.1/cw/ws","bundle":bundle});
+    let link = format!(
+        "rVPN://{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&link_data).unwrap())
+    );
+    for (filename, original, broken, occupy_panel) in [
+        ("client.toml", None, false, false),
+        ("client.toml", Some(example), false, false),
+        ("client.toml", Some(legacy.as_str()), false, true),
+        ("client.toml", Some("[bad"), true, false),
+        (
+            "client.json",
+            Some(r#"{"socks5":{"listen_address":42}}"#),
+            true,
+            false,
+        ),
+    ] {
         let directory = tempfile::tempdir().unwrap();
-        let config_dir = directory.path().join("config");
-        std::fs::create_dir(&config_dir).unwrap();
-        std::fs::write(config_dir.join("invalid.key"), "invalid identity").unwrap();
-        let config = config_dir.join("client.toml");
-        std::fs::write(&config, format!(
-            "identity_key_file = './invalid.key'\ndata_dir = './data'\n[logging]\nfile_enabled = {enabled}\ndirectory = './logs'\nlevel = 'off'\n"
-        )).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_rvpn"))
-            .args(["-c", config.to_str().unwrap()])
-            .current_dir(std::env::temp_dir())
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("Client terminated:"), "{stderr}");
-        assert!(stderr.contains("identity"), "{stderr}");
-        assert!(!config_dir.join("logs").exists());
+        let path = directory.path().join(filename);
+        let binary = Path::new(env!("CARGO_BIN_EXE_rvpn"));
+        let panel = free_address();
+        let occupied_panel = occupy_panel.then(|| std::net::TcpListener::bind(panel).unwrap());
+        let original = original.map(|contents| {
+            if occupy_panel {
+                contents.replace("127.0.0.1:9800", &panel.to_string())
+            } else {
+                contents.to_owned()
+            }
+        });
+        let mut command = if let Some(contents) = &original {
+            std::fs::write(&path, contents).unwrap();
+            let mut command = Command::new(binary);
+            command.arg("-c").arg(&path);
+            command
+        } else {
+            let copy = directory.path().join(binary.file_name().unwrap());
+            std::fs::copy(binary, &copy).unwrap();
+            Command::new(copy)
+        };
+        if occupied_panel.is_none() {
+            command.args(["--dashboard-listen", &panel.to_string()]);
+        }
+        command.current_dir(std::env::temp_dir());
+        let (mut process, address, mut socket, session) =
+            start(directory.path(), &mut command).await;
+        if occupy_panel {
+            assert_ne!(address, panel);
+            assert!(address.ip().is_loopback());
+            assert_eq!(
+                session["config"]["dashboard"]["listen_address"],
+                address.to_string()
+            );
+        } else {
+            assert_eq!(address, panel);
+        }
+        assert_eq!(session["config_error"], broken);
+        assert_eq!(session["runtime"]["awaiting_server_import"], true);
+        assert!(!directory.path().join("identity.key").exists());
+        assert!(!directory.path().join("prekey-bundle.json").exists());
+        assert_eq!(
+            rpc(&mut socket, json!({"id":1,"method":"server.export"})).await["ok"],
+            false
+        );
+        let before = std::fs::read(&path).unwrap();
+        if let Some(original) = original {
+            assert_eq!(before, original.as_bytes());
+        } else {
+            assert!(!before.is_empty());
+        }
+        let mut config = session["config"].clone();
+        let imported = rpc(
+            &mut socket,
+            json!({"id":2,"method":"server.import","config":config,"link":link}),
+        )
+        .await;
+        assert_eq!(imported["ok"], true, "{imported}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(imported["data"]["patch"].as_object().unwrap().clone());
+        let socks = free_address();
+        let blocked = std::net::TcpListener::bind(socks).unwrap();
+        config["socks5"]["listen_address"] = json!(socks.to_string());
+        config["http_proxy"]["enabled"] = json!(false);
+        config["dns_proxy"]["enabled"] = json!(false);
+        config["split_tunnel"]["enabled"] = json!(false);
+        config["data_dir"] = json!("./data");
+        config["logging"]["directory"] = json!("./logs");
+        let save =
+            json!({"id":3,"method":"config.save","config":config,"revision":session["revision"]});
+        let rejected = rpc(&mut socket, save.clone()).await;
+        assert_eq!(rejected["ok"], false, "{rejected}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(blocked);
+        let saved = rpc(&mut socket, save).await;
+        assert_eq!(saved["ok"], true, "{saved}");
+        assert_eq!(saved["data"]["config_error"], false);
+        assert_eq!(saved["data"]["runtime"]["awaiting_server_import"], false);
+        assert!(TcpStream::connect(socks).await.is_ok());
+        assert!(process.0.try_wait().unwrap().is_none());
+        let exported = rpc(&mut socket, json!({"id":4,"method":"server.export"})).await;
+        assert_eq!(exported["ok"], true, "{exported}");
+        let exported = exported["data"]["link"].as_str().unwrap();
+        let decoded: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(exported.strip_prefix("rVPN://").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, link_data);
+        let reimported = rpc(
+            &mut socket,
+            json!({"id":5,"method":"server.import","config":session["config"],"link":exported}),
+        )
+        .await;
+        assert_eq!(reimported["ok"], true, "{reimported}");
+        if !broken {
+            let stderr = std::fs::read_to_string(directory.path().join("stderr")).unwrap();
+            assert!(!stderr.contains("VPN failed to start"), "{stderr}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn startup_errors_open_local_recovery_even_when_dashboard_is_disabled() {
+    for (contents, expected) in [
+        ("identity_key_file = './invalid.key'\n", "identity"),
+        ("identity_key_file = './keys/identity.key'\nprekey_bundle = './missing-server-bundle.json'\n", "client cannot generate it"),
+        ("[logging]\nlevel = 'invalid'\n", "日志配置无效"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.toml");
+        std::fs::write(directory.path().join("invalid.key"), "invalid identity").unwrap();
+        std::fs::write(&path, format!("data_dir = './data'\n{contents}")).unwrap();
+        let (mut process, panel, mut socket, _) = start(
+            directory.path(), Command::new(env!("CARGO_BIN_EXE_rvpn")).arg("-c").arg(&path).arg("-v")
+        ).await;
+        assert!(panel.ip().is_loopback());
+        let stats = next(&mut socket, "stats").await;
+        let error = stats["data"]["runtime_error"].as_str().unwrap();
+        assert!(error.contains(expected), "{error}");
+        assert!(process.0.try_wait().unwrap().is_none());
         assert!(!directory.path().join("logs").exists());
+        assert!(!directory.path().join("missing-server-bundle.json").exists());
+        if expected.contains("generate") {
+            let key = std::fs::read_to_string(directory.path().join("keys/identity.key")).unwrap();
+            let stdout = std::fs::read_to_string(directory.path().join("stdout")).unwrap();
+            let stderr = std::fs::read_to_string(directory.path().join("stderr")).unwrap();
+            assert!(stdout.contains("Client identity fingerprint: ik:1:"));
+            assert!(!stdout.contains(key.lines().nth(2).unwrap()) && !stderr.contains(key.lines().nth(2).unwrap()));
+        }
     }
 }
 
 #[test]
 fn example_and_legacy_fingerprints_parse() {
     let example = include_str!("../../../../config/client.toml.example");
-    for config in [example.to_owned(), example.replace("\"Chrome\"", "\"chrome\"")] {
+    for config in [
+        example.to_owned(),
+        example.replace("\"Chrome\"", "\"chrome\""),
+    ] {
         let config: rvpn_client::config::ClientConfig = toml::from_str(&config).unwrap();
         assert_eq!(config.tls_fingerprint, rvpn_client::TlsFingerprint::Chrome);
-    }
-}
-
-#[test]
-fn client_creates_identity_but_never_invents_server_bundle() {
-    let dir = tempfile::tempdir().unwrap();
-    // Run a private copy to check that a failed start never opens the default log.
-    let binary = dir.path().join(
-        std::path::Path::new(env!("CARGO_BIN_EXE_rvpn"))
-            .file_name()
-            .unwrap(),
-    );
-    std::fs::copy(env!("CARGO_BIN_EXE_rvpn"), &binary).unwrap();
-    let config = dir.path().join("client.toml");
-    std::fs::write(&config, "tls_fingerprint = 'invalid'\n").unwrap();
-    let mut command = Command::new(&binary);
-    command.arg("-c").arg(&config);
-    let output = run_private_copy(&mut command).unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("TOML parse error"), "{stderr}");
-    assert!(stderr.contains("tls_fingerprint"), "{stderr}");
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
-    std::fs::write(&config, "identity_key_file = './keys/identity.key'\nprekey_bundle = './missing-server-bundle.json'\ndata_dir = './data'\n").unwrap();
-    let key_path = dir.path().join("keys/identity.key");
-    let mut previous = None;
-    for run in 0..2 {
-        let mut command = Command::new(&binary);
-        command
-            .current_dir(std::env::temp_dir())
-            .arg("-c")
-            .arg(&config)
-            .arg("-v");
-        let output = run_private_copy(&mut command).unwrap();
-        assert!(
-            !output.status.success(),
-            "Missing server bundle should stop startup"
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("client cannot generate it"), "{stderr}");
-        assert_eq!(stderr.matches("Client terminated:").count(), 1);
-        assert!(stdout.contains("Client public identity (Ed25519, base64)"));
-        assert!(stdout.contains("Client identity fingerprint: ik:1:"));
-        assert!(stdout.contains(if run == 0 {
-            "Client identity key generated:"
-        } else {
-            "Client identity key loaded:"
-        }));
-        let key = std::fs::read_to_string(&key_path).unwrap();
-        assert!(!std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .any(|path| path.extension().is_some_and(|ext| ext == "log")));
-        assert!(
-            !stdout.contains(key.lines().nth(2).unwrap()) && !stderr.contains(key.lines().nth(2).unwrap()),
-            "Private key leaked into startup output"
-        );
-        if let Some(before) = &previous {
-            assert_eq!(&key, before);
-        }
-        previous = Some(key);
-        assert!(!dir.path().join("missing-server-bundle.json").exists());
-    }
-}
-
-// A runner filesystem can briefly report ETXTBSY after copying a binary.
-// Preserve the executable-relative log check and retry only failed launches.
-fn run_private_copy(command: &mut Command) -> std::io::Result<std::process::Output> {
-    use std::io::ErrorKind;
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match command.output() {
-            Err(error)
-                if error.kind() == ErrorKind::ExecutableFileBusy && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            result => return result,
-        }
     }
 }

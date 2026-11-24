@@ -98,7 +98,15 @@ cargo test --profile ci-test --locked -p rvpn-server --lib config::tests
 
 ### Embedded client control panel
 
-Enable the panel and open `http://127.0.0.1:9800`:
+On macOS, Linux and Windows, run `rvpn` (`rvpn.exe` on Windows) after
+extracting the client archive. If `client.toml` is missing, the client creates
+it beside the executable and starts the local Web UI. Open the URL printed
+in the terminal, normally `http://127.0.0.1:9800`, then go to
+**服务器与路由 → 导入服务器链接**. Paste an `rVPN://` link, select
+**导入到草稿**, then **保存并应用** to start the proxy. The example
+client configuration supports the same setup flow.
+
+For an existing configuration, enable the panel with:
 
 ```toml
 [dashboard]
@@ -134,8 +142,10 @@ CLI overrides still take precedence, including when applying saved settings.
 Changing the panel address binds the new listener and the page switches to that
 address after receiving the save acknowledgement. Disabling the panel closes its
 listener and WebSocket sessions; proxying continues. CIDR changes apply to new
-and existing sessions. If VPN startup fails, an enabled panel stays available to
-fix the settings; saving a corrected configuration starts the network again.
+and existing sessions. For startup configuration errors, the client leaves a
+working panel open or starts a recovery panel on loopback. A malformed TOML or
+JSON file opens a default draft for repair. The original file is retained until
+a corrected configuration is successfully saved and applied.
 Externally edited files are shown as pending until saved/applied through the UI.
 
 The existing `allow_cidrs` defaults to localhost. Allowed clients can read and
@@ -262,6 +272,10 @@ actual WSS address and public prekey bundle. In the desktop panel, open
 rvpn -c client.toml import 'rVPN://…'
 rvpn -c client.toml import 'rVPN://…' --replace-primary
 ```
+
+To share the applied primary server from the desktop panel, open
+**服务器与路由 → 导出主服务器链接**, generate the link and copy it.
+The link carries the primary server's WSS address and public prekey bundle.
 
 First import can create a configuration. Subsequent imports add named servers
 by default. CLI imports take effect when the client loads that configuration.

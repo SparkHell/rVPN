@@ -142,6 +142,11 @@ async fn bind_panel(config: &ClientConfig) -> Result<Option<tokio::net::TcpListe
     if !config.dashboard.enabled {
         return Ok(None);
     }
+    anyhow::ensure!(
+        !config.dashboard.allow_cidrs.is_empty()
+            && config.dashboard.allow_cidrs.iter().all(|cidr| cidr.parse::<ip_network::IpNetwork>().is_ok()),
+        "Invalid dashboard.allow_cidrs"
+    );
     let listener = tokio::net::TcpListener::bind(&config.dashboard.listen_address)
         .await
         .with_context(|| {
@@ -153,12 +158,27 @@ async fn bind_panel(config: &ClientConfig) -> Result<Option<tokio::net::TcpListe
     Ok(Some(listener))
 }
 
+async fn bind_recovery_panel(config: &mut ClientConfig) -> Result<tokio::net::TcpListener> {
+    let mut dashboard = crate::config::DashboardConfig::default();
+    dashboard.enabled = true;
+    let socket = match tokio::net::TcpListener::bind(&dashboard.listen_address).await {
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            tokio::net::TcpListener::bind("127.0.0.1:0").await?
+        }
+        result => result?,
+    };
+    dashboard.listen_address = socket.local_addr()?.to_string();
+    config.dashboard = dashboard;
+    Ok(socket)
+}
+
 fn serve_panel(
     listener: tokio::net::TcpListener,
     config: &ClientConfig,
     state: Arc<dashboard::DashboardState>,
     panel: Arc<ControlPanel>,
 ) -> PanelListener {
+    dashboard::init(state.clone());
     let allow = Arc::new(
         config
             .dashboard
@@ -210,7 +230,22 @@ mod tests {
     }
 }
 
+pub(crate) fn awaits_server_import(config: &ClientConfig) -> bool {
+    if config.server_address == "wss://vpn.example.com/api/v1/ws" {
+        // Older release examples included this placeholder bundle path.
+        return config.prekey_bundle.as_ref().is_none_or(|path| {
+            path.ends_with("prekey-bundle.json") && matches!(path.try_exists(), Ok(false))
+        });
+    }
+    config.server_address == crate::config::DEFAULT_SERVER_ADDRESS && config.prekey_bundle.is_none()
+}
+
 async fn start_ready(config: ClientConfig) -> Result<Worker> {
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::geteuid() } == 0 || config.tun.enabled || config.dns_proxy.takes_over_system_dns() {
+        crate::linux_dns::recover().context("Failed to recover system DNS")?;
+        crate::tun_routes::recover().context("Failed to recover TUN routes")?;
+    }
     let mut worker = Worker::start(config)?;
     match tokio::time::timeout(Duration::from_secs(15), worker.wait_ready()).await {
         Ok(Ok(())) => Ok(worker),
@@ -228,49 +263,62 @@ pub async fn run(
     mut config: ClientConfig,
     path: PathBuf,
     overrides: Overrides,
+    mut startup_problem: Option<String>,
     logging: &rvpn_logging::ReloadableLogging,
 ) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        crate::linux_dns::recover()?;
-        crate::tun_routes::recover()?;
-    }
     config.split_tunnel.subscriptions = Some(Arc::new(rvpn_split_tunnel::subscriptions::Subscriptions::open(&config.data_dir)));
-    let panel = Arc::new(ControlPanel::new(path, config.clone())?);
-    let (sender, mut requests) = mpsc::channel::<ApplyRequest>(8);
-    panel.attach_applier(sender);
-    let state = dashboard::global().unwrap_or_else(|| Arc::new(dashboard::DashboardState::new()));
-    if config.dashboard.enabled {
-        dashboard::init(state.clone());
-    }
-    let sampler = tokio::spawn(dashboard::run_sampler(state.clone()));
-    let _sampler_guard = crate::OnDrop::new(move || sampler.abort());
-    let mut startup_error = None;
-    let mut listener = match bind_panel(&config).await {
-        Ok(Some(socket)) => Some(serve_panel(socket, &config, state.clone(), panel.clone())),
+    let awaiting_import = config.dashboard.enabled && awaits_server_import(&config);
+    let mut setup_listen_override = None;
+    let socket = match bind_panel(&config).await {
+        Ok(Some(socket)) => Some(socket),
         Ok(None) => {
             tracing::info!("Web 控制面板未启用；可在配置文件 [dashboard] 中设置 enabled = true");
             None
         }
         Err(error) => {
-            eprintln!("{error:#}");
-            startup_error = Some(format!("WebUI 启动失败：{error:#}"));
-            None
+            let socket = bind_recovery_panel(&mut config).await?;
+            let port_busy = error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse);
+            if awaiting_import && port_busy {
+                setup_listen_override = Some(config.dashboard.listen_address.clone());
+            } else {
+                startup_problem.get_or_insert_with(|| format!("WebUI 配置无效，已使用本地监听地址：{error:#}"));
+            }
+            Some(socket)
         }
     };
+    let panel = Arc::new(ControlPanel::new(path, config.clone(), setup_listen_override)?);
+    let (sender, mut requests) = mpsc::channel::<ApplyRequest>(8);
+    panel.attach_applier(sender);
+    let state = dashboard::global().unwrap_or_else(|| Arc::new(dashboard::DashboardState::new()));
+    let sampler = tokio::spawn(dashboard::run_sampler(state.clone()));
+    let _sampler_guard = crate::OnDrop::new(move || sampler.abort());
+    let mut listener = socket.map(|socket| serve_panel(socket, &config, state.clone(), panel.clone()));
     let (shutdown, mut stopped) = watch::channel(false);
     let signals = tokio::spawn(crate::handle_signals(shutdown));
     let _signal_guard = crate::OnDrop::new(move || signals.abort());
-    let mut worker = match start_ready(config.clone()).await {
-        Ok(worker) => {
+    let mut startup_error = None;
+    let initial_network = if let Some(problem) = startup_problem {
+        Err(anyhow::Error::msg(problem))
+    } else if awaiting_import {
+        println!("请在 Web 控制面板导入 rVPN:// 服务器链接，然后保存并应用。");
+        Ok(None)
+    } else {
+        start_ready(config.clone()).await.map(Some)
+    };
+    let mut worker = match initial_network {
+        Ok(Some(worker)) => {
             logging.use_runtime_settings(&config.logging)?;
             tracing::info!("R-VPN Client v{} started", env!("CARGO_PKG_VERSION"));
             Some(worker)
         }
+        Ok(None) => None,
         Err(error) => {
             if listener.is_none() {
-                let _ = crate::service::report_startup(None, Some(format!("{error:#}")));
-                return Err(error);
+                let socket = bind_recovery_panel(&mut config).await
+                    .with_context(|| format!("VPN startup failed: {error:#}; could not start the local recovery panel"))?;
+                panel.set_dashboard(config.dashboard.clone());
+                listener = Some(serve_panel(socket, &config, state.clone(), panel.clone()));
             }
             eprintln!("VPN failed to start; control panel remains available: {error:#}");
             panel.set_runtime_error(format!("{error:#}"));
@@ -305,6 +353,8 @@ pub async fn run(
                     Some(Arc::new(rvpn_split_tunnel::subscriptions::Subscriptions::open(&candidate.data_dir)))
                 };
                 let outcome = async {
+                    anyhow::ensure!(!awaiting_import || started || !awaits_server_import(&candidate),
+                        "请先导入服务器链接，或填写服务器地址和公开预密钥包路径");
                     // Avoid creating files before the first successful network startup.
                     let mut prepared_log = started.then(|| logging.prepare(&candidate.logging)).transpose()?;
                     let same_address = candidate.dashboard.enabled && listener.as_ref().is_some_and(|old| old.address == candidate.dashboard.listen_address);

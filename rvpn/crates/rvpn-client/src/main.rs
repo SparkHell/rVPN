@@ -59,7 +59,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{id as process_id, ExitCode};
 
 use anyhow::{Context as _, Result};
@@ -90,7 +90,7 @@ impl<F: FnMut()> Drop for OnDrop<F> {
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "R-VPN Client - A stealth VPN with Double Ratchet encryption")]
 struct Args {
-    /// Configuration file (relative paths are resolved beside the executable)
+    /// Configuration file (defaults to client.toml beside the executable)
     #[arg(short, long, default_value = "client.toml")]
     config: PathBuf,
 
@@ -194,21 +194,74 @@ fn main() -> Result<ExitCode> {
     }
 }
 
+fn check_format(path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(path.extension().and_then(|ext| ext.to_str()), Some("toml" | "json")),
+        "Configuration file must have a .toml or .json extension: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn create_initial_config(path: &Path) -> anyhow::Result<()> {
+    use std::io::{ErrorKind, Write};
+
+    let directory = path.parent().context("Configuration path has no parent directory")?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    let contents = if path.extension().is_some_and(|ext| ext == "json") {
+        "{\"dashboard\":{\"enabled\":true}}\n"
+    } else {
+        "[dashboard]\nenabled = true\n"
+    };
+    file.write_all(contents.as_bytes())?;
+    file.as_file().sync_all()?;
+    match file.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Failed to create {}", path.display())),
+    }
+}
+
 async fn async_main(args: Args) -> Result<ExitCode> {
-    let config = if args.config.exists() {
-        ClientConfig::load(&args.config)
-            .with_context(|| format!("Invalid client configuration: {}", args.config.display()))?
-    } else if args.command.is_none() {
-        anyhow::bail!("Client configuration not found: {}", args.config.display());
+    let starting_client = args.command.is_none();
+    let exists = args.config.try_exists()?;
+    if starting_client {
+        check_format(&args.config)?;
+        if !exists {
+            create_initial_config(&args.config)?;
+        }
+    }
+    let mut startup_problem = None;
+    let config = if exists || starting_client {
+        match ClientConfig::load(&args.config) {
+            Ok(config) => config,
+            Err(_) if starting_client => {
+                // The repair draft can safely replace unreadable syntax or field types
+                // only if we can read the original bytes for revision checks and rollback.
+                std::fs::read(&args.config)
+                    .with_context(|| format!("Failed to read {}", args.config.display()))?;
+                startup_problem = Some("配置文件无法解析，请在 WebUI 中修正或导入服务器链接。".into());
+                let mut config = control_panel::setup_config();
+                let directory = args.config.parent().context("Configuration path has no parent directory")?;
+                config.resolve_paths(directory);
+                config
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Invalid client configuration: {}", args.config.display()));
+            }
+        }
     } else {
         ClientConfig::default()
     };
-    let logging = rvpn_logging::init_client_startup(&config.logging, args.verbose, "rvpn-client")
-        .map_err(|error| {
-            let _ = service::report_startup(None, Some(format!("{error:#}")));
-            error
-        })?;
-    let result = run_client(args, config.clone(), &logging).await;
+    let logging = match rvpn_logging::init_client_startup(&config.logging, args.verbose, "rvpn-client") {
+        Ok(logging) => logging,
+        Err(error) if starting_client => {
+            startup_problem = Some(format!("日志配置无效：{error:#}"));
+            rvpn_logging::init_client_startup(&Default::default(), args.verbose, "rvpn-client")?
+        }
+        Err(error) => return Err(error),
+    };
+    let result = run_client(args, config, startup_problem, &logging).await;
     if let Err(error) = &result {
         let _ = service::report_startup(None, Some(format!("{error:#}")));
     }
@@ -225,6 +278,7 @@ async fn async_main(args: Args) -> Result<ExitCode> {
 async fn run_client(
     args: Args,
     config: ClientConfig,
+    startup_problem: Option<String>,
     logging: &rvpn_logging::ReloadableLogging,
 ) -> Result<()> {
     info!("R-VPN Client v{}", env!("CARGO_PKG_VERSION"));
@@ -260,7 +314,7 @@ async fn run_client(
         _ => {}
     }
 
-    runtime_control::run(config, args.config, overrides, logging).await
+    runtime_control::run(config, args.config, overrides, startup_problem, logging).await
 }
 
 /// Run in SOCKS5 proxy mode (Brook-style)

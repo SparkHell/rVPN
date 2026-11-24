@@ -106,7 +106,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             logging: rvpn_logging::LoggingConfig::default(),
-            server_address: "wss://localhost:443/api/v1/ws".to_string(),
+            server_address: default_server_address(),
             sni_hostname: None,
             identity_key_file: PathBuf::from("identity.key"),
             server_public_key: None,
@@ -177,26 +177,30 @@ impl ClientConfig {
         };
         let base = path.parent()
             .context("Configuration path has no parent directory")?;
-        config.logging.resolve_directory(base);
+        config.resolve_paths(base);
+        Ok(config)
+    }
+
+    pub(crate) fn resolve_paths(&mut self, base: &Path) {
+        self.logging.resolve_directory(base);
         for file in [
-            Some(&mut config.identity_key_file),
-            config.prekey_bundle.as_mut(),
-            Some(&mut config.data_dir),
-            Some(&mut config.server_identity.known_hosts_file),
-            config.split_tunnel.bypass_networks_file.as_mut(),
-            config.split_tunnel.bypass_domains_file.as_mut(),
-            config.split_tunnel.country_domains_file.as_mut(),
-            config.split_tunnel.tunnel_networks_file.as_mut(),
-            config.split_tunnel.tunnel_domains_file.as_mut(),
-            config.split_tunnel.ad_block_file.as_mut(),
-            config.split_tunnel.country_ips_file.as_mut(),
+            Some(&mut self.identity_key_file),
+            self.prekey_bundle.as_mut(),
+            Some(&mut self.data_dir),
+            Some(&mut self.server_identity.known_hosts_file),
+            self.split_tunnel.bypass_networks_file.as_mut(),
+            self.split_tunnel.bypass_domains_file.as_mut(),
+            self.split_tunnel.country_domains_file.as_mut(),
+            self.split_tunnel.tunnel_networks_file.as_mut(),
+            self.split_tunnel.tunnel_domains_file.as_mut(),
+            self.split_tunnel.ad_block_file.as_mut(),
+            self.split_tunnel.country_ips_file.as_mut(),
         ].into_iter().flatten() {
             *file = resolve_path(file, base);
         }
-        for server in &mut config.extra_servers {
+        for server in &mut self.extra_servers {
             server.prekey_bundle = resolve_path(&server.prekey_bundle, base);
         }
-        Ok(config)
     }
 }
 
@@ -210,8 +214,10 @@ pub fn resolve_path(path: &Path, base: &Path) -> PathBuf {
     }
 }
 
+pub(crate) const DEFAULT_SERVER_ADDRESS: &str = "wss://localhost:443/api/v1/ws";
+
 fn default_server_address() -> String {
-    "wss://localhost:443/api/v1/ws".to_string()
+    DEFAULT_SERVER_ADDRESS.to_string()
 }
 
 fn default_identity_key_file() -> PathBuf {

@@ -29,6 +29,7 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 
 pub struct ControlPanel {
     path: PathBuf,
+    setup_listen_override: Option<String>,
     active: std::sync::RwLock<(ClientConfig, String)>,
     writes: Mutex<()>,
     runtime_error: std::sync::Mutex<Option<String>>,
@@ -40,6 +41,12 @@ pub struct ApplyRequest {
     pub config: ClientConfig,
     pub revision: String,
     pub reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+pub(crate) fn setup_config() -> ClientConfig {
+    let mut config = ClientConfig::default();
+    config.dashboard.enabled = true;
+    config
 }
 
 fn revision(bytes: &[u8]) -> String {
@@ -275,7 +282,7 @@ mod tests {
         std::fs::write(&path, if extension == "json" { "{}" } else { "" }).unwrap();
         let mut active = ClientConfig::default();
         active.dashboard.enabled = true;
-        Arc::new(ControlPanel::new(path, active).unwrap())
+        Arc::new(ControlPanel::new(path, active, None).unwrap())
     }
 
     #[tokio::test]
@@ -555,6 +562,10 @@ impl ControlPanel {
         *self.runtime_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    pub fn set_dashboard(&self, dashboard: crate::config::DashboardConfig) {
+        self.active.write().unwrap_or_else(|e| e.into_inner()).0.dashboard = dashboard;
+    }
+
     fn peer_allowed(&self, peer: SocketAddr) -> bool {
         let active = self.active.read().unwrap_or_else(|e| e.into_inner());
         active.0.dashboard.enabled
@@ -577,10 +588,11 @@ impl ControlPanel {
         Ok(stats)
     }
 
-    pub fn new(path: PathBuf, active: ClientConfig) -> Result<Self> {
+    pub fn new(path: PathBuf, active: ClientConfig, setup_listen_override: Option<String>) -> Result<Self> {
         let bytes = std::fs::read(&path).context("无法读取控制面板配置文件")?;
         Ok(Self {
             path,
+            setup_listen_override,
             active: std::sync::RwLock::new((active, revision(&bytes))),
             writes: Mutex::new(()),
             runtime_error: std::sync::Mutex::new(None),
@@ -589,12 +601,11 @@ impl ControlPanel {
         })
     }
 
-    fn read(&self) -> Result<(Value, String)> {
-        let bytes = std::fs::read(&self.path)?;
+    fn parse_document(&self, bytes: &[u8]) -> Result<Value> {
         let input: Value = if self.path.extension().is_some_and(|ext| ext == "json") {
-            serde_json::from_slice(&bytes)?
+            serde_json::from_slice(bytes)?
         } else {
-            serde_json::to_value(toml::from_str::<toml::Value>(std::str::from_utf8(&bytes)?)?)?
+            serde_json::to_value(toml::from_str::<toml::Value>(std::str::from_utf8(bytes)?)?)?
         };
         // Normalize serde aliases (split_tunnel accepts both snake_case and
         // camelCase) before merging, avoiding duplicate fields on save.
@@ -632,18 +643,30 @@ impl ControlPanel {
             }
         }
         merge_defaults(&mut defaults, input);
-        Ok((defaults, revision(&bytes)))
+        Ok(defaults)
     }
 
     pub fn configuration(&self) -> Result<Value> {
-        let (config, revision) = self.read()?;
+        let bytes = std::fs::read(&self.path)?;
+        let revision = revision(&bytes);
+        let (mut config, config_error) = match self.parse_document(&bytes) {
+            Ok(config) => (config, false),
+            Err(_) => (serde_json::to_value(setup_config())?, true),
+        };
         let active = self.active.read().unwrap_or_else(|e| e.into_inner());
         let pending = revision != active.1;
         let running = &active.0;
+        let awaiting_import = running.dashboard.enabled && crate::runtime_control::awaits_server_import(running);
+        if awaiting_import && !pending {
+            if let Some(address) = &self.setup_listen_override {
+                config["dashboard"]["listen_address"] = json!(address);
+            }
+        }
         Ok(
             json!({"config":config, "revision":revision, "path":self.path,
-            "restart_required":false, "pending_changes":pending,
+            "restart_required":false, "pending_changes":pending, "config_error":config_error,
             "runtime":{"server_address":running.server_address,"tun":running.tun.enabled,
+                "awaiting_server_import":awaiting_import,
                 "socks5":running.socks5.listen_address,"http_proxy":running.http_proxy.listen_address,
                 "system_dns_supported":cfg!(any(windows, target_os = "linux", target_os = "macos")),
                 "dns_proxy":running.dns_proxy.effective_listener(),"dashboard":running.dashboard}, "version":env!("CARGO_PKG_VERSION")}),
@@ -684,6 +707,10 @@ impl ControlPanel {
             "server.import" => crate::server_link::prepare(&self.path, &request["config"],
                 request["link"].as_str().context("缺少服务器链接")?,
                 request["replace_primary"].as_bool().unwrap_or(false)),
+            "server.export" => {
+                let config = self.active.read().unwrap_or_else(|e| e.into_inner()).0.clone();
+                Ok(json!({"link":crate::server_link::export(&config)?}))
+            }
             "config.get" => self.configuration(),
             "config.validate" => {
                 validate(&request["config"])?;
@@ -694,7 +721,8 @@ impl ControlPanel {
                 let _lock = self.writes.lock().await;
                 let mut file_lock = fslock::LockFile::open(&self.path.with_extension("import.lock"))?;
                 anyhow::ensure!(file_lock.try_lock()?, "其他程序正在保存配置，请稍后再试");
-                let (_, current) = self.read()?;
+                let previous = std::fs::read(&self.path)?;
+                let current = revision(&previous);
                 anyhow::ensure!(
                     request["revision"].as_str() == Some(&current),
                     "配置已被其他页面或程序修改，请重新加载后再保存"
@@ -706,7 +734,6 @@ impl ControlPanel {
                 } else {
                     toml::to_string_pretty(&without_nulls(config))?
                 };
-                let previous = std::fs::read(&self.path)?;
                 // Preserve file permissions and replace atomically on every OS.
                 let parent = self.path.parent().context("配置文件没有父目录")?;
                 let mut file = tempfile::NamedTempFile::new_in(parent)?;

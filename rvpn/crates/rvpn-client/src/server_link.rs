@@ -1,15 +1,15 @@
 //! Import the versioned public deployment link into a configuration draft.
-use std::{io::Write, path::Path};
+use std::{io::{Read, Write}, path::Path};
 
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use rvpn_core::{crypto::X3DHPublicBundle, identity_pin};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use url::Url;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ServerLink {
     v: u8,
@@ -17,15 +17,11 @@ struct ServerLink {
     bundle: X3DHPublicBundle,
 }
 
-pub fn prepare(path: &Path, draft: &Value, link: &str, replace: bool) -> Result<Value> {
-    let (scheme, encoded) = link.trim().split_once("://").context("需要 rVPN:// 链接")?;
-    ensure!(
-        scheme.eq_ignore_ascii_case("rvpn") && encoded.len() <= 8192,
-        "无效的 rVPN 链接"
-    );
-    let data: ServerLink = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
-    ensure!(data.v == 1, "不支持的链接版本");
-    let url = Url::parse(&data.address)?;
+const MAX_ENCODED_LINK: usize = 8192;
+const MAX_BUNDLE_BYTES: u64 = 16384;
+
+fn validate_server(address: &str, bundle: &X3DHPublicBundle) -> Result<Url> {
+    let url = Url::parse(address)?;
     ensure!(
         url.scheme() == "wss"
             && url.host().is_some()
@@ -37,12 +33,41 @@ pub fn prepare(path: &Path, draft: &Value, link: &str, replace: bool) -> Result<
             && url.path() != "/",
         "需要带路径的 WSS 地址"
     );
-    let bundle = data.bundle;
     let key = VerifyingKey::from_bytes(&bundle.identity_key)?;
     key.verify_strict(
         &bundle.signed_prekey,
         &Signature::from_bytes(&bundle.prekey_signature),
     )?;
+    Ok(url)
+}
+
+pub fn export(config: &crate::config::ClientConfig) -> Result<String> {
+    let path = config.prekey_bundle.as_ref().context("请先导入并应用主服务器配置")?;
+    let metadata = path.metadata().context("无法读取主服务器预密钥包")?;
+    ensure!(metadata.is_file() && metadata.len() <= MAX_BUNDLE_BYTES, "预密钥包须为公开 JSON 文件");
+    let mut contents = Vec::new();
+    std::fs::File::open(path)?.take(MAX_BUNDLE_BYTES + 1).read_to_end(&mut contents)?;
+    ensure!(contents.len() as u64 <= MAX_BUNDLE_BYTES, "预密钥包过大");
+    let bundle: X3DHPublicBundle = serde_json::from_slice(&contents).context("主服务器预密钥包格式无效")?;
+    let address = validate_server(&config.server_address, &bundle)?.to_string();
+    if let Some(pin) = config.server_identity.fingerprint.as_deref().filter(|pin| !pin.is_empty()) {
+        ensure!(identity_pin::pins_match(pin, &bundle.identity_key)?, "主服务器预密钥包与已配置的指纹不匹配");
+    }
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&ServerLink { v: 1, address, bundle })?);
+    ensure!(encoded.len() <= MAX_ENCODED_LINK, "服务器链接过长");
+    Ok(format!("rVPN://{encoded}"))
+}
+
+pub fn prepare(path: &Path, draft: &Value, link: &str, replace: bool) -> Result<Value> {
+    let (scheme, encoded) = link.trim().split_once("://").context("需要 rVPN:// 链接")?;
+    ensure!(
+        scheme.eq_ignore_ascii_case("rvpn") && encoded.len() <= MAX_ENCODED_LINK,
+        "无效的 rVPN 链接"
+    );
+    let data: ServerLink = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
+    ensure!(data.v == 1, "不支持的链接版本");
+    let bundle = data.bundle;
+    let url = validate_server(&data.address, &bundle)?;
     let fingerprint = crate::identity_verification::compute_fingerprint(&bundle);
     let base = path.parent().context("缺少配置目录")?;
     let mut nodes = draft["server"].as_array().cloned().unwrap_or_default();
@@ -65,7 +90,7 @@ pub fn prepare(path: &Path, draft: &Value, link: &str, replace: bool) -> Result<
         match previous_path.metadata() {
             Ok(metadata) => {
                 ensure!(
-                    metadata.is_file() && metadata.len() <= 16384,
+                    metadata.is_file() && metadata.len() <= MAX_BUNDLE_BYTES,
                     "预密钥包须为公开 JSON 文件"
                 );
                 let previous: X3DHPublicBundle =

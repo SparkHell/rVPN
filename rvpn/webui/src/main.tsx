@@ -665,7 +665,11 @@ function Overview({
             </div>
             <div>
               <strong>主服务器</strong>
-              <code>{session?.runtime.server_address || '等待客户端信息'}</code>
+              <code>
+                {session?.runtime.awaiting_server_import
+                  ? '尚未配置服务器'
+                  : session?.runtime.server_address || '等待客户端信息'}
+              </code>
             </div>
           </div>
           <div className="endpoint-row">
@@ -1010,6 +1014,7 @@ function App() {
 
   const [page, setPage] = useState('overview')
   const [serverLink, setServerLink] = useState('')
+  const [exportedLink, setExportedLink] = useState('')
   const [replacePrimary, setReplacePrimary] = useState(false)
   const [draft, setDraft] = useState<Config | null>(null)
   const [base, setBase] = useState<Session | null>(null)
@@ -1083,6 +1088,29 @@ function App() {
       setNotice({ error: true, text: String(error) })
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function exportServer() {
+    setBusy(true)
+    setExportedLink('')
+    setNotice(null)
+    try {
+      const { link } = (await request('server.export')) as { link: string }
+      setExportedLink(link)
+    } catch (error) {
+      setNotice({ error: true, text: String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function copyExportedLink() {
+    try {
+      await navigator.clipboard.writeText(exportedLink)
+      setNotice({ text: '已复制 rVPN 链接。' })
+    } catch {
+      setNotice({ text: '请选中并手动复制导出的链接。' })
     }
   }
 
@@ -1160,6 +1188,7 @@ function App() {
         setBase(fresh)
         setSession(fresh)
         setDraft(structuredClone(fresh.config))
+        setExportedLink('')
         setNotice({ text: '配置已保存并应用，无需重启客户端。' })
         if (fresh.runtime.dashboard) {
           const destination = dashboardUrl(
@@ -1369,7 +1398,16 @@ function App() {
             </div>
           )}
           {page === 'overview' && stats?.last_tls && <p>最近一次 TLS 握手：{stats.last_tls}</p>}
-          {stats?.runtime_error && (
+          {session?.config_error ? (
+            <div className="notice error" role="alert">
+              <span>配置文件无法解析。请修改当前草稿或导入服务器链接，再点击「保存并应用」。</span>
+              {page !== 'connection' && (
+                <button className="button tertiary" onClick={() => navigate('connection')}>
+                  修复配置
+                </button>
+              )}
+            </div>
+          ) : stats?.runtime_error ? (
             <div className="notice error" role="alert">
               <ShieldCheck size={18} />
               <span>
@@ -1377,7 +1415,16 @@ function App() {
                 。你仍可修改配置并点击「保存并应用」恢复运行。
               </span>
             </div>
-          )}
+          ) : session?.runtime.awaiting_server_import ? (
+            <div className="notice" role="status">
+              <span>尚未配置服务器。导入 rVPN 链接并保存后，客户端将启动代理。</span>
+              {page !== 'connection' && (
+                <button className="button secondary" onClick={() => navigate('connection')}>
+                  导入服务器链接
+                </button>
+              )}
+            </div>
+          ) : null}
           {page === 'overview' ? (
             <Overview
               session={session}
@@ -1431,6 +1478,26 @@ function App() {
                       >
                         导入到草稿
                       </button>
+                    </div>
+                  </section>
+                )}
+                {page === 'connection' && !search && !session?.runtime.awaiting_server_import && (
+                  <section className="panel config-panel">
+                    <div className="panel-heading"><h2>导出主服务器链接</h2></div>
+                    <div className="fields">
+                      {exportedLink && (
+                        <label className="field wide">导出的 rVPN 链接
+                          <input readOnly value={exportedLink} onFocus={e => e.currentTarget.select()} />
+                        </label>
+                      )}
+                      <button className="button secondary" disabled={busy || !connected} onClick={() => void exportServer()}>
+                        生成链接
+                      </button>
+                      {exportedLink && (
+                        <button className="button tertiary" onClick={() => void copyExportedLink()}>
+                          复制链接
+                        </button>
+                      )}
                     </div>
                   </section>
                 )}
