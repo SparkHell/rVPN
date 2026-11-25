@@ -526,10 +526,17 @@ async fn saving_repaired_configuration_recovers_a_stopped_network() {
 
 #[tokio::test]
 async fn first_apply_starts_both_proxies_when_the_dns_port_is_busy() {
+    use hickory_proto::{
+        op::{Message as DnsMessage, MessageType, OpCode, Query},
+        rr::{Name, RecordType},
+    };
+
     let (_directory, mut child, panel, socks) = fixture(true);
     let pid = child.0.id();
     let (mut socket, mut current) = connect(panel).await;
-    let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // The blocker only reserves a port. Avoid registering it with the Windows
+    // I/O driver, where pending readiness polling can outlive socket closure.
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let dns = occupied.local_addr().unwrap();
     let http = address();
     let mut config = current["config"].clone();
@@ -538,6 +545,7 @@ async fn first_apply_starts_both_proxies_when_the_dns_port_is_busy() {
     config["http_proxy"]["listen_address"] = json!(http.to_string());
     config["dns_proxy"]["enabled"] = json!(true);
     config["dns_proxy"]["listen_address"] = json!(dns.to_string());
+    config["dns_proxy"]["custom_hosts"] = json!(["recovery.test 192.0.2.1"]);
 
     let saved = save(&mut socket, &mut current, config).await;
     assert_eq!(saved["ok"], true, "{saved}");
@@ -549,11 +557,30 @@ async fn first_apply_starts_both_proxies_when_the_dns_port_is_busy() {
 
     // Retry the saved settings when the UDP port is free, without restarting.
     drop(occupied);
+    drop(std::net::UdpSocket::bind(dns).expect("the test's UDP port must be free before retry"));
     let config = current["config"].clone();
     let saved = save(&mut socket, &mut current, config).await;
     assert_eq!(saved["ok"], true, "{saved}");
-    assert!(current["runtime"]["dns_warning"].is_null());
-    assert!(tokio::net::UdpSocket::bind(dns).await.is_err());
+    let warning = &current["runtime"]["dns_warning"];
+    assert!(warning.is_null(), "DNS did not recover on {dns}: {warning}");
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(dns).await.unwrap();
+    let mut query = DnsMessage::new(1, MessageType::Query, OpCode::Query);
+    query.add_query(Query::query(
+        Name::from_ascii("recovery.test.").unwrap(),
+        RecordType::A,
+    ));
+    client.send(&query.to_vec().unwrap()).await.unwrap();
+    let mut packet = [0; 512];
+    let size = tokio::time::timeout(Duration::from_secs(3), client.recv(&mut packet))
+        .await
+        .expect("recovered DNS proxy did not respond")
+        .unwrap();
+    let response = DnsMessage::from_vec(&packet[..size]).unwrap();
+    let [answer] = response.answers.as_slice() else {
+        panic!("expected one local DNS answer: {response:?}");
+    };
+    assert_eq!(answer.data.to_string(), "192.0.2.1");
     assert!(TcpStream::connect(socks).await.is_ok());
     assert!(TcpStream::connect(http).await.is_ok());
     assert!(child.0.try_wait().unwrap().is_none());
