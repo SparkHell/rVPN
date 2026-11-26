@@ -758,7 +758,7 @@ async fn handle_connection(
     // exactly as before.
     if let Some(decoy) = decoy {
         let mut stream = stream;
-        match pre_read_head(&mut stream).await {
+        match pre_read_head(&mut stream, &ws_path, &tun_path, &dns_path, &mux_path).await {
             HeadVerdict::WebSocket(buffered) => {
                 debug!("WebSocket upgrade from {} (decoy pre-read)", peer_addr);
                 let stream = RewindStream::new(buffered, stream);
@@ -809,17 +809,55 @@ const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 
 /// Outcome of pre-reading the HTTP request head on a decoy-enabled port.
 enum HeadVerdict {
-    /// Well-formed WebSocket upgrade; replay these bytes into tungstenite.
+    /// Well-formed WebSocket upgrade targeting a configured VPN endpoint.
     WebSocket(Vec<u8>),
-    /// Plain HTTP request; serve from the decoy site.
+    /// Plain HTTP request (or WebSocket upgrade to a non-VPN path); serve from decoy.
     Http(Vec<u8>),
     /// EOF, timeout, oversized, or malformed head — close silently.
     Drop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsEndpoint {
+    Tun,
+    Dns,
+    Mux,
+    Legacy,
+}
+
+fn match_ws_endpoint(
+    raw_target: &str,
+    ws_path: &str,
+    tun_path: &str,
+    dns_path: &str,
+    mux_path: &str,
+) -> Option<WsEndpoint> {
+    let path = raw_target.split('?').next().unwrap_or(raw_target);
+    let matches_prefix = |base: &str| {
+        path == base || path.starts_with(&format!("{}/", base.trim_end_matches('/')))
+    };
+    if matches_prefix(tun_path) {
+        Some(WsEndpoint::Tun)
+    } else if matches_prefix(dns_path) {
+        Some(WsEndpoint::Dns)
+    } else if matches_prefix(mux_path) {
+        Some(WsEndpoint::Mux)
+    } else if path == ws_path || path == format!("{}/", ws_path.trim_end_matches('/')) {
+        Some(WsEndpoint::Legacy)
+    } else {
+        None
+    }
+}
+
 /// Read from the stream until a complete HTTP request head has been
 /// buffered, then classify it.
-async fn pre_read_head<S>(stream: &mut S) -> HeadVerdict
+async fn pre_read_head<S>(
+    stream: &mut S,
+    ws_path: &str,
+    tun_path: &str,
+    dns_path: &str,
+    mux_path: &str,
+) -> HeadVerdict
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -848,15 +886,21 @@ where
         .flatten();
 
     match head {
-        Some(h) if h.is_websocket_upgrade => HeadVerdict::WebSocket(buf),
+        Some(h)
+            if h.is_websocket_upgrade
+                && match_ws_endpoint(&h.target, ws_path, tun_path, dns_path, mux_path).is_some() =>
+        {
+            HeadVerdict::WebSocket(buf)
+        }
         Some(_) => HeadVerdict::Http(buf),
         None => HeadVerdict::Drop,
     }
 }
 
 /// Perform the WebSocket handshake and route the connection to the VPN
-/// handler for its path. Unknown paths are accepted then dropped, exactly
-/// as before.
+/// handler for its path. Unknown paths are rejected with HTTP 404 before
+/// completing the WebSocket upgrade so active probers do not see a `101`
+/// followed by an immediate drop.
 #[allow(clippy::too_many_arguments)]
 async fn accept_and_dispatch_ws<S>(
     stream: S,
@@ -873,55 +917,85 @@ async fn accept_and_dispatch_ws<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Track the request path using std::sync::Mutex since the callback is synchronous
+    let endpoint = Arc::new(std::sync::Mutex::new(None));
+    let endpoint_clone = endpoint.clone();
     let request_path = Arc::new(std::sync::Mutex::new(String::new()));
     let request_path_clone = request_path.clone();
 
-    let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-        // Extract the path from the request URI
+    let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
         let path = req.uri().path().to_string();
-        if let Ok(mut guard) = request_path_clone.lock() {
-            *guard = path;
+        if let Some(matched) =
+            match_ws_endpoint(&path, &ws_path, &tun_path, &dns_path, &mux_path)
+        {
+            if let Ok(mut guard) = endpoint_clone.lock() {
+                *guard = Some(matched);
+            }
+            if let Ok(mut guard) = request_path_clone.lock() {
+                *guard = path;
+            }
+            Ok(response)
+        } else {
+            warn!(
+                "Rejecting WebSocket upgrade on unknown path '{}' from {}",
+                path, peer_addr
+            );
+            let mut err = tokio_tungstenite::tungstenite::http::Response::new(Some(
+                "Not Found".to_string(),
+            ));
+            *err.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::NOT_FOUND;
+            Err(err)
         }
-        Ok(response)
     };
 
     let ws_result = tokio_tungstenite::accept_hdr_async(stream, callback).await;
 
     match ws_result {
         Ok(ws) => {
-            // WebSocket upgrade successful
             let path = request_path.lock().unwrap().clone();
+            let matched = *endpoint.lock().unwrap();
             info!("WebSocket upgrade accepted from {} on path: {}", peer_addr, path);
 
-            // Route based on path
-            if path == tun_path || path.starts_with(&format!("{}/", tun_path)) {
-                if let Err(e) = tun_handler.read().await.handle_connection(ws, peer_addr).await {
-                    debug!("TUN handler error for {}: {}", peer_addr, e);
+            match matched {
+                Some(WsEndpoint::Tun) => {
+                    if let Err(e) = tun_handler.read().await.handle_connection(ws, peer_addr).await {
+                        debug!("TUN handler error for {}: {}", peer_addr, e);
+                    }
                 }
-            } else if path == dns_path || path.starts_with(&format!("{}/", dns_path)) {
-                if let Err(e) = dns_handler.read().await.handle_connection(ws, peer_addr).await {
-                    debug!("DNS handler error for {}: {}", peer_addr, e);
+                Some(WsEndpoint::Dns) => {
+                    if let Err(e) = dns_handler.read().await.handle_connection(ws, peer_addr).await {
+                        debug!("DNS handler error for {}: {}", peer_addr, e);
+                    }
                 }
-            } else if path == mux_path || path.starts_with(&format!("{}/", mux_path)) {
-                // SOCKS5 multiplexed connection: single WebSocket, multiple TCP flows
-                if let Err(e) = mux_handler.read().await.handle_connection(ws, peer_addr, None, rvpn_server::config::TunNetworkConfig::default()).await {
-                    debug!("MUX handler error for {}: {}", peer_addr, e);
+                Some(WsEndpoint::Mux) => {
+                    if let Err(e) = mux_handler
+                        .read()
+                        .await
+                        .handle_connection(
+                            ws,
+                            peer_addr,
+                            None,
+                            rvpn_server::config::TunNetworkConfig::default(),
+                        )
+                        .await
+                    {
+                        debug!("MUX handler error for {}: {}", peer_addr, e);
+                    }
                 }
-            } else if path == ws_path || path == format!("{}/", ws_path.trim_end_matches('/')) {
-                if let Err(e) = handler.read().await.handle_ws_connection(ws, peer_addr).await {
-                    debug!("Handler error for {}: {}", peer_addr, e);
+                Some(WsEndpoint::Legacy) => {
+                    if let Err(e) = handler.read().await.handle_ws_connection(ws, peer_addr).await {
+                        debug!("Handler error for {}: {}", peer_addr, e);
+                    }
                 }
-            } else {
-                // Unknown path - close connection
-                warn!("WebSocket connection on unknown path '{}' from {}", path, peer_addr);
+                None => {
+                    warn!("WebSocket connection on unknown path '{}' from {}", path, peer_addr);
+                }
             }
 
             info!("Connection from {} closed", peer_addr);
         }
         Err(e) => {
-            // Not a WebSocket - handle as HTTP
-            debug!("Not a WebSocket from {}: {}", peer_addr, e);
+            debug!("Not an accepted VPN WebSocket from {}: {}", peer_addr, e);
         }
     }
 
@@ -1211,4 +1285,67 @@ fn prekey_bundle(
     info!("Distribute public bundle {} to clients; private key files stay on the server", output_path.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod ws_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_vpn_websocket_paths_and_rejects_unknown() {
+        let ws = "/cw/ws";
+        let tun = "/cw/ws/tun";
+        let dns = "/cw/ws/dns";
+        let mux = "/cw/ws/mux";
+
+        assert_eq!(match_ws_endpoint("/cw/ws", ws, tun, dns, mux), Some(WsEndpoint::Legacy));
+        assert_eq!(match_ws_endpoint("/cw/ws/?x=1", ws, tun, dns, mux), Some(WsEndpoint::Legacy));
+        assert_eq!(match_ws_endpoint("/cw/ws/mux", ws, tun, dns, mux), Some(WsEndpoint::Mux));
+        assert_eq!(match_ws_endpoint("/cw/ws/dns/1", ws, tun, dns, mux), Some(WsEndpoint::Dns));
+        assert_eq!(match_ws_endpoint("/cw/ws/tun", ws, tun, dns, mux), Some(WsEndpoint::Tun));
+        assert_eq!(match_ws_endpoint("/", ws, tun, dns, mux), None);
+        assert_eq!(match_ws_endpoint("/cw/ws/other", ws, tun, dns, mux), None);
+        assert_eq!(match_ws_endpoint("/cw/ws2", ws, tun, dns, mux), None);
+    }
+
+    #[tokio::test]
+    async fn unknown_websocket_path_is_rejected_with_404_before_upgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let cfg = ServerConfig::default();
+        let handler = Arc::new(RwLock::new(VpnHandler::new(cfg.clone()).unwrap()));
+        let tun_handler = Arc::new(RwLock::new(TunHandler::new(cfg.clone(), None).unwrap()));
+        let dns_handler = Arc::new(RwLock::new(DnsHandler::new(cfg.clone()).unwrap()));
+        let mux_handler = Arc::new(RwLock::new(MultiplexerHandler::new(cfg.clone()).unwrap()));
+
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            accept_and_dispatch_ws(
+                stream,
+                peer,
+                handler,
+                tun_handler,
+                dns_handler,
+                mux_handler,
+                "/api/v1/ws".into(),
+                "/api/v1/ws/tun".into(),
+                "/api/v1/ws/dns".into(),
+                "/api/v1/ws/mux".into(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = tokio_tungstenite::connect_async(format!("ws://{addr}/probe"))
+            .await
+            .unwrap_err();
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status(), 404);
+            }
+            other => panic!("expected HTTP 404 rejection, got {other:?}"),
+        }
+        server.await.unwrap();
+    }
 }

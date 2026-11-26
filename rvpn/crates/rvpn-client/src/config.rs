@@ -181,7 +181,7 @@ impl ClientConfig {
         Ok(config)
     }
 
-    pub(crate) fn resolve_paths(&mut self, base: &Path) {
+    pub fn resolve_paths(&mut self, base: &Path) {
         self.logging.resolve_directory(base);
         for file in [
             Some(&mut self.identity_key_file),

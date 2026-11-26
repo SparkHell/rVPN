@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::lookup_host;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
@@ -160,7 +160,7 @@ async fn cached_addresses(cache: &DnsCache, key: &str) -> Option<Vec<SocketAddr>
 pub struct VpnHandler {
     #[allow(dead_code)]
     config: ServerConfig,
-    rate_limiter: RwLock<RateLimiter>,
+    rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
     dns_cache: DnsCache,
     x3dh_responder: Option<X3DHResponder>,
 }
@@ -235,10 +235,10 @@ impl VpnHandler {
 
         Ok(Self {
             config,
-            rate_limiter: RwLock::new(RateLimiter::new(
+            rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new(
                 max_connections_per_ip,
                 max_handshakes_per_minute,
-            )),
+            ))),
             dns_cache: new_dns_cache(),
             x3dh_responder,
         })
@@ -289,14 +289,11 @@ impl VpnHandler {
     pub async fn handle_connection(&self, stream: TcpStream, peer_addr: SocketAddr) -> Result<()> {
         debug!("New connection from {}", peer_addr);
 
-        // Rate limit check
-        {
-            let mut limiter = self.rate_limiter.write().await;
-            if !limiter.check_and_record(&peer_addr.ip()) {
-                debug!("Rate limited: {}", peer_addr);
-                return Ok(());
-            }
-        }
+        // Rate limit check (concurrent connections + per-minute handshakes)
+        let Some(_rate_guard) = acquire_rate_limit(&self.rate_limiter, peer_addr.ip()) else {
+            debug!("Rate limited: {}", peer_addr);
+            return Ok(());
+        };
 
         // Perform WebSocket handshake
         let ws_stream = accept_async(stream)
@@ -317,14 +314,11 @@ impl VpnHandler {
     {
         debug!("New WebSocket connection from {}", peer_addr);
 
-        // Rate limit check
-        {
-            let mut limiter = self.rate_limiter.write().await;
-            if !limiter.check_and_record(&peer_addr.ip()) {
-                debug!("Rate limited: {}", peer_addr);
-                return Ok(());
-            }
-        }
+        // Rate limit check (concurrent connections + per-minute handshakes)
+        let Some(_rate_guard) = acquire_rate_limit(&self.rate_limiter, peer_addr.ip()) else {
+            debug!("Rate limited: {}", peer_addr);
+            return Ok(());
+        };
 
         self.handle_websocket(ws_stream, peer_addr).await
     }
@@ -1312,12 +1306,14 @@ impl VpnHandler {
     }
 }
 
-/// Simple rate limiter
+/// Simple rate limiter tracking both per-minute handshake attempts and active
+/// concurrent connections per source IP.
 #[derive(Debug)]
 pub struct RateLimiter {
     max_per_minute: u32,
     max_connections: u32,
     requests: std::collections::HashMap<std::net::IpAddr, (u32, Instant)>,
+    active_connections: std::collections::HashMap<std::net::IpAddr, u32>,
 }
 
 impl RateLimiter {
@@ -1326,25 +1322,38 @@ impl RateLimiter {
             max_per_minute: max_handshakes_per_minute,
             max_connections: max_connections_per_ip,
             requests: std::collections::HashMap::new(),
+            active_connections: std::collections::HashMap::new(),
         }
     }
 
-    pub fn check(&self, ip: &std::net::IpAddr) -> bool {
-        let now = Instant::now();
+    fn active_count(&self, ip: &std::net::IpAddr) -> u32 {
+        self.active_connections.get(ip).copied().unwrap_or(0)
+    }
 
+    pub fn check(&self, ip: &std::net::IpAddr) -> bool {
+        if self.active_count(ip) >= self.max_connections {
+            return false;
+        }
+        let now = Instant::now();
         if let Some((count, start)) = self.requests.get(ip) {
             let elapsed = now.duration_since(*start);
             if elapsed.as_secs() < 60 {
-                return *count < self.max_per_minute && *count < self.max_connections;
+                return *count < self.max_per_minute;
             }
         }
-
-        true
+        self.max_per_minute > 0
     }
 
     /// Atomically check rate limit and record the request if allowed.
     /// Performs lazy cleanup of stale entries (older than 60 seconds).
     pub fn check_and_record(&mut self, ip: &std::net::IpAddr) -> bool {
+        if self.max_connections == 0 || self.max_per_minute == 0 {
+            return false;
+        }
+        if self.active_count(ip) >= self.max_connections {
+            return false;
+        }
+
         let now = Instant::now();
 
         // Lazy cleanup: remove stale entries older than 60 seconds
@@ -1352,13 +1361,14 @@ impl RateLimiter {
             now.duration_since(*start).as_secs() < 60
         });
 
-        if let Some((count, start)) = self.requests.get(ip) {
+        if let Some((count, start)) = self.requests.get_mut(ip) {
             let elapsed = now.duration_since(*start);
             if elapsed.as_secs() < 60 {
-                if *count >= self.max_per_minute || *count >= self.max_connections {
+                if *count >= self.max_per_minute {
                     return false;
                 }
-                self.requests.insert(*ip, (count + 1, now));
+                // Preserve the fixed 60s window start instead of resetting it.
+                *count += 1;
                 return true;
             }
         }
@@ -1366,6 +1376,28 @@ impl RateLimiter {
         // New entry or expired window
         self.requests.insert(*ip, (1, now));
         true
+    }
+
+    /// Check rate/connection limits, record a handshake, and increment active
+    /// connection count for `ip`. Call `release_connection` when the session ends.
+    pub fn try_acquire(&mut self, ip: std::net::IpAddr) -> bool {
+        if !self.check_and_record(&ip) {
+            return false;
+        }
+        let active = self.active_connections.entry(ip).or_insert(0);
+        *active += 1;
+        true
+    }
+
+    /// Decrement active connection count when a connection finishes.
+    pub fn release_connection(&mut self, ip: &std::net::IpAddr) {
+        if let Some(active) = self.active_connections.get_mut(ip) {
+            if *active <= 1 {
+                self.active_connections.remove(ip);
+            } else {
+                *active -= 1;
+            }
+        }
     }
 
     pub fn record(&mut self, ip: std::net::IpAddr) {
@@ -1389,6 +1421,34 @@ impl Default for RateLimiter {
     }
 }
 
+struct RateLimitGuard {
+    limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    ip: IpAddr,
+}
+
+impl Drop for RateLimitGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.limiter.lock() {
+            guard.release_connection(&self.ip);
+        }
+    }
+}
+
+fn acquire_rate_limit(
+    limiter: &Arc<std::sync::Mutex<RateLimiter>>,
+    ip: IpAddr,
+) -> Option<RateLimitGuard> {
+    let mut guard = limiter.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.try_acquire(ip) {
+        Some(RateLimitGuard {
+            limiter: Arc::clone(limiter),
+            ip,
+        })
+    } else {
+        None
+    }
+}
+
 /// Multiplexed VPN handler - One WebSocket = Multiple TCP connections
 /// Uses X3DH handshake + Double Ratchet encryption
 /// Frame format: [flow_id: u32 (BE)][payload_len: u16 (BE)][payload: bytes]
@@ -1397,6 +1457,7 @@ pub struct MultiplexerHandler {
     config: ServerConfig,
     x3dh_responder: Option<Arc<X3DHResponder>>,
     dns_cache: DnsCache,
+    rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
 }
 
 impl MultiplexerHandler {
@@ -1459,10 +1520,17 @@ impl MultiplexerHandler {
             None
         };
 
+        let max_connections_per_ip = config.rate_limit.max_connections_per_ip;
+        let max_handshakes_per_minute = config.rate_limit.max_handshakes_per_minute;
+
         Ok(Self {
             config,
             x3dh_responder,
             dns_cache: new_dns_cache(),
+            rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new(
+                max_connections_per_ip,
+                max_handshakes_per_minute,
+            ))),
         })
     }
 
@@ -1517,6 +1585,11 @@ impl MultiplexerHandler {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let Some(_rate_guard) = acquire_rate_limit(&self.rate_limiter, peer_addr.ip()) else {
+            debug!("MUX: Rate limited {}", peer_addr);
+            return Ok(());
+        };
+
         info!("MUX: New multiplexed connection from {}", peer_addr);
 
         let mut tun_config = tun_config;
@@ -1905,7 +1978,7 @@ where
             } else {
                 warn!("Cannot register client {} - tun_server is None!", allocated_ip);
             }
-        } else {
+        } else if self.tun_config.enabled {
             warn!("Cannot register client - allocated_ip_for_tun is None!");
         }
 
@@ -3815,7 +3888,7 @@ use rvpn_core::protocol::message::{DnsQuery as ProtoDnsQuery, DnsResponse as Pro
 /// Handler for DNS-over-WebSocket connections
 pub struct DnsHandler {
     x3dh_responder: Option<X3DHResponder>,
-    rate_limiter: RwLock<RateLimiter>,
+    rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
 }
 
 impl DnsHandler {
@@ -3857,10 +3930,10 @@ impl DnsHandler {
 
         Ok(Self {
             x3dh_responder,
-            rate_limiter: RwLock::new(RateLimiter::new(
+            rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new(
                 config.rate_limit.max_connections_per_ip,
                 config.rate_limit.max_handshakes_per_minute,
-            )),
+            ))),
         })
     }
 
@@ -3874,14 +3947,11 @@ impl DnsHandler {
     {
         info!("DNS WebSocket connection from {}", peer_addr);
 
-        // Rate limit check
-        {
-            let limiter = self.rate_limiter.read().await;
-            if !limiter.check(&peer_addr.ip()) {
-                debug!("DNS handler: rate limited {}", peer_addr);
-                return Ok(());
-            }
-        }
+        // Rate limit check (concurrent connections + per-minute handshakes)
+        let Some(_rate_guard) = acquire_rate_limit(&self.rate_limiter, peer_addr.ip()) else {
+            debug!("DNS handler: rate limited {}", peer_addr);
+            return Ok(());
+        };
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
 

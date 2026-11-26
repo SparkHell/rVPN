@@ -1,16 +1,115 @@
 //! The panel lives on the process runtime; every VPN generation owns a separate
 //! runtime. Dropping that runtime cancels all nested relay/DNS/pool tasks before
 //! listeners are reused, including tasks spawned by library components.
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::id as process_id, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use tokio::sync::{mpsc, oneshot, watch};
+use tracing::{error, info};
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 use crate::{
     config::ClientConfig,
     control_panel::{ApplyRequest, ControlPanel},
     dashboard,
+    server_pool::parse_server_url,
+    service,
+    socks5::Socks5Proxy,
 };
+
+/// CLI arguments
+#[derive(Parser, Debug)]
+#[command(name = "rvpn")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(about = "R-VPN Client - A stealth VPN with Double Ratchet encryption")]
+pub struct Args {
+    /// Configuration file (defaults to client.toml beside the executable)
+    #[arg(short, long, default_value = "client.toml")]
+    pub config: PathBuf,
+
+    /// Server address (overrides config)
+    #[arg(long)]
+    pub server: Option<String>,
+
+    /// Server prekey bundle JSON (relative paths are resolved beside the executable)
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
+
+    /// TLS fingerprint for DPI resistance (chrome, firefox, safari, ios, android, edge, none)
+    #[arg(long)]
+    pub fingerprint: Option<String>,
+
+    /// Enable the web control panel and set its listen address (e.g. 127.0.0.1:9800)
+    #[arg(long)]
+    pub dashboard_listen: Option<String>,
+
+    /// Enable verbose logging
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Subcommands
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+/// Subcommands
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Import a public rVPN deployment link
+    Import {
+        link: String,
+        #[arg(long)]
+        replace_primary: bool,
+    },
+    /// Install or manage the system service (requires administrator/root)
+    Service {
+        #[command(subcommand)]
+        action: service::ServiceAction,
+    },
+    /// Generate new identity key
+    Keygen {
+        /// Key type (ed25519)
+        #[arg(long, default_value = "ed25519")]
+        key_type: String,
+        /// Output file path
+        #[arg(short, long, default_value = "identity.key")]
+        output: PathBuf,
+    },
+    /// Extract public key from identity file
+    Pubkey {
+        /// Input identity key file
+        #[arg(short, long)]
+        key: PathBuf,
+        /// Output public key file
+        #[arg(short, long, default_value = "public.key")]
+        output: PathBuf,
+    },
+    /// Show VPN status
+    Status {
+        /// Number of historical entries to show
+        #[arg(short, long, default_value_t = 5)]
+        entries: usize,
+    },
+}
+
+#[cfg(target_os = "linux")]
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> OnDrop<F> {
+    fn new(f: F) -> Self {
+        Self(f)
+    }
+}
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        self.0();
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct Overrides {
@@ -71,10 +170,10 @@ impl Worker {
                             if config.tun.enabled {
                                 // Validate key/bundle files before acknowledging a TUN generation.
                                 crate::server_pool::ServerPool::from_config(&config).await?;
-                                crate::run_tun(config, ready_tx).await
+                                run_tun(config, ready_tx).await
                             } else {
                                 crate::websocket::configure_endpoint_dns(&config)?;
-                                crate::run_socks5(config, ready_tx, allow_dns_failure).await
+                                run_socks5(config, ready_tx, allow_dns_failure).await
                             }
                         } => result,
                     }
@@ -300,11 +399,11 @@ pub async fn run(
     panel.attach_applier(sender);
     let state = dashboard::global().unwrap_or_else(|| Arc::new(dashboard::DashboardState::new()));
     let sampler = tokio::spawn(dashboard::run_sampler(state.clone()));
-    let _sampler_guard = crate::OnDrop::new(move || sampler.abort());
+    let _sampler_guard = OnDrop::new(move || sampler.abort());
     let mut listener = socket.map(|socket| serve_panel(socket, &config, state.clone(), panel.clone()));
     let (shutdown, mut stopped) = watch::channel(false);
-    let signals = tokio::spawn(crate::handle_signals(shutdown));
-    let _signal_guard = crate::OnDrop::new(move || signals.abort());
+    let signals = tokio::spawn(handle_signals(shutdown));
+    let _signal_guard = OnDrop::new(move || signals.abort());
     let mut startup_error = None;
     let initial_network = if let Some(problem) = startup_problem {
         Err(anyhow::Error::msg(problem))
@@ -451,4 +550,304 @@ pub async fn run(
         worker.stop().await;
     }
     Ok(())
+}
+
+/// Run in SOCKS5 proxy mode (Brook-style)
+async fn run_socks5(
+    config: ClientConfig,
+    ready: oneshot::Sender<Option<String>>,
+    allow_dns_failure: bool,
+) -> Result<()> {
+    info!("Starting R-VPN Client in SOCKS5 mode (Brook-style)");
+    info!("Server: {}", config.server_address);
+
+    // Save PID file
+    let pid_file = config.data_dir.join("rvpn.pid");
+    tokio::fs::create_dir_all(&config.data_dir).await?;
+    tokio::fs::write(&pid_file, process_id().to_string()).await?;
+    info!("Saved PID to {:?}", pid_file);
+
+    // Set up cleanup on exit
+    let pid_file_clone = pid_file.clone();
+    let _guard = OnDrop::new(move || {
+        let _ = std::fs::remove_file(&pid_file_clone);
+    });
+
+    let socks_addr: SocketAddr = config.socks5.listen_address.parse()?;
+
+    // Initialize stats manager for historical tracking
+    let stats_manager = crate::stats::init_global_stats_manager_with_dir(config.data_dir.clone()).await;
+    let _stats_handle = stats_manager.start_collection();
+
+    // Create SOCKS5 proxy (each connection manages its own WebSocket)
+    let proxy = Socks5Proxy::new(socks_addr, &config).await?;
+    // Bind every listener before reporting readiness, so a failed reload can
+    // restore the previous generation instead of silently losing a proxy.
+    let socks_listener = tokio::net::TcpListener::bind(socks_addr).await
+        .with_context(|| format!("Failed to bind SOCKS5 proxy to {socks_addr}"))?;
+
+    // Optionally start HTTP proxy (shares mux tunnel with SOCKS5)
+    if config.http_proxy.enabled {
+        let http_listen: SocketAddr = config.http_proxy.listen_address.parse().with_context(|| {
+            format!(
+                "Invalid HTTP proxy listen address: {}",
+                config.http_proxy.listen_address
+            )
+        })?;
+
+        let http_proxy = crate::http_proxy::HttpProxy::new(
+            http_listen,
+            &config,
+            proxy.identity_key(),
+            proxy.server_bundle(),
+            proxy.split_tunnel(),
+            proxy.dns_resolver(),
+            proxy.mux_tunnel(),
+            proxy.tunnel_pools(),
+            proxy.pool(),
+            proxy.router(),
+        )
+        .await?;
+
+        let listener = tokio::net::TcpListener::bind(http_listen).await
+            .with_context(|| format!("Failed to bind HTTP proxy to {http_listen}"))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = http_proxy.run_with_listener(listener).await {
+                error!("HTTP proxy fatal error: {}", e);
+            }
+        });
+    }
+
+    let mut dns_warning = None;
+    let (_system_dns, dns) = if config.dns_proxy.enabled {
+        let start_dns = async {
+            let takeover = config.dns_proxy.takes_over_system_dns();
+            #[cfg(target_os = "macos")]
+            anyhow::ensure!(!takeover || unsafe { libc::geteuid() } == 0,
+                "macOS 系统 DNS 接管需要管理员权限。请从终端重新运行 ./rvpn 并授权，或关闭接管并使用高位 DNS 端口");
+
+            let (dns, primary, secondary) = bind_dns_proxy(&config, &proxy).await?;
+            #[cfg(windows)]
+            let system_dns = takeover.then(crate::windows_dns::SystemDns::take_over).transpose()?;
+            #[cfg(target_os = "macos")]
+            let system_dns = takeover.then(crate::macos_dns::SystemDns::take_over).transpose()?;
+            #[cfg(target_os = "linux")]
+            let system_dns = if takeover {
+                crate::linux_dns::SystemDns::install(config.dns_proxy.effective_listener().parse()?, true)?
+            } else {
+                None
+            };
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+            let system_dns: Option<()> = { let _ = takeover; None };
+            Ok::<_, anyhow::Error>((system_dns, Some(tokio::spawn(dns.run_with_sockets(primary, secondary)))))
+        };
+        match start_dns.await {
+            Ok(active) => active,
+            Err(error) if allow_dns_failure => {
+                dns_warning = Some(format!("DNS 未启动，代理已启动。{error:#}"));
+                (None, None)
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        (None, None)
+    };
+    let _ = ready.send(dns_warning);
+    tokio::select! {
+        result = proxy.run_with_listener(socks_listener) => result,
+        result = async {
+            match dns {
+                Some(task) => task.await.context("DNS proxy task stopped")?,
+                None => std::future::pending().await,
+            }
+        } => result,
+    }
+}
+
+/// Check delivery to each bound socket before changing any adapter. Peeking
+/// preserves DNS requests that arrived before our empty probe datagram.
+pub(crate) async fn check_dns_loopback(listener: &tokio::net::UdpSocket) -> Result<()> {
+    let address = listener.local_addr()?;
+    let probe = tokio::net::UdpSocket::bind(SocketAddr::new(address.ip(), 0)).await?;
+    probe.send_to(&[], address).await?;
+    let mut packet = vec![0; 65535];
+    tokio::time::timeout(Duration::from_secs(2), listener.peek_from(&mut packet))
+        .await.with_context(|| format!("DNS 回环监听 {address} 未收到探测数据"))??;
+    Ok(())
+}
+
+async fn bind_dns_proxy(
+    config: &ClientConfig,
+    proxy: &Socks5Proxy,
+) -> Result<(Arc<crate::dns_proxy::DnsProxy>, tokio::net::UdpSocket, Option<tokio::net::UdpSocket>)> {
+    let address: SocketAddr = config.dns_proxy.effective_listener().parse()?;
+    let nameservers = rvpn_split_tunnel::dns_cache::DnsUpstreams::new(&config.dns_proxy.nameservers)?;
+    nameservers.validate_listener(address)?;
+    let extra_hosts = config.extra_servers.iter().map(|server| parse_server_url(&server.address).0).collect();
+    let doh_hosts = config.dns_proxy.nameservers.iter()
+        .filter_map(|endpoint| rvpn_split_tunnel::dns_cache::doh_upstream_hostname(endpoint)).collect();
+    let dns = Arc::new(crate::dns_proxy::DnsProxy::new(
+        address, proxy.server_host().to_string(), proxy.server_port(), proxy.server_path(),
+        proxy.tls_fingerprint(), proxy.identity_key(), proxy.server_bundle(), proxy.split_tunnel(),
+        proxy.dns_resolver(), nameservers, extra_hosts, doh_hosts, config.dns_proxy.host_records()?,
+    ));
+    let socket = bind_dns_listener(address).await?;
+    let secondary = if config.dns_proxy.takes_over_system_dns() {
+        let address = crate::config::DnsProxyConfig::SYSTEM_DNS_V6.parse()?;
+        let secondary = bind_dns_listener(address).await?;
+        tokio::try_join!(check_dns_loopback(&socket), check_dns_loopback(&secondary))?;
+        Some(secondary)
+    } else { None };
+    Ok((dns, socket, secondary))
+}
+
+async fn bind_dns_listener(address: SocketAddr) -> Result<tokio::net::UdpSocket> {
+    tokio::net::UdpSocket::bind(address).await.map_err(|error| {
+        let detail = match error.kind() {
+            std::io::ErrorKind::AddrInUse => "端口已占用",
+            std::io::ErrorKind::PermissionDenied => "权限不足",
+            _ => "无法绑定",
+        };
+        anyhow::Error::new(error).context(format!("DNS UDP 监听 {address} 失败，{detail}"))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_tun(_: ClientConfig, _: oneshot::Sender<Option<String>>) -> Result<()> {
+    anyhow::bail!("Managed desktop TUN routing and DNS currently require Linux")
+}
+
+#[cfg(target_os = "linux")]
+async fn run_tun(mut config: ClientConfig, ready: oneshot::Sender<Option<String>>) -> Result<()> {
+    use crate::tun::TunDevice;
+    use crate::tunnel::VpnTunnel;
+
+    anyhow::ensure!(config.extra_servers.is_empty() && config.routing.is_empty(),
+        "Multi-server routing is supported only in proxy mode");
+    anyhow::ensure!(config.dns_proxy.enabled, "TUN requires the local DNS proxy for domain rules");
+    if config.dns_proxy.nameservers.is_empty() {
+        config.dns_proxy.nameservers.clone_from(&config.tun.dns_servers);
+    }
+    crate::websocket::configure_endpoint_dns(&config)?;
+    let listen: SocketAddr = config.dns_proxy.effective_listener().parse()?;
+    anyhow::ensure!(listen.is_ipv4() && listen.ip().is_loopback() && listen.port() == 53,
+        "TUN DNS proxy must listen on an IPv4 loopback address at port 53");
+
+    let engine = Socks5Proxy::new(listen, &config).await?;
+    let split = engine.split_tunnel();
+    let dns_resolver = engine.dns_resolver();
+    let (host, port, path) = parse_server_url(&config.server_address);
+    let path = path.trim_end_matches('/');
+    let tun_path = if path.ends_with("/tun") { path.to_owned() } else { format!("{path}/tun") };
+    let mut upstream_ips = Vec::new();
+    for upstream in &config.dns_proxy.nameservers {
+        if upstream.starts_with("https://") {
+            let url = url::Url::parse(upstream)?;
+            let hostname = url.host_str().context("Missing DoH host")?.trim_matches(['[', ']']);
+            upstream_ips.extend(dns_resolver.resolve(hostname, url.port().unwrap_or(443)).await?.into_iter().map(|addr| addr.ip()));
+        } else if let Ok(address) = upstream.parse::<SocketAddr>() {
+            upstream_ips.push(address.ip());
+        } else {
+            upstream_ips.push(upstream.parse()?);
+        }
+    }
+
+    let (dns, socket, secondary) = bind_dns_proxy(&config, &engine).await?;
+    dns.prepare_for_tun();
+    let connection = async {
+        let resumption = rvpn_tls::ResumptionStore::new();
+        let mut ready = Some(ready);
+        let mut failures = 0;
+        loop {
+            let session = async {
+                // Connect before capturing system routes. Record all IPs used to reach
+                // the TLS frontend, including ECH alternative addresses.
+                let tunnel = VpnTunnel::connect(&host, port, &tun_path, config.tls_fingerprint,
+                    config.sni_hostname.as_deref(), &config.identity_key_file, config.prekey_bundle.as_deref(),
+                    &config.server_identity, Some(&resumption)).await?;
+                let (virtual_ip, server_mtu) = {
+                    let guard = tunnel.read().await;
+                    let address = guard.virtual_ip.context("TUN server did not assign an IPv4 address")?;
+                    info!(%address, gateway = ?guard.gateway_ip, mtu = guard.mtu, "TUN address assigned");
+                    (address, guard.mtu)
+                };
+                let mut tun_config = config.tun.clone();
+                tun_config.mtu = tun_config.mtu.min(server_mtu);
+                let device = TunDevice::create_with_ip(&tun_config, &format!("{virtual_ip}/32"))?;
+                let (direct, forced, full_unknown) = split.ipv4_routes().await;
+                let mut routes = crate::tun_routes::Routes::new(&device.name()?, &tun_config.routes, direct, forced, full_unknown)?;
+                for address in split.server_ipv4_exceptions().await.into_iter().chain(upstream_ips.iter().copied()) {
+                    routes.pin(address)?;
+                }
+                routes.activate()?;
+                let routes = Arc::new(routes);
+                let weak = Arc::downgrade(&routes);
+                crate::websocket::set_endpoint_route_hook(Some(Arc::new(move |address| {
+                    if let Some(routes) = weak.upgrade() { routes.pin(address)?; }
+                    Ok(())
+                })));
+                let _hook = OnDrop::new(|| crate::websocket::set_endpoint_route_hook(None));
+                dns.set_tun_routes(&routes);
+                let _dns = crate::linux_dns::SystemDns::install(listen, config.dns_proxy.takes_over_system_dns())?;
+                dashboard::TUN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _status = OnDrop::new(|| dashboard::TUN_READY.store(false, std::sync::atomic::Ordering::Relaxed));
+                failures = 0;
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(None);
+                }
+                let (_shutdown, shutdown) = watch::channel(false);
+                tokio::select! {
+                    result = device.run(tunnel, shutdown) => result,
+                    result = routes.expire() => result.context("TUN DNS route expiry failed"),
+                }
+            }.await;
+            if ready.is_some() {
+                return session.context("TUN initialization failed");
+            }
+            failures += 1;
+            if failures >= MAX_RECONNECT_ATTEMPTS {
+                return session.and_then(|_| Err(anyhow::anyhow!("TUN network stopped")));
+            }
+            warn!(?session, "TUN disconnected, retrying with system routes restored");
+            dashboard::record_reconnect();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    };
+    tokio::select! {
+        result = connection => result,
+        result = Arc::clone(&dns).run_with_sockets(socket, secondary) => result.context("TUN DNS listener stopped"),
+    }
+}
+
+/// Handle shutdown signals (SIGINT, SIGTERM on Unix; Ctrl+C on Windows)
+async fn handle_signals(shutdown_tx: watch::Sender<bool>) {
+    #[cfg(unix)]
+    {
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("Failed to create SIGINT handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to create SIGTERM handler");
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("Received SIGINT, initiating graceful shutdown...");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, initiating graceful shutdown...");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if crate::service::windows::is_service() {
+            crate::service::windows::wait_stop().await;
+        } else {
+            tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        }
+        info!("Received shutdown request, initiating graceful shutdown...");
+    }
+
+    let _ = shutdown_tx.send(true);
 }

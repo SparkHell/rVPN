@@ -1037,7 +1037,11 @@ mod tests {
 
         let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let v6 = UdpSocket::bind("[::1]:0").await.unwrap();
-        tokio::try_join!(crate::check_dns_loopback(&v4), crate::check_dns_loopback(&v6)).unwrap();
+        tokio::try_join!(
+            crate::runtime_control::check_dns_loopback(&v4),
+            crate::runtime_control::check_dns_loopback(&v6)
+        )
+        .unwrap();
         let addresses = [v4.local_addr().unwrap(), v6.local_addr().unwrap()];
         let resolver = Arc::new(DnsResolver::new(true, 300, 100, false, true, vec![]));
         let ad_list = tempfile::NamedTempFile::new().unwrap();

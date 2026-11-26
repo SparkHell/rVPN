@@ -94,6 +94,56 @@ async fn test_rate_limiter() -> anyhow::Result<()> {
     // Second request should also succeed (within limit)
     assert!(limiter.check(&ip));
 
+    // Concurrent connection limit + release
+    let mut strict = crate::handler::RateLimiter::new(1, 10);
+    assert!(strict.try_acquire(ip));
+    assert!(!strict.try_acquire(ip), "second concurrent connection must be rejected");
+    strict.release_connection(&ip);
+    assert!(strict.try_acquire(ip), "slot must reopen after release_connection");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_mux_and_dns_handlers_enforce_rate_limits() -> anyhow::Result<()> {
+    let mut config = crate::config::ServerConfig::default();
+    config.rate_limit.max_connections_per_ip = 0;
+    config.rate_limit.max_handshakes_per_minute = 0;
+
+    let mux = crate::handler::MultiplexerHandler::new(config.clone())?;
+    let dns = crate::handler::DnsHandler::new(config.clone())?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    // Both handlers should reject immediately via rate limit without panicking or hanging.
+    let accept_task = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let (s, p) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(s).await.unwrap();
+            streams.push((ws, p));
+        }
+        streams
+    });
+
+    let _c1 = tokio_tungstenite::connect_async(format!("ws://{addr}/mux")).await?;
+    let _c2 = tokio_tungstenite::connect_async(format!("ws://{addr}/dns")).await?;
+    let mut pairs = accept_task.await?;
+    let (ws_dns, peer_dns) = pairs.pop().unwrap();
+    let (ws_mux, peer_mux) = pairs.pop().unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        mux.handle_connection(ws_mux, peer_mux, None, config.tun),
+    )
+    .await??;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        dns.handle_connection(ws_dns, peer_dns),
+    )
+    .await??;
+
     Ok(())
 }
 

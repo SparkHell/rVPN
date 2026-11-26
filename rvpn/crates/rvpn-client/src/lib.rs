@@ -5,8 +5,20 @@
 //! its own WebSocket connection (no connection pooling or multiplexing).
 
 pub mod config;
+#[cfg(not(target_os = "android"))]
+pub mod control_panel;
 pub mod dashboard;
 pub mod dns;
+#[cfg(not(target_os = "android"))]
+pub mod dns_proxy;
+#[cfg(windows)]
+pub mod windows_dns;
+#[cfg(any(target_os = "macos", test))]
+pub mod macos_dns;
+#[cfg(target_os = "linux")]
+pub mod resolved_dns;
+#[cfg(target_os = "linux")]
+pub mod linux_dns;
 
 // These modules are temporarily unused in the Brook-style refactor
 // but kept for potential future use (metrics, etc.)
@@ -28,6 +40,8 @@ pub mod stream_relay;
 pub mod tls_fingerprint_stub;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub mod tun;
+#[cfg(target_os = "linux")]
+pub mod tun_routes;
 #[cfg(not(target_os = "android"))]
 pub mod tunnel;
 pub mod websocket;
@@ -38,7 +52,13 @@ pub mod http_proxy;
 #[cfg(not(target_os = "android"))]
 pub mod router;
 #[cfg(not(target_os = "android"))]
+pub mod runtime_control;
+#[cfg(not(target_os = "android"))]
+pub mod server_link;
+#[cfg(not(target_os = "android"))]
 pub mod server_pool;
+#[cfg(not(target_os = "android"))]
+pub mod service;
 #[cfg(not(target_os = "android"))]
 pub mod tunnel_pool;
 
@@ -48,6 +68,8 @@ pub mod dns_cache;
 
 // Re-export commonly used types
 pub use config::{ClientConfig, ServerIdentityConfig};
+#[cfg(not(target_os = "android"))]
+pub use runtime_control::{Args, Commands};
 #[cfg(not(target_os = "android"))]
 pub use rvpn_tls::{TlsFingerprint, connect_chrome_like, ChromeTlsStream};
 pub use rvpn_tls::fingerprint_from_str;

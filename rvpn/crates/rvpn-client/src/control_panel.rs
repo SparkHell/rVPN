@@ -43,7 +43,7 @@ pub struct ApplyRequest {
     pub reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
-pub(crate) fn setup_config() -> ClientConfig {
+pub fn setup_config() -> ClientConfig {
     let mut config = ClientConfig::default();
     config.dashboard.enabled = true;
     config

@@ -144,19 +144,19 @@ jobs:
           Copy-Item target/x86_64-pc-windows-msvc/release/rvpn.exe,target/x86_64-pc-windows-msvc/release/rvpn-server.exe target/release/
 
       - name: Test configuration and relative paths
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn config::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib config::tests --timings
 
       - name: Test service commands and startup reporting
-        run: "cargo test --profile ci-test --locked --package rvpn-client --bin rvpn service:: --timings"
+        run: "cargo test --profile ci-test --locked --package rvpn-client --lib service:: --timings"
 
       - name: Test automatic VPN server bypass
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn split_tunnel::endpoint_tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib split_tunnel::endpoint_tests --timings
 
       - name: Test WebUI startup addresses
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn runtime_control::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib runtime_control::tests --timings
 
       - name: Test WebSocket control panel
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn control_panel::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib control_panel::tests --timings
 
       - name: Test configuration hot reload and rollback
         run: cargo test --profile ci-test --locked --package rvpn-client --test hot_reload --timings
@@ -168,10 +168,10 @@ jobs:
         run: cargo test --profile ci-test --locked --package rvpn-split-tunnel --lib --timings
 
       - name: Test DNS proxy and system DNS takeover
-        run: "cargo test --profile ci-test --locked --package rvpn-client --bin rvpn dns --timings"
+        run: "cargo test --profile ci-test --locked --package rvpn-client --lib dns --timings"
 
       - name: Test WebSocket upgrade and close handling
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn websocket::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib websocket::tests --timings
 
       - name: Test tunnel address and connection recovery
         run: cargo test --profile ci-test --locked --package rvpn-client --lib tunnel::tests --timings
@@ -327,19 +327,19 @@ jobs:
           fi
 
       - name: Test configuration and relative paths
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn config::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib config::tests --timings
 
       - name: Test service commands and startup reporting
-        run: "cargo test --profile ci-test --locked --package rvpn-client --bin rvpn service:: --timings"
+        run: "cargo test --profile ci-test --locked --package rvpn-client --lib service:: --timings"
 
       - name: Test automatic VPN server bypass
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn split_tunnel::endpoint_tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib split_tunnel::endpoint_tests --timings
 
       - name: Test WebUI startup addresses
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn runtime_control::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib runtime_control::tests --timings
 
       - name: Test WebSocket control panel
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn control_panel::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib control_panel::tests --timings
 
       - name: Test configuration hot reload and rollback
         run: cargo test --profile ci-test --locked --package rvpn-client --test hot_reload --timings
@@ -351,10 +351,10 @@ jobs:
         run: cargo test --profile ci-test --locked --package rvpn-split-tunnel --lib --timings
 
       - name: Test DNS proxy and system DNS takeover
-        run: "cargo test --profile ci-test --locked --package rvpn-client --bin rvpn dns --timings"
+        run: "cargo test --profile ci-test --locked --package rvpn-client --lib dns --timings"
 
       - name: Test WebSocket upgrade and close handling
-        run: cargo test --profile ci-test --locked --package rvpn-client --bin rvpn websocket::tests --timings
+        run: cargo test --profile ci-test --locked --package rvpn-client --lib websocket::tests --timings
 
       - name: Test tunnel address and connection recovery
         run: cargo test --profile ci-test --locked --package rvpn-client --lib tunnel::tests --timings

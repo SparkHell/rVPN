@@ -41,9 +41,6 @@ tungstenite.workspace = true
 
 # TLS - rvpn-tls provides boring (desktop/macOS) and rustls (iOS) backends
 
-# SOCKS5 Proxy
-fast-socks5.workspace = true
-
 # TUN
 tun-rs.workspace = true
 
@@ -53,7 +50,6 @@ ip_network.workspace = true
 socket2 = "0.5"
 
 # Data structures
-radix_trie.workspace = true
 lru.workspace = true
 
 # Serialization
@@ -90,7 +86,6 @@ url.workspace = true
 futures-util.workspace = true
 lazy_static.workspace = true
 parking_lot.workspace = true
-async-trait = "0.1"
 dirs = "5.0"
 tempfile.workspace = true
 

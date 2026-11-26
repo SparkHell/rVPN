@@ -92,7 +92,7 @@ To run the same checks locally:
 
 ```bash
 cd rvpn
-cargo test --profile ci-test --locked -p rvpn-client --bin rvpn config::tests
+cargo test --profile ci-test --locked -p rvpn-client --lib config::tests
 cargo test --profile ci-test --locked -p rvpn-server --lib config::tests
 ```
 

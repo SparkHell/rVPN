@@ -88,12 +88,6 @@ rand.workspace = true
 # Socket options for SO_REUSEADDR
 socket2 = "0.5"
 
-# IP network handling for split tunnel
-ipnetwork = "0.20"
-
-# Concurrent hashmap for flow creation locks
-dashmap = "5.5"
-
 # DNS server and client
 hickory-proto = { workspace = true, optional = true }
 

@@ -207,6 +207,7 @@ pub(crate) fn vm_internal_compressed() -> (u64, u64) {
     (internal, compressed)
 }
 
+#[cfg(target_vendor = "apple")]
 extern "C" {
     fn malloc_get_all_zones(
         task: libc::mach_port_t,
@@ -298,6 +299,7 @@ fn vm_region_tags_str() -> String {
 
 /// Enumerate every malloc zone in this task. Returns the zone pointer slice
 /// (the array is owned by libmalloc; do not free).
+#[cfg(target_vendor = "apple")]
 fn all_zone_ptrs() -> Vec<*mut std::ffi::c_void> {
     let mut array: *mut usize = std::ptr::null_mut();
     let mut count: u32 = 0;
@@ -314,6 +316,12 @@ fn all_zone_ptrs() -> Vec<*mut std::ffi::c_void> {
             .filter(|p| !p.is_null())
             .collect()
     }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[allow(dead_code)]
+fn all_zone_ptrs() -> Vec<*mut std::ffi::c_void> {
+    Vec::new()
 }
 
 /// Per-zone live bytes, compact "name=KB" list sorted by size desc, zones
@@ -357,6 +365,7 @@ pub(crate) fn zone_sizes_str() -> String {
 /// zone alone does not cover the nano zone (where small BoringSSL allocations
 /// live), so we must relief ALL zones. Non-disruptive (no live allocations,
 /// no tunnel drop). Called from the 15 s keepalive.
+#[cfg(target_vendor = "apple")]
 pub(crate) fn all_zones_pressure_relief() {
     for zone in all_zone_ptrs() {
         unsafe {
@@ -364,6 +373,9 @@ pub(crate) fn all_zones_pressure_relief() {
         }
     }
 }
+
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn all_zones_pressure_relief() {}
 
 /// Sum of live bytes-in-use across ALL malloc zones. If this stays flat while
 /// `headroom_bytes` declines, the growth is NOT in any malloc zone (it's in

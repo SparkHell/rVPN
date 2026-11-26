@@ -1190,19 +1190,26 @@ pub extern "C" fn rvpn_tun_get_rss_bytes() -> u64 {
 #[cfg(not(feature = "diagnostics"))]
 #[no_mangle]
 pub extern "C" fn rvpn_tun_get_rss_bytes() -> u64 {
-    const MACH_TASK_BASIC_INFO: u32 = 20;
-    const INFO_COUNT: u32 = 12;
-    let mut buf = [0i32; 12];
-    let mut count = INFO_COUNT;
-    #[allow(deprecated)]
-    let task = unsafe { libc::mach_task_self() };
-    let kr = unsafe { libc::task_info(task, MACH_TASK_BASIC_INFO, buf.as_mut_ptr(), &mut count) };
-    if kr != 0 {
-        return 0;
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    {
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        const INFO_COUNT: u32 = 12;
+        let mut buf = [0i32; 12];
+        let mut count = INFO_COUNT;
+        #[allow(deprecated)]
+        let task = unsafe { libc::mach_task_self() };
+        let kr = unsafe { libc::task_info(task, MACH_TASK_BASIC_INFO, buf.as_mut_ptr(), &mut count) };
+        if kr != 0 {
+            return 0;
+        }
+        let lo = buf[2] as u32 as u64;
+        let hi = buf[3] as u32 as u64;
+        (hi << 32) | lo
     }
-    let lo = buf[2] as u32 as u64;
-    let hi = buf[3] as u32 as u64;
-    (hi << 32) | lo
+    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+    {
+        0
+    }
 }
 
 /// Get the last time any traffic was received from the server.
