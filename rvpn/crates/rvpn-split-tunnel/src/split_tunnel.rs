@@ -912,10 +912,10 @@ mod tests {
         let resolver = Arc::new(DnsResolver::new(true,300,1000,false,true,vec![])
             .with_nameservers(&[blackhole.local_addr().unwrap().to_string()]).unwrap());
         let split = SplitTunnel::new(config,resolver).await.unwrap();
-        split.data.write().await.gfwlist = crate::gfwlist::Rules {
-            proxy: HashSet::from(["proxy.example".into()]),
-            exceptions: HashSet::from(["except.proxy.example".into()]), skipped:0,
-        };
+        let mut gfw = crate::gfwlist::Rules::default();
+        gfw.proxy = HashSet::from(["proxy.example".into()]);
+        gfw.exceptions = HashSet::from(["except.proxy.example".into()]);
+        split.data.write().await.gfwlist = gfw;
         let (routed, _, _, gfwlist) = tokio::time::timeout(Duration::from_millis(100),
             split.connection_route("www.proxy.example")).await.unwrap();
         assert_eq!(routed,RoutingDecision::Tunnel);

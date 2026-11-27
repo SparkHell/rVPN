@@ -17,15 +17,13 @@ from datetime import datetime, timezone
 
 
 SOURCES = {
-    "adguard_dns": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
-    "adaway": "https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt",
+    "anti_ad": "https://anti-ad.net/easylist.txt",
     "china_domains": "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf",
     "apnic": "https://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest",
     "gfwlist": "https://raw.githubusercontent.com/gfwlist/gfwlist/refs/heads/master/gfwlist.txt",
 }
 LICENSE_SOURCES = {
-    "LICENSE-HostlistsRegistry.txt": "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/LICENSE",
-    "LICENSE-AdAway.txt": "https://raw.githubusercontent.com/AdAway/adaway.github.io/master/LICENSE.md",
+    "LICENSE-anti-AD.txt": "https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/LICENSE",
     "LICENSE-dnsmasq-china-list.txt": "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/LICENSE",
     "LICENSE-GFWList.txt": "https://raw.githubusercontent.com/gfwlist/gfwlist/master/COPYING.txt",
 }
@@ -240,11 +238,9 @@ def update(output_dir: Path) -> dict[str, int]:
     raw = {name: fetch(url) for name, url in SOURCES.items()}
     licenses = {name: fetch(url) for name, url in LICENSE_SOURCES.items()}
     decoded = {name: data.decode("utf-8") for name, data in raw.items()}
-    ad_domains = parse_adguard_dns(decoded["adguard_dns"])
-    adaway_domains = parse_adaway_hosts(decoded["adaway"])
-    if len(ad_domains) < 50_000 or len(adaway_domains) < 1_000:
-        raise ValueError("AdGuard or AdAway did not pass minimum-count validation")
-    ad_domains.update(adaway_domains)
+    ad_domains = parse_adguard_dns(decoded["anti_ad"])
+    if len(ad_domains) < 50_000:
+        raise ValueError("anti-AD did not pass minimum-count validation")
     china_domains = parse_china_domains(decoded["china_domains"])
     country_ips = parse_apnic(decoded["apnic"])
     gfw_files = gfwlist_files(raw["gfwlist"])
@@ -273,16 +269,15 @@ def update(output_dir: Path) -> dict[str, int]:
         },
     }
     files = {
-        "filter_1.txt": decoded["adguard_dns"],
-        "filter_2.txt": decoded["adaway"],
+        "easylist.txt": decoded["anti_ad"],
         "ad-domains.txt": "".join(f"{domain}\n" for domain in sorted(ad_domains)),
         "country-domains-cn.txt": "".join(f"{domain}\n" for domain in sorted(china_domains)),
         "country-ips.json": json.dumps(country_ips, separators=(",", ":")) + "\n",
         "sources.json": json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         "NOTICE.txt": (
             "Generated rVPN routing data. Source URLs, SHA-256 values, and refresh time "
-            "are recorded in sources.json. AdGuard and AdAway license texts are included "
-            "under their own filenames. The dnsmasq-china-list license is also included. "
+            "are recorded in sources.json. The anti-AD (MIT) and dnsmasq-china-list "
+            "license texts are included under their own filenames. "
             "APNIC's delegation file states that its country fields record original "
             "allocation/assignment, not authoritative current IP location. "
             "GFWList is distributed under LGPL-2.1 (LICENSE-GFWList.txt); the raw "

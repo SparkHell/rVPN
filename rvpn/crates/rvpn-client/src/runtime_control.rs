@@ -640,7 +640,11 @@ async fn run_socks5(
             let system_dns = takeover.then(crate::macos_dns::SystemDns::take_over).transpose()?;
             #[cfg(target_os = "linux")]
             let system_dns = if takeover {
-                crate::linux_dns::SystemDns::install(config.dns_proxy.effective_listener().parse()?, true)?
+                crate::linux_dns::SystemDns::install(
+                    config.dns_proxy.effective_listener().parse()?,
+                    true,
+                    &config.dns_proxy.nameservers,
+                )?
             } else {
                 None
             };
@@ -795,7 +799,16 @@ async fn run_tun(mut config: ClientConfig, ready: oneshot::Sender<Option<String>
                 })));
                 let _hook = OnDrop::new(|| crate::websocket::set_endpoint_route_hook(None));
                 dns.set_tun_routes(&routes);
-                let _dns = crate::linux_dns::SystemDns::install(listen, config.dns_proxy.takes_over_system_dns())?;
+                let fallback_dns = if config.dns_proxy.nameservers.is_empty() {
+                    &tun_config.dns_servers
+                } else {
+                    &config.dns_proxy.nameservers
+                };
+                let _dns = crate::linux_dns::SystemDns::install(
+                    listen,
+                    config.dns_proxy.takes_over_system_dns(),
+                    fallback_dns,
+                )?;
                 dashboard::TUN_READY.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _status = OnDrop::new(|| dashboard::TUN_READY.store(false, std::sync::atomic::Ordering::Relaxed));
                 failures = 0;

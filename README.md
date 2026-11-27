@@ -380,7 +380,7 @@ frames do not emit a log line. File logs never contain terminal color codes.
 ### AdGuard and GFWList subscriptions
 
 Open **分流规则** in the client panel to switch AdGuard domain filtering and GFWList
-proxy rules independently. With split routing enabled, unmatched DNS queries use the local upstream. For connections, target IPs in the configured direct ranges connect directly. If direct regions are configured, other addresses use the VPN. Explicit tunnel domains and CIDRs take precedence. Save to apply switches. Each update button downloads through the client’s active SOCKS5 listener. AdGuard updates fetch both Hostlists Registry lists (DNS filter and AdAway hosts), then merge and validate them before replacing the snapshot. Each successful update atomically replaces the
+proxy rules independently. With split routing enabled, unmatched DNS queries use the local upstream. For connections, target IPs in the configured direct ranges connect directly. If direct regions are configured, other addresses use the VPN. Explicit tunnel domains and CIDRs take precedence. Save to apply switches. Each update button downloads through the client’s active SOCKS5 listener. AdGuard updates fetch the anti-AD AdGuard Home list (`https://anti-ad.net/easylist.txt`), then parse and validate it before replacing the snapshot. Each successful update atomically replaces the
 snapshot under `data_dir/subscriptions`. Successful updates take effect on the
 next routing decision and survive restarts. The bundled rules work offline
 before the first update. AdGuard imports domain blocking and exception rules.
@@ -393,7 +393,7 @@ latest 64 results in process memory and displays up to six answers per query.
 
 CI downloads and validates the upstream GFWList during the shared rule-data
 build, converts its domain rules, then embeds `gfwlist-rules.json` into all
-platform binaries. CI also embeds the merged advertising domains from both lists. The raw `filter_1.txt`, `filter_2.txt`, and GFWList source accompany the generated snapshots in every client artifact. The exact same data is included in every client archive's
+platform binaries. CI also embeds the advertising domains from anti-AD. The raw `easylist.txt` and GFWList source accompany the generated snapshots in every client artifact. The exact same data is included in every client archive's
 `rules/` directory: raw `gfwlist.txt`, normalized `gfwlist-rules.json`, plain
 `gfwlist-domains.txt`, source hashes/counts, and `LICENSE-GFWList.txt`. Publishing
 reuses that artifact instead of fetching a different list after compilation.
@@ -649,8 +649,7 @@ Run the source-aware updater to create external rule files:
 python3 scripts/update_rule_data.py --output-dir /var/lib/rvpn/rules
 ```
 
-It downloads AdGuard DNS filter (`filter_1.txt`), AdAway hosts via AdGuard
-(`filter_2.txt`), the China domain list, and APNIC delegations. It converts
+It downloads anti-AD (`easylist.txt`), the China domain list, and APNIC delegations. It converts
 domain-only blocking rules and hosts entries to plain domain names, and APNIC
 records to `country-ips.json`. China domain candidates still require an IP
 match in the selected country's CIDRs before bypassing the VPN. APNIC records

@@ -1,7 +1,8 @@
 //! Persist validated domain subscriptions and swap the live snapshot after a successful write.
-use crate::gfwlist::Rules;
+use crate::gfwlist::{PatternRule, Rules};
 use anyhow::{ensure, Context, Result};
 use base64::Engine;
+use regex::RegexBuilder;
 use std::{
     path::{Path, PathBuf},
     sync::RwLock,
@@ -30,15 +31,210 @@ impl Source {
     }
     fn urls(self) -> &'static [&'static str] {
         match self {
-            Self::AdGuard => &[
-                "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
-                "https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt",
-            ],
+            Self::AdGuard => &["https://anti-ad.net/easylist.txt"],
             Self::GfwList => {
                 &["https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt"]
             }
         }
     }
+}
+
+fn is_valid_domain(d: &str) -> bool {
+    d.len() <= 253
+        && d.contains('.')
+        && d.parse::<std::net::IpAddr>().is_err()
+        && d.split('.').all(|s| {
+            !s.is_empty()
+                && s.len() <= 63
+                && !s.starts_with('-')
+                && !s.ends_with('-')
+                && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+}
+
+fn is_valid_wildcard_domain(d: &str) -> bool {
+    d.len() <= 253
+        && d.contains('.')
+        && d.contains('*')
+        && !d.starts_with('.')
+        && !d.ends_with('.')
+        && !d.contains("..")
+        && d.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'*'))
+}
+
+fn wildcard_domain_to_regex(pattern: &str) -> String {
+    let mut out = String::from("^(?:.*\\.)?");
+    for ch in pattern.to_ascii_lowercase().chars() {
+        match ch {
+            '*' => out.push_str(".*"),
+            '.' => out.push_str("\\."),
+            _ => out.push(ch),
+        }
+    }
+    out.push('$');
+    out
+}
+
+fn regex_is_valid(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .size_limit(1 << 20)
+            .build()
+            .is_ok()
+}
+
+/// Parse supported AdGuard Home DNS rule modifiers (`important`, `denyallow=...`, `dnstype=...`).
+/// Returns `None` if an unsupported modifier is present so browser/URL/rewrite rules are skipped.
+fn parse_adguard_modifiers(raw: &str) -> Option<Vec<String>> {
+    let mut denyallow = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        if part.eq_ignore_ascii_case("important") {
+            continue;
+        }
+        if let Some(list) = part.strip_prefix("denyallow=") {
+            if list.is_empty() {
+                return None;
+            }
+            for item in list.split('|') {
+                let domain = item.trim().trim_end_matches('.');
+                if !is_valid_domain(domain) {
+                    return None;
+                }
+                denyallow.push(domain.to_ascii_lowercase());
+            }
+            continue;
+        }
+        if let Some(types) = part.strip_prefix("dnstype=") {
+            let mut has_address_type = false;
+            for item in types.split('|') {
+                let item = item.trim();
+                if item.is_empty() || item.starts_with('~') {
+                    return None;
+                }
+                if item.eq_ignore_ascii_case("A")
+                    || item.eq_ignore_ascii_case("AAAA")
+                    || item.eq_ignore_ascii_case("CNAME")
+                {
+                    has_address_type = true;
+                }
+            }
+            if !has_address_type {
+                return None;
+            }
+            continue;
+        }
+        return None;
+    }
+    Some(denyallow)
+}
+
+fn parse_adguard_rule(rule: &str, exception: bool, rules: &mut Rules) -> bool {
+    if rule.starts_with('/') {
+        let Some(end) = rule.rfind('/') else {
+            return false;
+        };
+        if end == 0 {
+            return false;
+        }
+        let pattern = &rule[1..end];
+        let rest = &rule[end + 1..];
+        let denyallow = if rest.is_empty() {
+            Vec::new()
+        } else if let Some(mods) = rest.strip_prefix('$') {
+            let Some(denyallow) = parse_adguard_modifiers(mods) else {
+                return false;
+            };
+            denyallow
+        } else {
+            return false;
+        };
+        if !regex_is_valid(pattern) {
+            return false;
+        }
+        if exception {
+            if !denyallow.is_empty() {
+                return false;
+            }
+            rules.exception_patterns.push(pattern.to_owned());
+        } else {
+            rules.patterns.push(PatternRule {
+                pattern: pattern.to_owned(),
+                denyallow,
+            });
+        }
+        return true;
+    }
+
+    if rule.starts_with("||") {
+        let (body, mods) = rule
+            .split_once('$')
+            .map_or((rule, None), |(b, m)| (b, Some(m)));
+        let Some(domain) = body.strip_prefix("||").and_then(|v| v.strip_suffix('^')) else {
+            return false;
+        };
+        let denyallow = match mods {
+            Some(m) => {
+                let Some(list) = parse_adguard_modifiers(m) else {
+                    return false;
+                };
+                list
+            }
+            None => Vec::new(),
+        };
+        if is_valid_domain(domain) {
+            if exception {
+                if !denyallow.is_empty() {
+                    return false;
+                }
+                rules.exceptions.insert(domain.to_ascii_lowercase());
+            } else if denyallow.is_empty() {
+                rules.proxy.insert(domain.to_ascii_lowercase());
+            } else {
+                let pattern = wildcard_domain_to_regex(domain);
+                rules.patterns.push(PatternRule { pattern, denyallow });
+            }
+            return true;
+        }
+        if is_valid_wildcard_domain(domain) {
+            let pattern = wildcard_domain_to_regex(domain);
+            if !regex_is_valid(&pattern) {
+                return false;
+            }
+            if exception {
+                if !denyallow.is_empty() {
+                    return false;
+                }
+                rules.exception_patterns.push(pattern);
+            } else {
+                rules.patterns.push(PatternRule { pattern, denyallow });
+            }
+            return true;
+        }
+        return false;
+    }
+
+    let mut fields = rule.split_whitespace();
+    let Some(address) = fields.next() else {
+        return false;
+    };
+    if !matches!(address, "127.0.0.1" | "0.0.0.0" | "::1") {
+        return false;
+    }
+    let Some(domain) = fields.next().filter(|d| is_valid_domain(d)) else {
+        return false;
+    };
+    if exception {
+        rules.exceptions.insert(domain.to_ascii_lowercase());
+    } else {
+        rules.proxy.insert(domain.to_ascii_lowercase());
+    }
+    true
 }
 
 fn domains(source: Source, bytes: &[u8]) -> Result<Rules> {
@@ -65,44 +261,29 @@ fn domains(source: Source, bytes: &[u8]) -> Result<Rules> {
             continue;
         }
         let (exception, rule) = line.strip_prefix("@@").map_or((false, line), |v| (true, v));
-        let domain = match source {
-            Source::AdGuard => rule
-                .strip_prefix("||")
-                .and_then(|v| v.strip_suffix('^'))
-                .or_else(|| {
-                    let mut fields = rule.split_whitespace();
-                    let address = fields.next()?;
-                    matches!(address, "127.0.0.1" | "0.0.0.0" | "::1")
-                        .then(|| fields.next())
-                        .flatten()
-                }),
-            Source::GfwList => Some(
-                rule.trim_start_matches("||")
+        match source {
+            Source::AdGuard => {
+                if !parse_adguard_rule(rule, exception, &mut rules) {
+                    rules.skipped += 1;
+                }
+            }
+            Source::GfwList => {
+                let domain = rule
+                    .trim_start_matches("||")
                     .trim_start_matches('.')
-                    .trim_end_matches('^'),
-            ),
-        };
-        let Some(domain) = domain.filter(|d| {
-            d.len() <= 253
-                && d.contains('.')
-                && d.parse::<std::net::IpAddr>().is_err()
-                && d.split('.').all(|s| {
-                    !s.is_empty()
-                        && s.len() <= 63
-                        && !s.starts_with('-')
-                        && !s.ends_with('-')
-                        && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
-                })
-        }) else {
-            rules.skipped += 1;
-            continue;
-        };
-        let set = if exception {
-            &mut rules.exceptions
-        } else {
-            &mut rules.proxy
-        };
-        set.insert(domain.to_ascii_lowercase());
+                    .trim_end_matches('^');
+                if !is_valid_domain(domain) {
+                    rules.skipped += 1;
+                    continue;
+                }
+                let set = if exception {
+                    &mut rules.exceptions
+                } else {
+                    &mut rules.proxy
+                };
+                set.insert(domain.to_ascii_lowercase());
+            }
+        }
     }
     Ok(rules)
 }
@@ -122,7 +303,10 @@ impl Subscriptions {
             let path = directory.join(source.filename());
             match std::fs::read(&path) {
                 Ok(bytes) => match serde_json::from_slice::<Rules>(&bytes) {
-                    Ok(rules) if !rules.proxy.is_empty() => Some(rules),
+                    Ok(rules) if !rules.proxy.is_empty() || !rules.patterns.is_empty() => {
+                        rules.compile();
+                        Some(rules)
+                    }
                     _ => {
                         tracing::warn!("Invalid rule cache: {}", path.display());
                         None
@@ -156,7 +340,7 @@ impl Subscriptions {
         let client = reqwest::Client::builder()
             .https_only(true)
             .proxy(reqwest::Proxy::all(proxy_url).context("无效的规则更新代理")?)
-            .timeout(Duration::from_secs(22))
+            .timeout(Duration::from_secs(60))
             .build()?;
         let mut combined = Rules::default();
         for url in source.urls() {
@@ -184,19 +368,22 @@ impl Subscriptions {
             }
             let rules = domains(source, &bytes)?;
             ensure!(
-                rules.proxy.len() >= 1000,
+                rules.proxy.len() + rules.patterns.len() >= 1000,
                 "有效域名不足 1000 条，保留上次规则：{url}"
             );
             combined.proxy.extend(rules.proxy);
             combined.exceptions.extend(rules.exceptions);
+            combined.patterns.extend(rules.patterns);
+            combined.exception_patterns.extend(rules.exception_patterns);
             combined.skipped += rules.skipped;
         }
         self.install(source, combined)
     }
 
     fn install(&self, source: Source, rules: Rules) -> Result<usize> {
-        let count = rules.proxy.len();
+        let count = rules.proxy.len() + rules.patterns.len();
         ensure!(count >= 1000, "有效域名不足 1000 条，保留上次规则");
+        rules.compile();
         std::fs::create_dir_all(&self.directory)?;
         let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
         serde_json::to_writer(file.as_file_mut(), &rules)?;
@@ -251,5 +438,53 @@ mod tests {
         let store = Subscriptions::open(dir.path());
         assert_eq!(store.matches(source, "ad1.example"), Some(true));
         assert_eq!(store.matches(Source::GfwList, "restored.example"), None);
+    }
+
+    #[test]
+    fn adguard_supports_wildcards_regex_and_modifiers() {
+        let input = "\
+! anti-AD samples
+||ads*-normal-hl.zijieapi.com^
+||*serror*.wo.com.cn^$dnstype=A|CNAME
+@@||profile*.se.360.cn^
+/^(\\S+\\.)?tongji\\./
+/^(\\S+\\.)?advert/$denyallow=taobao.com|tmall.com
+/^(\\S+\\.)?9377[a-z0-9]{2}\\.com$/$dnstype=A
+||profile1.se.360.cn^
+||httpsonly.example^$dnstype=HTTPS
+||rewrite.example^$dnsrewrite=1.2.3.4
+||bad.example/path*
+";
+        let rules = domains(Source::AdGuard, input.as_bytes()).unwrap();
+        // Wildcard block & subdomain
+        assert!(rules.forces_proxy("ads1-normal-hl.zijieapi.com"));
+        assert!(rules.forces_proxy("sub.ads99-normal-hl.zijieapi.com"));
+        assert!(!rules.forces_proxy("notads-normal-hl.zijieapi.com"));
+        assert!(rules.forces_proxy("xserror1.wo.com.cn"));
+        // Wildcard exception overrides plain block
+        assert!(!rules.forces_proxy("profile1.se.360.cn"));
+        assert!(!rules.forces_proxy("sub.profile2.se.360.cn"));
+        // Regex rules
+        assert!(rules.forces_proxy("tongji.example.com"));
+        assert!(rules.forces_proxy("a.tongji.example.com"));
+        assert!(rules.forces_proxy("9377ab.com"));
+        assert!(rules.forces_proxy("sub.9377ab.com"));
+        assert!(!rules.forces_proxy("9377abc.com"));
+        // Regex with $denyallow
+        assert!(rules.forces_proxy("advert.example.com"));
+        assert!(!rules.forces_proxy("advert.taobao.com"));
+        assert!(!rules.forces_proxy("sub.advert.tmall.com"));
+        // Unsupported modifiers & URL rules are skipped
+        assert!(!rules.forces_proxy("httpsonly.example"));
+        assert!(!rules.forces_proxy("rewrite.example"));
+        assert!(!rules.forces_proxy("bad.example"));
+        assert_eq!(rules.skipped, 3);
+
+        // Round-trip through JSON serialization
+        let json = serde_json::to_vec(&rules).unwrap();
+        let reloaded: Rules = serde_json::from_slice(&json).unwrap();
+        assert!(reloaded.forces_proxy("ads1-normal-hl.zijieapi.com"));
+        assert!(!reloaded.forces_proxy("advert.taobao.com"));
+        assert!(!reloaded.forces_proxy("profile1.se.360.cn"));
     }
 }

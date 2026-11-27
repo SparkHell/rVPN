@@ -490,7 +490,7 @@ jobs:
               (cd "$dir" && sha256sum -c "${binary}.sha256")
               python3 scripts/check-release-linkage.py "${name#rvpn-*-}" "$dir/$binary"
               if [[ "$name" == rvpn-client-* ]]; then
-                [[ -s "$dir/rules/filter_1.txt" && -s "$dir/rules/filter_2.txt" && -s "$dir/rules/gfwlist.txt" ]]
+                [[ -s "$dir/rules/easylist.txt" && -s "$dir/rules/gfwlist.txt" ]]
                 (cd "$dir" && zip -q -r "${GITHUB_WORKSPACE}/dist/${name}.zip" "$binary" "${binary}.sha256" "$config" rules)
               else
                 (cd "$dir" && zip -q -j "${GITHUB_WORKSPACE}/dist/${name}.zip" "$binary" "${binary}.sha256" "$config")
@@ -500,7 +500,7 @@ jobs:
               chmod +x "$dir/$binary"
               python3 scripts/check-release-linkage.py "${name#rvpn-*-}" "$dir/$binary"
               if [[ "$name" == rvpn-client-* ]]; then
-                [[ -s "$dir/rules/filter_1.txt" && -s "$dir/rules/filter_2.txt" && -s "$dir/rules/gfwlist.txt" ]]
+                [[ -s "$dir/rules/easylist.txt" && -s "$dir/rules/gfwlist.txt" ]]
                 tar -czf "dist/${name}.tar.gz" -C "$dir" "$binary" "${binary}.sha256" "$config" rules
               elif [[ "$name" == rvpn-server-linux-* ]]; then
                 cp scripts/install-server.sh scripts/install_server.py scripts/caddy_ech.py "$dir/"
