@@ -1122,6 +1122,11 @@ fn x25519_public_key(bytes: &[u8; 32]) -> x25519_dalek::PublicKey {
 }
 
 #[cfg(test)]
+fn test_shared_secret() -> SharedSecret {
+    rand::Rng::gen(&mut rand::rngs::OsRng)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1169,7 +1174,7 @@ mod tests {
 
     #[test]
     fn test_decrypt_to_ref_matches_decrypt_to() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
         let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
         let mut bob = DoubleRatchet::init_bob(shared_secret);
 
@@ -1192,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_double_ratchet_basic() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
         
         let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
         let mut bob = DoubleRatchet::init_bob(shared_secret);
@@ -1208,7 +1213,7 @@ mod tests {
 
     #[test]
     fn test_double_ratchet_multiple_messages() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
 
         let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
         let mut bob = DoubleRatchet::init_bob(shared_secret);
@@ -1224,7 +1229,7 @@ mod tests {
 
     #[test]
     fn test_double_ratchet_bidirectional() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
 
         let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
         let mut bob = DoubleRatchet::init_bob(shared_secret);
@@ -1254,7 +1259,7 @@ mod tests {
 
     #[test]
     fn test_double_ratchet_out_of_order_and_replay_rejection() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
         let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
         let mut bob_owned = DoubleRatchet::init_bob(shared_secret);
         let mut bob_buf = DoubleRatchet::init_bob(shared_secret);
@@ -1293,12 +1298,12 @@ mod tests {
 
     #[test]
     fn test_skip_message_keys_rejects_excessive_gap_without_overflow() {
-        let mut bob = DoubleRatchet::init_bob([0x42u8; 32]);
+        let mut bob = DoubleRatchet::init_bob(test_shared_secret());
         bob.recv_message_number = u32::MAX - 10;
         let err = bob.skip_message_keys(u32::MAX);
         assert!(err.is_ok());
 
-        let mut bob2 = DoubleRatchet::init_bob([0x42u8; 32]);
+        let mut bob2 = DoubleRatchet::init_bob(test_shared_secret());
         bob2.recv_message_number = 0;
         assert!(bob2.skip_message_keys(MAX_SKIP as u32 + 1).is_err());
     }
@@ -1310,7 +1315,7 @@ mod split_ratchet_tests {
 
     #[tokio::test]
     async fn test_split_ratchet_basic() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
         
         let alice = SplitRatchet::init_alice(shared_secret, [0u8; 32]).await;
         let bob = SplitRatchet::init_bob(shared_secret).await;
@@ -1326,7 +1331,7 @@ mod split_ratchet_tests {
 
     #[tokio::test]
     async fn test_split_ratchet_multiple_messages() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
 
         let alice = SplitRatchet::init_alice(shared_secret, [0u8; 32]).await;
         let bob = SplitRatchet::init_bob(shared_secret).await;
@@ -1342,7 +1347,7 @@ mod split_ratchet_tests {
 
     #[tokio::test]
     async fn test_split_ratchet_bidirectional() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
 
         let alice = SplitRatchet::init_alice(shared_secret, [0u8; 32]).await;
         let bob = SplitRatchet::init_bob(shared_secret).await;
@@ -1370,7 +1375,7 @@ mod split_ratchet_tests {
 
     #[tokio::test]
     async fn test_split_ratchet_from_double_ratchet() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
         
         // Create DoubleRatchets and extract their state for conversion
         let alice_dr = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
@@ -1395,7 +1400,7 @@ mod split_ratchet_tests {
 
     #[tokio::test]
     async fn test_split_ratchet_concurrent_encrypt_decrypt() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
 
         let alice = std::sync::Arc::new(SplitRatchet::init_alice(shared_secret, [0u8; 32]).await);
         let bob = std::sync::Arc::new(SplitRatchet::init_bob(shared_secret).await);
@@ -1436,7 +1441,7 @@ mod split_ratchet_tests {
 
     #[tokio::test]
     async fn test_split_ratchet_out_of_order_and_replay_rejection() {
-        let shared_secret = [0x42u8; 32];
+        let shared_secret = test_shared_secret();
         let alice = SplitRatchet::init_alice(shared_secret, [0u8; 32]).await;
         let bob = SplitRatchet::init_bob(shared_secret).await;
 

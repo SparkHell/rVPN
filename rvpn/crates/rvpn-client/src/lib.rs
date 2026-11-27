@@ -69,7 +69,7 @@ pub mod dns_cache;
 // Re-export commonly used types
 pub use config::{ClientConfig, ServerIdentityConfig};
 #[cfg(not(target_os = "android"))]
-pub use runtime_control::{Args, Commands};
+pub use runtime_control::{async_main, Args, Commands};
 #[cfg(not(target_os = "android"))]
 pub use rvpn_tls::{TlsFingerprint, connect_chrome_like, ChromeTlsStream};
 pub use rvpn_tls::fingerprint_from_str;
