@@ -28,6 +28,8 @@ async fn start(directory: &Path, command: &mut Command) -> (Process, SocketAddr,
     let stdout = directory.join("stdout");
     let stderr = directory.join("stderr");
     command
+        .env("RVPN_NO_BROWSER", "1")
+        .stdin(Stdio::null())
         .stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
         .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
     let deadline = Instant::now() + Duration::from_secs(2);

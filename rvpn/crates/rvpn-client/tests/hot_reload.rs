@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
     time::Duration,
 };
 use tokio::{
@@ -81,11 +81,11 @@ async fn save(socket: &mut Socket, current: &mut Value, config: Value) -> Value 
     result
 }
 
-fn fixture(missing_bundle: bool) -> (tempfile::TempDir, Process, SocketAddr, SocketAddr) {
-    fixture_logging(missing_bundle, false)
+async fn fixture(missing_bundle: bool) -> (tempfile::TempDir, Process, SocketAddr, SocketAddr) {
+    fixture_logging(missing_bundle, false).await
 }
 
-fn fixture_logging(
+async fn fixture_logging(
     missing_bundle: bool,
     file_logging: bool,
 ) -> (tempfile::TempDir, Process, SocketAddr, SocketAddr) {
@@ -98,7 +98,6 @@ fn fixture_logging(
     )
     .unwrap();
     let mut config = rvpn_client::config::ClientConfig::default();
-    let panel = address();
     let socks = address();
     config.server_address = "wss://127.0.0.1:9/api/v1/ws".into();
     config.data_dir = "./data".into();
@@ -112,7 +111,7 @@ fn fixture_logging(
         .into(),
     );
     config.dashboard.enabled = true;
-    config.dashboard.listen_address = panel.to_string();
+    config.dashboard.listen_address = "127.0.0.1:0".into();
     config.socks5.listen_address = socks.to_string();
     config.dns_proxy.enabled = false;
     config.http_proxy.enabled = false;
@@ -123,20 +122,39 @@ fn fixture_logging(
     }
     let path = directory.path().join("client.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-    let child = Process(
+    let stdout_path = directory.path().join("stdout");
+    let stderr_path = directory.path().join("stderr");
+    let mut child = Process(
         Command::new(env!("CARGO_BIN_EXE_rvpn"))
             .args(["-c", path.to_str().unwrap()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .env("RVPN_NO_BROWSER", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
             .spawn()
             .unwrap(),
     );
+    // Let the client own the port from allocation through the WebSocket handshake.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let panel = loop {
+        let output = std::fs::read(&stdout_path).unwrap();
+        if let Some(panel) = String::from_utf8_lossy(&output).lines().find_map(|line| {
+            line.split_once("http://")?.1.strip_suffix('/')?.parse::<SocketAddr>().ok()
+        }) {
+            break panel;
+        }
+        let status = child.0.try_wait().unwrap();
+        assert!(status.is_none() && tokio::time::Instant::now() < deadline,
+            "panel did not announce its address (status {status:?})\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output), std::fs::read_to_string(&stderr_path).unwrap());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
     (directory, child, panel, socks)
 }
 
 #[tokio::test]
 async fn file_logging_keeps_only_panel_access_information_on_console() {
-    let (directory, mut child, panel, socks) = fixture_logging(false, true);
+    let (directory, mut child, panel, socks) = fixture_logging(false, true).await;
     let (mut socket, mut current) = connect(panel).await;
     // Trigger a successful save to prove runtime messages aren't duplicated.
     let mut config = current["config"].clone();
@@ -163,23 +181,8 @@ async fn file_logging_keeps_only_panel_access_information_on_console() {
     .expect("configuration applied log was not written within 10 seconds");
     child.0.kill().unwrap();
     child.0.wait().unwrap();
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    use std::io::Read;
-    child
-        .0
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut stdout)
-        .unwrap();
-    child
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
+    let stdout = std::fs::read_to_string(directory.path().join("stdout")).unwrap();
+    let stderr = std::fs::read_to_string(directory.path().join("stderr")).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
     assert!(stdout.contains(&format!("http://{panel}/")), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
@@ -200,7 +203,7 @@ async fn idle_flow(address: SocketAddr) -> TcpStream {
 #[tokio::test]
 async fn server_endpoints_use_direct_socks_and_http_after_configuration_reload() {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let (_directory, _child, panel, socks) = fixture(false);
+        let (_directory, _child, panel, socks) = fixture(false).await;
         let (mut socket, mut current) = connect(panel).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap();
@@ -260,7 +263,7 @@ async fn server_endpoints_use_direct_socks_and_http_after_configuration_reload()
 async fn proxy_handshakes_and_http_framing() {
     let mut phase = "start client";
     tokio::time::timeout(Duration::from_secs(20), async {
-        let (_directory, _child, panel, socks) = fixture(false);
+        let (_directory, _child, panel, socks) = fixture(false).await;
         let (mut panel, mut current) = connect(panel).await;
         let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
         let target = listener.local_addr().unwrap();
@@ -382,7 +385,7 @@ async fn proxy_handshakes_and_http_framing() {
 
 #[tokio::test]
 async fn saves_apply_rebind_roll_back_and_move_panel_without_changing_pid() {
-    let (directory, mut child, panel, socks) = fixture(false);
+    let (directory, mut child, panel, socks) = fixture(false).await;
     let pid = child.0.id();
     let (mut socket, mut current) = connect(panel).await;
     // Startup readiness may follow the panel's first session by a few ms.
@@ -505,7 +508,7 @@ async fn saves_apply_rebind_roll_back_and_move_panel_without_changing_pid() {
 
 #[tokio::test]
 async fn saving_repaired_configuration_recovers_a_stopped_network() {
-    let (directory, mut child, panel, socks) = fixture_logging(true, true);
+    let (directory, mut child, panel, socks) = fixture_logging(true, true).await;
     let pid = child.0.id();
     let (mut socket, mut current) = connect(panel).await;
     let mut config = current["config"].clone();
@@ -531,7 +534,7 @@ async fn first_apply_starts_both_proxies_when_the_dns_port_is_busy() {
         rr::{Name, RecordType},
     };
 
-    let (_directory, mut child, panel, socks) = fixture(true);
+    let (_directory, mut child, panel, socks) = fixture(true).await;
     let pid = child.0.id();
     let (mut socket, mut current) = connect(panel).await;
     // The blocker only reserves a port. Avoid registering it with the Windows
@@ -589,7 +592,7 @@ async fn first_apply_starts_both_proxies_when_the_dns_port_is_busy() {
 
 #[tokio::test]
 async fn access_policy_changes_revoke_existing_and_new_panel_sessions() {
-    let (_directory, mut child, panel, socks) = fixture(false);
+    let (_directory, mut child, panel, socks) = fixture(false).await;
     let (mut socket, mut current) = connect(panel).await;
     let mut config = current["config"].clone();
     config["dashboard"]["allow_cidrs"] = json!(["192.0.2.0/24"]);
