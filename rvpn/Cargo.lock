@@ -2862,6 +2862,7 @@ dependencies = [
  "base64 0.21.7",
  "ip_network",
  "ip_network_table",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
