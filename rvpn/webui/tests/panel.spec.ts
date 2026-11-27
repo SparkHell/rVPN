@@ -10,6 +10,7 @@ const config = {
   data_dir: './data',
   server: [],
   routing: {},
+  exit_strategy: "primary",
   socks5: {
     listen_address: '127.0.0.1:1080',
     auth_enabled: false,
@@ -295,6 +296,7 @@ test('supports node and routing forms, and protects unsaved changes', async ({
   await page
     .getByLabel('节点地址', { exact: false })
     .fill('wss://office.example/ws')
+  await page.getByLabel('默认出口策略').selectOption('failover')
   await page.getByLabel('路由目标节点名').fill('office')
   await page.getByRole('button', { name: '添加', exact: true }).click()
   await page.getByLabel('域名规则').fill('*.example.com')

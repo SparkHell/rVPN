@@ -408,18 +408,9 @@ async fn pooled_tunnel(target_host: &str, proxy: &ProxyHandle) -> Result<(Arc<So
         .tunnel_pools
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("pooled mode requires tunnel pools"))?;
-    let exit_name = proxy.router.choose(target_host);
-    let tunnel = pools
-        .get_or_default(exit_name)
-        .pick_with_reuse()
-        .await
-        .with_context(|| format!("Failed to pick pooled tunnel via exit '{}'", exit_name))?;
-
-    if exit_name != crate::server_pool::DEFAULT_SERVER_NAME {
-        debug!("Routing {} → exit '{}' (pooled)", target_host, exit_name);
-    }
-
-    Ok(tunnel)
+    proxy.pool.connect_exit(proxy.router.choose(target_host), |server| async move {
+        pools.get_or_default(&server.name).pick_with_reuse().await
+    }).await
 }
 
 async fn open_legacy(
@@ -429,28 +420,14 @@ async fn open_legacy(
     proxy: &ProxyHandle,
     timing: &mut ConnectionTiming,
 ) -> Result<()> {
-    let server = proxy.pool.get_or_default(proxy.router.choose(target_host));
-
-    if server.name != crate::server_pool::DEFAULT_SERVER_NAME {
-        debug!(
-            "Routing {} → server '{}' ({}:{})",
-            target_host, server.name, server.host, server.port
-        );
-    }
-
-    let (mut relay, mut ws_reader, ws_writer, ws_tasks) = StreamRelay::connect(
-        &server.host,
-        server.port,
-        &server.path,
-        proxy.tls_fingerprint,
-        server.sni_hostname.as_deref(),
-        &proxy.identity_key,
-        &server.bundle,
-        Some(&server.identity_config),
-        Some(&server.resumption),
-    )
-    .await
-    .with_context(|| format!("Failed to connect StreamRelay to server '{}'", server.name))?;
+    let (mut relay, mut ws_reader, ws_writer, ws_tasks) = proxy.pool
+        .connect_exit(proxy.router.choose(target_host), |server| async move {
+            StreamRelay::connect(
+                &server.host, server.port, &server.path, proxy.tls_fingerprint,
+                server.sni_hostname.as_deref(), &proxy.identity_key, &server.bundle,
+                Some(&server.identity_config), Some(&server.resumption),
+            ).await
+        }).await?;
 
     timing.finish_stage("目标连接");
     let mut request = vec![0]; // Confirmed TCP connect command. Older servers reject it.

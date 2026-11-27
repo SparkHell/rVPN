@@ -11,7 +11,8 @@
 //! is shared across all servers (SSH-model: one key, many hosts).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use crate::config::ExitStrategy;
 
 use anyhow::{Context as _, Result};
 
@@ -52,6 +53,9 @@ pub struct ResolvedServer {
 pub struct ServerPool {
     servers: HashMap<String, Arc<ResolvedServer>>,
     default_name: String,
+    order: Vec<String>,
+    strategy: ExitStrategy,
+    cursor: Arc<AtomicUsize>,
 }
 
 impl ServerPool {
@@ -120,6 +124,11 @@ impl ServerPool {
         }
 
         Ok(Self {
+            order: std::iter::once(DEFAULT_SERVER_NAME.to_owned())
+                .chain(config.extra_servers.iter().map(|entry| entry.name.trim().to_owned()))
+                .collect(),
+            strategy: config.exit_strategy,
+            cursor: Arc::new(AtomicUsize::new(0)),
             servers,
             default_name: DEFAULT_SERVER_NAME.to_string(),
         })
@@ -134,6 +143,41 @@ impl ServerPool {
             .or_else(|| self.servers.get(&self.default_name))
             .cloned()
             .expect("ServerPool always contains the default entry")
+    }
+
+    /// Try another exit only while establishing its transport. Once a target
+    /// request has been sent it must never be replayed through a second exit.
+    pub async fn connect_exit<T, F>(
+        &self,
+        routed: &str,
+        mut connect: impl FnMut(Arc<ResolvedServer>) -> F,
+    ) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>> + Send,
+    {
+        if self.order.len() == 1 || routed != DEFAULT_SERVER_NAME || matches!(self.strategy, ExitStrategy::Primary) {
+            return connect(self.get_or_default(routed)).await;
+        }
+        let start = match self.strategy {
+            ExitStrategy::RoundRobin => self.cursor.fetch_add(1, Ordering::Relaxed) % self.order.len(),
+            _ => 0,
+        };
+        let mut last_error = None;
+        for name in self.order[start..].iter().chain(&self.order[..start]) {
+            // Leave time inside the proxy's 30s target deadline for other
+            // exits and the destination acknowledgement.
+            let attempt = tokio::time::timeout(
+                std::time::Duration::from_secs(5), connect(self.get_or_default(name)),
+            ).await.context("exit handshake timed out").and_then(|result| result);
+            match attempt {
+                Ok(connection) => return Ok(connection),
+                Err(error) => {
+                    tracing::warn!("Exit {name} unavailable: {error:#}");
+                    last_error = Some(error.context(format!("exit {name}")));
+                }
+            }
+        }
+        Err(last_error.expect("pool always contains a primary exit"))
     }
 
     /// Names of every configured server, including `"default"`.
@@ -246,6 +290,31 @@ mod tests {
             identity_config: ServerIdentityConfig::default(),
             resumption: ResumptionStore::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn exit_strategies_apply_only_to_unmatched_connections() {
+        let names = [DEFAULT_SERVER_NAME, "backup"];
+        let mut pool = ServerPool {
+            servers: names.iter().map(|&name| (name.to_owned(), Arc::new(test_server(name)))).collect(),
+            default_name: DEFAULT_SERVER_NAME.to_owned(),
+            order: names.map(str::to_owned).to_vec(),
+            strategy: ExitStrategy::RoundRobin,
+            cursor: Arc::default(),
+        };
+        let success = |server: Arc<ResolvedServer>| async move { Ok(server.name.clone()) };
+        for expected in [DEFAULT_SERVER_NAME, "backup", DEFAULT_SERVER_NAME] {
+            assert_eq!(pool.connect_exit(DEFAULT_SERVER_NAME, success).await.unwrap(), expected);
+        }
+        pool.strategy = ExitStrategy::Failover;
+        let only_backup = |server: Arc<ResolvedServer>| async move {
+            anyhow::ensure!(server.name == "backup", "unreachable");
+            Ok(server.name.clone())
+        };
+        assert_eq!(pool.connect_exit(DEFAULT_SERVER_NAME, only_backup).await.unwrap(), "backup");
+        assert!(pool.connect_exit("backup", |server| async move { anyhow::ensure!(server.name == DEFAULT_SERVER_NAME, "offline"); Ok(()) }).await.is_err());
+        pool.strategy = ExitStrategy::Primary;
+        assert!(pool.connect_exit(DEFAULT_SERVER_NAME, only_backup).await.is_err());
     }
 
     /// The resumption store rides on `ResolvedServer` (one per exit) and is

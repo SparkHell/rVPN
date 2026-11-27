@@ -53,6 +53,18 @@ const icons = {
   settings: Settings2,
 }
 
+const exitLabels: Record<string, string> = {
+  primary: '仅主出口',
+  failover: '主备切换 · 按节点顺序尝试',
+  round_robin: '负载均衡 · 按新连接轮询',
+}
+
+const connectionGroups = [
+  { title: '主服务器', keys: ['server_address', 'sni_hostname', 'tls_fingerprint', 'server_public_key', 'prekey_bundle'] },
+  { title: '本地文件', keys: ['identity_key_file', 'data_dir'] },
+  { title: '出口与路由', keys: ['exit_strategy', 'server', 'routing'] },
+]
+
 const hiddenNetworkFields = new Set([
   'dns_cache_ttl',
   'dns_servers',
@@ -240,7 +252,7 @@ function Field({
         >
           {options[name].map((option) => (
             <option key={option} value={option}>
-              {option || '自动 / 使用兼容设置'}
+              {name === 'exit_strategy' ? exitLabels[option] : option || '自动 / 使用兼容设置'}
             </option>
           ))}
         </select>
@@ -379,7 +391,7 @@ function RoutingEditor({
         <div className="add-rule">
           <input
             aria-label="路由目标节点名"
-            placeholder="目标节点名 / default"
+            placeholder="附加服务器名称"
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
@@ -397,7 +409,7 @@ function RoutingEditor({
         </div>
       </div>
       {!Object.keys(value).length && (
-        <div className="empty-row">未匹配规则的连接使用主服务器。</div>
+        <div className="empty-row">未匹配规则的新连接按默认出口策略分配。</div>
       )}
       {Object.entries(value).map(([key, rule]) => (
         <div className="entry" key={key}>
@@ -617,7 +629,7 @@ function Overview({
             unit: '',
             icon: Activity,
             color: 'green',
-            sub: '本次运行 · 隧道上传与下载合计',
+            sub: '跨重启累计 · 隧道上传与下载合计',
           },
         ].map((metric) => (
           <article className="metric" key={metric.label}>
@@ -1474,42 +1486,44 @@ function App() {
               </div>
               <div className="config-sections">
                 {page === 'connection' && !search && (
-                  <section className="panel config-panel">
-                    <div className="panel-heading"><h2>导入服务器链接</h2></div>
-                    <div className="fields">
-                      <label className="field wide">服务器链接
-                        <input value={serverLink} placeholder="rVPN://…" onChange={e => setServerLink(e.target.value)} />
-                      </label>
-                      <label><input type="checkbox" checked={replacePrimary} onChange={e => setReplacePrimary(e.target.checked)} /> 替换主服务器</label>
-                      <button
-                        className="button secondary"
-                        disabled={busy || !connected || !serverLink.trim()}
-                        onClick={() => void importServer()}
-                      >
-                        导入到草稿
-                      </button>
-                    </div>
-                  </section>
-                )}
-                {page === 'connection' && !search && !session?.runtime.awaiting_server_import && (
-                  <section className="panel config-panel">
-                    <div className="panel-heading"><h2>导出主服务器链接</h2></div>
-                    <div className="fields">
-                      {exportedLink && (
-                        <label className="field wide">导出的 rVPN 链接
-                          <input readOnly value={exportedLink} onFocus={e => e.currentTarget.select()} />
+                  <div className="link-exchange">
+                    <section className="panel config-panel">
+                      <div className="panel-heading"><h2><ArrowDownLeft size={17} /> 导入服务器链接</h2></div>
+                      <div className="link-controls">
+                        <label className="field wide">服务器链接
+                          <input value={serverLink} placeholder="rVPN://…" onChange={e => setServerLink(e.target.value)} />
                         </label>
-                      )}
-                      <button className="button secondary" disabled={busy || !connected} onClick={() => void exportServer()}>
-                        生成链接
-                      </button>
-                      {exportedLink && (
-                        <button className="button tertiary" onClick={() => void copyExportedLink()}>
-                          复制链接
+                        <label><input type="checkbox" checked={replacePrimary} onChange={e => setReplacePrimary(e.target.checked)} /> 替换主服务器</label>
+                        <button
+                          className="button secondary"
+                          disabled={busy || !connected || !serverLink.trim()}
+                          onClick={() => void importServer()}
+                        >
+                          导入到草稿
                         </button>
-                      )}
-                    </div>
-                  </section>
+                      </div>
+                    </section>
+                    {!session?.runtime.awaiting_server_import && (
+                      <section className="panel config-panel">
+                        <div className="panel-heading"><h2><ArrowUpRight size={17} /> 导出主服务器链接</h2></div>
+                        <div className="link-controls">
+                          {exportedLink && (
+                            <label className="field wide">导出的 rVPN 链接
+                              <input readOnly value={exportedLink} onFocus={e => e.currentTarget.select()} />
+                            </label>
+                          )}
+                          <button className="button secondary" disabled={busy || !connected} onClick={() => void exportServer()}>
+                            生成链接
+                          </button>
+                          {exportedLink && (
+                            <button className="button tertiary" onClick={() => void copyExportedLink()}>
+                              复制链接
+                            </button>
+                          )}
+                        </div>
+                      </section>
+                    )}
+                  </div>
                 )}
                 {page === 'split' && !search && (
                   <>
@@ -1577,7 +1591,21 @@ function App() {
                   </>
                 )}
 
-                {(page === 'other' ? unknownKeys : keys)
+                {page === 'connection' && connectionGroups.map(group => {
+                  const visible = group.keys.filter(key => key in draft &&
+                    (group.title + key + (labels[key] || '')).toLowerCase().includes(search.toLowerCase()))
+                  if (!visible.length) return null
+                  return <section className="panel config-panel" key={group.title}>
+                    <div className="panel-heading"><h2>{group.title}</h2></div>
+                    <div className="fields">{visible.map(key => {
+                      const update = (value: unknown) => setDraft(setPath(draft, [key], value))
+                      if (key === 'server') return <ServerEditor key={key} value={draft[key] as unknown[]} onChange={update} />
+                      if (key === 'routing') return <RoutingEditor key={key} value={draft[key] as Config} onChange={update} />
+                      return <Field key={key} name={key} value={draft[key]} onChange={update} />
+                    })}</div>
+                  </section>
+                })}
+                {(page === 'connection' ? [] : page === 'other' ? unknownKeys : keys)
                   .filter((key) => key in draft)
                   .map((key) => {
                     const value = draft[key]
@@ -1762,21 +1790,7 @@ function App() {
                           <SlidersHorizontal size={18} />
                         </div>
                         <div className="fields">
-                          {key === 'server' ? (
-                            <ServerEditor
-                              value={value as unknown[]}
-                              onChange={(next) =>
-                                setDraft(setPath(draft, [key], next))
-                              }
-                            />
-                          ) : key === 'routing' ? (
-                            <RoutingEditor
-                              value={value as Config}
-                              onChange={(next) =>
-                                setDraft(setPath(draft, [key], next))
-                              }
-                            />
-                          ) : object ? (
+                          {object ? (
                             entries.map(([name, v]) => (
                               <Field
                                 key={name}

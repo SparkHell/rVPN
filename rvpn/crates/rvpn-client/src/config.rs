@@ -87,6 +87,10 @@ pub struct ClientConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
 
+    /// Selection policy for proxy connections without a matching exit rule.
+    #[serde(default)]
+    pub exit_strategy: ExitStrategy,
+
     /// Additional named servers for multi-server routing (SOCKS5 mode only).
     /// The top-level `server_address` + `prekey_bundle` form the implicit
     /// `"default"` server; entries here add more. Each `[[server]]` block
@@ -97,7 +101,7 @@ pub struct ClientConfig {
     /// Per-server routing rules. Keyed by server `name`. Domains match the
     /// SOCKS5 request hostname (exact host, `*.parent`, or bare parent).
     /// IPs match either a literal IPv4/IPv6 target or a CIDR.
-    /// If no rule matches, traffic goes to the default server.
+    /// Unmatched proxy traffic follows exit_strategy.
     #[serde(default)]
     pub routing: HashMap<String, RoutingRule>,
 }
@@ -122,10 +126,20 @@ impl Default for ClientConfig {
             dashboard: DashboardConfig::default(),
             tls_fingerprint: TlsFingerprint::default(),
             data_dir: default_data_dir(),
+            exit_strategy: ExitStrategy::default(),
             extra_servers: Vec::new(),
             routing: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitStrategy {
+    #[default]
+    Primary,
+    Failover,
+    RoundRobin,
 }
 
 /// Additional server for multi-server routing.

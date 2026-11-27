@@ -16,7 +16,7 @@ nat_enabled = true
 dhcp_range = "10.200.0.0/24"
 
 [server.tun]
-enabled = false
+enabled = true
 tun_ip = "10.200.0.1/24"
 # Optional exceptions for TCP/UDP proxy destinations only, e.g. ["10.200.0.42/32"].
 proxy_allow_cidrs = []

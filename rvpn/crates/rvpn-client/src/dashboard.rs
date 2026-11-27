@@ -145,6 +145,7 @@ pub struct DashboardState {
     pub bytes_down: AtomicU64,
     /// Payload bytes uploaded and downloaded through VPN tunnels.
     tunnel_bytes: AtomicU64,
+    prior_tunnel_bytes: AtomicU64,
     /// Cumulative proxied connections accepted.
     pub conns_accepted: AtomicU64,
     /// Cumulative proxied connections finished.
@@ -192,6 +193,7 @@ impl DashboardState {
             bytes_up: AtomicU64::new(0),
             bytes_down: AtomicU64::new(0),
             tunnel_bytes: AtomicU64::new(0),
+            prior_tunnel_bytes: AtomicU64::new(0),
             conns_accepted: AtomicU64::new(0),
             conns_completed: AtomicU64::new(0),
             conns_active: AtomicU64::new(0),
@@ -287,6 +289,71 @@ impl DashboardState {
             .filter(|(ts, _)| *ts >= t0 && *ts < t1)
             .cloned()
             .collect()
+    }
+}
+
+/// Persist only new bytes. The sidecar lock serializes clients sharing a
+/// data directory, including across atomic replacement of the total.
+pub(crate) struct TrafficStore {
+    saved_session: u64,
+    directory: std::path::PathBuf,
+}
+
+impl TrafficStore {
+    pub fn new(directory: &std::path::Path) -> Self {
+        Self { saved_session: 0, directory: directory.to_owned() }
+    }
+
+    pub fn checkpoint_in(&mut self, state: &DashboardState, next: &std::path::Path) -> anyhow::Result<()> {
+        if self.directory == next {
+            return self.checkpoint(state);
+        }
+        self.checkpoint(state)?;
+        state.tunnel_bytes.fetch_sub(self.saved_session, Ordering::Relaxed);
+        state.prior_tunnel_bytes.store(0, Ordering::Relaxed);
+        self.saved_session = 0;
+        self.directory = next.to_owned();
+        self.checkpoint(state)
+    }
+
+    pub fn checkpoint(&mut self, state: &DashboardState) -> anyhow::Result<()> {
+        use std::{fs, io::Write};
+        let session = state.tunnel_bytes.load(Ordering::Relaxed);
+        let delta = session.saturating_sub(self.saved_session);
+        let dir = &self.directory;
+        let path = dir.join("proxy-traffic.bytes");
+        // Take the lock before reading the base for a write. Atomic replacement
+        // makes read-only refreshes safe without creating files on first run.
+        let _lock = if delta > 0 {
+            fs::create_dir_all(dir)?;
+            let lock = fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join("proxy-traffic.lock"))?;
+            lock.lock()?;
+            Some(lock)
+        } else {
+            None
+        };
+        let previous: u64 = match fs::read_to_string(&path) {
+            Ok(text) => text.trim().parse()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        if delta == 0 {
+            state.prior_tunnel_bytes.store(previous.saturating_sub(session), Ordering::Relaxed);
+            return Ok(());
+        }
+        let total = previous.saturating_add(delta);
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        writeln!(temp, "{total}")?;
+        temp.as_file().sync_all()?;
+        temp.persist(path)?;
+        state.prior_tunnel_bytes.store(total.saturating_sub(session), Ordering::Relaxed);
+        self.saved_session = session;
+        Ok(())
     }
 }
 
@@ -787,7 +854,7 @@ pub(crate) fn render_stats_json(state: &DashboardState, now: u64) -> String {
         "counters": {
             "bytes_up": state.bytes_up.load(Ordering::Relaxed),
             "bytes_down": state.bytes_down.load(Ordering::Relaxed),
-            "tunnel_bytes": state.tunnel_bytes.load(Ordering::Relaxed),
+            "tunnel_bytes": state.tunnel_bytes.load(Ordering::Relaxed).saturating_add(state.prior_tunnel_bytes.load(Ordering::Relaxed)),
             "conns_accepted": state.conns_accepted.load(Ordering::Relaxed),
             "conns_active": state.conns_active.load(Ordering::Relaxed),
             "conns_completed": state.conns_completed.load(Ordering::Relaxed),
@@ -1484,6 +1551,24 @@ fn render_page(state: &DashboardState, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_traffic_survives_restart_and_merges_independent_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = DashboardState::new();
+        let two = DashboardState::new();
+        let mut first = TrafficStore::new(dir.path());
+        let mut second = TrafficStore::new(dir.path());
+        one.tunnel_bytes.store(100, Ordering::Relaxed);
+        two.tunnel_bytes.store(35, Ordering::Relaxed);
+        first.checkpoint(&one).unwrap();
+        second.checkpoint(&two).unwrap();
+        first.checkpoint(&one).unwrap();
+        let restarted = DashboardState::new();
+        TrafficStore::new(dir.path()).checkpoint(&restarted).unwrap();
+        assert_eq!(restarted.prior_tunnel_bytes.load(Ordering::Relaxed), 135);
+        assert_eq!(restarted.bytes_up.load(Ordering::Relaxed), 0);
+    }
 
     fn bucket_at(ts: u64) -> Bucket {
         Bucket {

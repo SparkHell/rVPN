@@ -4,6 +4,8 @@
 # prekey_bundle = "./prekey-bundle.json"
 identity_key_file = "./identity.key"
 tls_fingerprint = "Chrome"
+# Unmatched proxy connections: primary, failover (in server order), or round_robin.
+exit_strategy = "primary"
 
 [socks5]
 listen_address = "127.0.0.1:1080"

@@ -327,8 +327,8 @@ pub struct TunNetworkConfig {
     #[serde(default)]
     pub proxy_allow_cidrs: Vec<ip_network::IpNetwork>,
 
-    /// Enable TUN interface (default: false for backward compatibility)
-    #[serde(default)]
+    /// Enable the server TUN interface by default.
+    #[serde(default = "default_tun_enabled")]
     pub enabled: bool,
 
     /// TUN interface IP address (CIDR notation)
@@ -352,13 +352,17 @@ impl Default for TunNetworkConfig {
     fn default() -> Self {
         Self {
             proxy_allow_cidrs: Vec::new(),
-            enabled: false, // Disabled by default to preserve existing behavior
+            enabled: default_tun_enabled(),
             tun_ip: "10.200.0.1/24".to_string(),
             mtu: 1420,
             interface_name: "tun0".to_string(),
             dns_servers: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))],
         }
     }
+}
+
+fn default_tun_enabled() -> bool {
+    cfg!(target_os = "linux")
 }
 
 fn default_tun_ip() -> String {
@@ -483,6 +487,16 @@ max_files = 4
     }
 
     #[test]
+    fn server_tun_defaults_and_explicit_opt_out() {
+        let defaults: ConfigWrapper = toml::from_str("[server]").unwrap();
+        let partial: ConfigWrapper = toml::from_str("[server.tun]\nmtu = 1400").unwrap();
+        let disabled: ConfigWrapper = toml::from_str("[server.tun]\nenabled = false").unwrap();
+        assert_eq!(defaults.server.tun.enabled, cfg!(target_os = "linux"));
+        assert_eq!(partial.server.tun.enabled, defaults.server.tun.enabled);
+        assert!(!disabled.server.tun.enabled);
+    }
+
+    #[test]
     fn packaged_server_example_loads() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/server.toml.example");
@@ -490,7 +504,7 @@ max_files = 4
         let contents = std::fs::read_to_string(path).unwrap();
         let wrapper: ConfigWrapper = toml::from_str(&contents).unwrap();
         assert_eq!(wrapper.server.websocket_path, "/api/v1/ws");
-        assert!(!wrapper.server.tun.enabled);
+        assert!(wrapper.server.tun.enabled);
         assert!(!wrapper.server.acme.enabled);
     }
 }

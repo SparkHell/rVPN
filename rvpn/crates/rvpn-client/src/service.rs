@@ -268,11 +268,7 @@ struct StartupReport {
     dns_warning: Option<String>,
 }
 
-pub fn report_startup(
-    address: Option<std::net::SocketAddr>,
-    error: Option<String>,
-    dns_warning: Option<&str>,
-) -> Result<()> {
+pub(crate) fn managed_process() -> bool {
     #[cfg(windows)]
     let managed = windows::is_service();
     #[cfg(unix)]
@@ -282,7 +278,15 @@ pub fn report_startup(
         || unsafe { libc::getppid() == 1 };
     #[cfg(not(any(unix, windows)))]
     let managed = false;
-    if !managed {
+    managed
+}
+
+pub fn report_startup(
+    address: Option<std::net::SocketAddr>,
+    error: Option<String>,
+    dns_warning: Option<&str>,
+) -> Result<()> {
+    if !managed_process() {
         return Ok(());
     }
     let directory = report_directory()?;

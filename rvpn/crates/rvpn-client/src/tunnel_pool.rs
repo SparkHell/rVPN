@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Weak, atomic::{AtomicUsize, Ordering as AtomicOrdering}};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -173,13 +173,22 @@ fn new_entry<T: PoolTunnel>(tunnel: Arc<T>, rotation: &RotationConfig) -> PoolEn
     }
 }
 
+/// A pick can be cancelled while its handshake is in flight.
+struct PendingHandshake(Arc<AtomicUsize>);
+
+impl Drop for PendingHandshake {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
 /// Mutable pool state, locked on every pick/refill/rotation check.
 struct PoolInner<T: PoolTunnel> {
     /// Live plus not-yet-detected-dead tunnels (dead ones are pruned lazily).
     tunnels: Vec<PoolEntry<T>>,
     /// In-flight background handshakes (pre-warm/replacement), counted so
     /// `ensure_target` never over-spawns.
-    connecting: usize,
+    connecting: Arc<AtomicUsize>,
     /// Consecutive background-connect failures; drives the backoff delay.
     backoff_attempt: u32,
     /// Successful tunnel handshakes since pool creation (metrics).
@@ -263,7 +272,7 @@ impl<T: PoolTunnel> TunnelPool<T> {
         let pool = Self {
             inner: Arc::new(Mutex::new(PoolInner {
                 tunnels: Vec::new(),
-                connecting: 0,
+                connecting: Arc::default(),
                 backoff_attempt: 0,
                 handshakes: 0,
                 rotations: 0,
@@ -303,7 +312,7 @@ impl<T: PoolTunnel> TunnelPool<T> {
     }
 
     pub async fn pick_with_reuse(&self) -> Result<(Arc<T>, bool)> {
-        {
+        let reservation = {
             let mut inner = self.inner.lock().await;
             let pruned = inner.prune_dead();
             if pruned > 0 {
@@ -333,7 +342,7 @@ impl<T: PoolTunnel> TunnelPool<T> {
             if assignable > 0 {
                 // All assignable tunnels at cap: grow toward pool_max in the
                 // background, assign to least-loaded anyway (soft cap).
-                if assignable + inner.connecting < self.pool_max {
+                if assignable + inner.connecting.load(AtomicOrdering::Relaxed) < self.pool_max {
                     info!(
                         "pool '{}': all {} tunnel(s) at cap {}, growing",
                         self.name, assignable, self.max_flows_per_conn
@@ -351,15 +360,13 @@ impl<T: PoolTunnel> TunnelPool<T> {
                 return Ok((t, true));
             }
 
-            // No assignable tunnels: reserve a connecting slot so concurrent
-            // picks don't stampede the handshake path, then connect
-            // synchronously.
-            inner.connecting += 1;
-        }
+            inner.connecting.fetch_add(1, AtomicOrdering::Relaxed);
+            PendingHandshake(inner.connecting.clone())
+        };
 
         let result = (self.connector)().await;
         let mut inner = self.inner.lock().await;
-        inner.connecting = inner.connecting.saturating_sub(1);
+        drop(reservation);
         match result {
             Ok(t) => {
                 inner.backoff_attempt = 0;
@@ -380,7 +387,7 @@ impl<T: PoolTunnel> TunnelPool<T> {
                     self.name, attempt, e
                 );
                 // Background retry so the next flow finds a warm tunnel.
-                if inner.assignable_count() + inner.connecting < self.pool_size {
+                if inner.assignable_count() + inner.connecting.load(AtomicOrdering::Relaxed) < self.pool_size {
                     spawn_connect(self.ctx(), &mut inner, backoff_delay(attempt));
                 }
                 Err(e)
@@ -395,7 +402,7 @@ impl<T: PoolTunnel> TunnelPool<T> {
 fn ensure_target<T: PoolTunnel>(ctx: &PoolCtx<T>, inner: &mut PoolInner<T>) {
     let deficit = ctx
         .pool_size
-        .saturating_sub(inner.assignable_count() + inner.connecting);
+        .saturating_sub(inner.assignable_count() + inner.connecting.load(AtomicOrdering::Relaxed));
     for _ in 0..deficit {
         debug!("pool '{}': pre-warming tunnel (below target)", ctx.name);
         spawn_connect(ctx.clone(), inner, Duration::ZERO);
@@ -408,7 +415,7 @@ fn ensure_target<T: PoolTunnel>(ctx: &PoolCtx<T>, inner: &mut PoolInner<T>) {
 ///
 /// This is the shared replacement path for both failure and rotation.
 fn spawn_connect<T: PoolTunnel>(ctx: PoolCtx<T>, inner: &mut PoolInner<T>, delay: Duration) {
-    inner.connecting += 1;
+    inner.connecting.fetch_add(1, AtomicOrdering::Relaxed);
     tokio::spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -420,7 +427,7 @@ fn spawn_connect<T: PoolTunnel>(ctx: PoolCtx<T>, inner: &mut PoolInner<T>, delay
         // by mux and pooled paths) — do not add a second probe here.
         let result = (ctx.connector)().await;
         let mut guard = inner_arc.lock().await;
-        guard.connecting = guard.connecting.saturating_sub(1);
+        guard.connecting.fetch_sub(1, AtomicOrdering::Relaxed);
         match result {
             Ok(t) => {
                 guard.backoff_attempt = 0;
@@ -441,7 +448,7 @@ fn spawn_connect<T: PoolTunnel>(ctx: PoolCtx<T>, inner: &mut PoolInner<T>, delay
                     "pool '{}': background connect failed (attempt {}): {}",
                     ctx.name, attempt, e
                 );
-                if guard.assignable_count() + guard.connecting < ctx.pool_size {
+                if guard.assignable_count() + guard.connecting.load(AtomicOrdering::Relaxed) < ctx.pool_size {
                     spawn_connect(ctx.clone(), &mut guard, backoff_delay(attempt));
                 }
             }
@@ -574,7 +581,7 @@ fn spawn_metrics<T: PoolTunnel>(ctx: PoolCtx<T>) {
                 ctx.name,
                 guard.alive_count(),
                 draining,
-                guard.connecting,
+                guard.connecting.load(AtomicOrdering::Relaxed),
                 flows_per_tunnel,
                 guard.handshakes,
                 guard.rotations,

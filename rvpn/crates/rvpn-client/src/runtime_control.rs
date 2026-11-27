@@ -309,6 +309,32 @@ fn serve_panel(
     }
 }
 
+fn open_desktop_panel(address: std::net::SocketAddr) {
+    if crate::service::managed_process() || std::env::var_os("RVPN_NO_BROWSER").is_some() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if !["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|name|
+        std::env::var_os(name).is_some_and(|value| !value.is_empty())) {
+        return;
+    }
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    tokio::spawn(async move {
+        #[cfg(windows)]
+        let mut opener = tokio::process::Command::new("rundll32.exe");
+        #[cfg(windows)]
+        opener.arg("url.dll,FileProtocolHandler");
+        #[cfg(target_os = "macos")]
+        let mut opener = tokio::process::Command::new("open");
+        #[cfg(target_os = "linux")]
+        let mut opener = tokio::process::Command::new("xdg-open");
+        match opener.arg(panel_url(address)).status().await {
+            Ok(status) if status.success() => {}
+            result => tracing::warn!("Could not open control panel in browser: {result:?}"),
+        }
+    });
+}
+
 pub(crate) fn panel_url(mut address: std::net::SocketAddr) -> String {
     if address.ip().is_unspecified() {
         address.set_ip(if address.is_ipv4() {
@@ -404,6 +430,12 @@ pub async fn run(
     let (sender, mut requests) = mpsc::channel::<ApplyRequest>(8);
     panel.attach_applier(sender);
     let state = dashboard::global().unwrap_or_else(|| Arc::new(dashboard::DashboardState::new()));
+    dashboard::init(state.clone());
+    let mut traffic = dashboard::TrafficStore::new(&config.data_dir);
+    if let Err(error) = traffic.checkpoint(&state) {
+        tracing::warn!("Could not load proxy traffic: {error:#}");
+    }
+    let mut traffic_interval = tokio::time::interval(Duration::from_secs(5));
     let sampler = tokio::spawn(dashboard::run_sampler(state.clone()));
     let _sampler_guard = OnDrop::new(move || sampler.abort());
     let mut listener = socket.map(|socket| serve_panel(socket, &config, state.clone(), panel.clone()));
@@ -440,6 +472,9 @@ pub async fn run(
             None
         }
     };
+    if let Some(address) = listener.as_ref().and_then(|panel| panel.local_address) {
+        open_desktop_panel(address);
+    }
     let mut started = worker.is_some();
     crate::service::report_startup(
         listener.as_ref().and_then(|panel| panel.local_address),
@@ -451,6 +486,11 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = stopped.changed() => break,
+            _ = traffic_interval.tick() => {
+                if let Err(error) = traffic.checkpoint_in(&state, &config.data_dir) {
+                    tracing::warn!("Could not checkpoint proxy traffic: {error:#}");
+                }
+            }
             completed = async { match worker.as_mut() { Some(worker) => (&mut worker.done).await, None => std::future::pending().await } } => {
                 if let Some(old) = worker.take() { old.stop().await; }
                 let error = match completed { Ok(Err(error)) => error, _ => "VPN network runtime stopped".into() };
@@ -555,6 +595,7 @@ pub async fn run(
     if let Some(worker) = worker {
         worker.stop().await;
     }
+    traffic.checkpoint_in(&state, &config.data_dir)?;
     Ok(())
 }
 

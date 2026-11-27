@@ -129,6 +129,7 @@ export const sections = [
       'identity_key_file',
       'prekey_bundle',
       'data_dir',
+      'exit_strategy',
       'server',
       'routing',
     ],
@@ -186,6 +187,7 @@ export const labels: Record<string, string> = {
   prekey_bundle: '服务器预密钥包',
   data_dir: '数据目录',
   server: '附加服务器',
+  exit_strategy: '默认出口策略',
   routing: '按服务器分配路由',
   socks5: 'SOCKS5 代理',
   http_proxy: 'HTTP / HTTPS 代理',
@@ -264,6 +266,7 @@ export const hints: Record<string, string> = {
   dns_cache_enabled: '缓存解析结果，减少重复查询。',
   ipv6_enabled: '有 IPv6 地址时优先连接，失败后尝试 IPv4。',
   server_address: '支持 ws:// 或 wss://，包含 WebSocket 路径。',
+  exit_strategy: '适用于 SOCKS5 和 HTTP 的 legacy、pooled 模式。域名或 IP 规则优先；主备与轮询仅在建立新连接时选择出口。',
   prekey_bundle: '使用服务端生成的公开 prekey-bundle.json。',
   dns_servers: '仅当「DNS 上游」为空时使用。TUN 启动后会把系统 DNS 指向本地 DNS 代理；此处请填上游解析器，避免指回代理自身。',
   nameservers:
@@ -298,6 +301,7 @@ export const hints: Record<string, string> = {
   logging: '保存后立即切换日志级别和文件设置，不中断代理连接。',
 }
 export const options: Record<string, string[]> = {
+  exit_strategy: ['primary', 'failover', 'round_robin'],
   ech_mode: ['off', 'prefer', 'required'],
   tls_fingerprint: [
     'chrome',

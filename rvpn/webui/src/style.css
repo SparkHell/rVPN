@@ -854,6 +854,25 @@ footer > span:last-child {
   border-radius: 4px;
   padding: 1px 5px;
 }
+.link-exchange {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 16px;
+}
+.link-exchange > :only-child { grid-column: 1 / -1; }
+.link-exchange h2, .link-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.link-exchange h2 svg { color: #49bf86; }
+.link-controls { flex-wrap: wrap; }
+.link-controls .field { flex: 1 0 100%; font-size: 12px; }
+.link-controls .field input { margin-top: 7px; }
+.link-controls label:has([type="checkbox"]) { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.link-controls input[type="checkbox"] { accent-color: #00b467; }
+@media (max-width: 800px) { .link-exchange { grid-template-columns: 1fr; } }
+
 .config-panel {
   padding: 24px;
 }

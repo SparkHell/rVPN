@@ -343,9 +343,13 @@ def install_binary(source, binary):
     os.replace(out.name, BIN / binary)
 
 
-def service(name, directory, command, env=""):
+def service(name, directory, command, env="", tun=False):
+    # TUN setup runs ip/iptables and checks host routes and Docker IPAM.
+    identity = ("ProtectSystem=full\nProtectHome=yes\nPrivateTmp=yes\n"
+                "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\n" if tun
+                else "DynamicUser=yes\n")
     unit = (f"[Unit]\nDescription={name}\nAfter=network.target\n\n[Service]\n"
-            f"DynamicUser=yes\nStateDirectory={directory.name}\nWorkingDirectory={directory}\n{env}"
+            f"{identity}StateDirectory={directory.name}\nWorkingDirectory={directory}\n{env}"
             f"ExecStart={command}\nRestart=on-failure\nRestartSec=3\nNoNewPrivileges=yes\n"
             "[Install]\nWantedBy=multi-user.target\n")
     write(UNITS / (name + ".service"), unit)
@@ -456,18 +460,29 @@ def deploy(args):
         existing_sites = bool(config.get("apps", {}).get("http", {}).get("servers"))
         clean = not location and not existing_sites and not mirror_present and not {"nginx", "apache2"}.intersection(installed)
         mirror = clean and yes("同时部署 MirrorProxy 作为此域名的公开镜像站？（推荐）")
+        tun = yes("启用服务端 TUN 和内核 IPv4 转发？")
         path = choose_path(config, domain, location)
         port = port_choice("rVPN 本机端口", 8091, set())
-        state = dict(domain=domain, path=path, port=port, mirror=mirror, installed_caddy=not has_caddy,
+        state = dict(domain=domain, tun=tun, path=path, port=port, mirror=mirror, installed_caddy=not has_caddy,
                      mirror_port=port_choice("MirrorProxy 本机端口", 3000, {port}) if mirror else None)
     print(f"{domain}，Caddy HTTPS → {state['path']} → 127.0.0.1:{state['port']}\n"
           f"站点配置：{location[0] if location else CADDY}；rVPN 配置：{ETC}/server.toml\n"
           f"systemd：caddy、rvpn-server" + (f"、rvpn-mirrorproxy（127.0.0.1:{state['mirror_port']}）" if state['mirror'] else ""))
     print("复用已安装的 Caddy。" if has_caddy else "将通过 apt 安装 Caddy，并启用 HTTPS。")
+    if state.get("tun"):
+        print("TUN 将使用 10.200.0.0/24，并启用 IPv4 转发和 iptables。")
     if location:
         print("现有站点将保留原有处理规则；仅 HTTP 的域名站点将启用 Caddy 自动 HTTPS。")
     if not yes("确认安装依赖、配置并启动以上服务？", False):
         return
+    if state.get("tun"):
+        if not Path("/dev/net/tun").exists():
+            raise ValueError("服务端 TUN 需要 /dev/net/tun；请启用设备或选择关闭 TUN")
+        run("apt-get", "update")
+        run("apt-get", "install", "-y", "iproute2", "iptables")
+        forwarding = Path("/etc/sysctl.d/90-rvpn-forwarding.conf")
+        write(forwarding, "net.ipv4.ip_forward = 1\n")
+        run("sysctl", "-p", str(forwarding))
     install_dependencies(has_caddy)
     if not STATE.exists():
         write(STATE, json.dumps(state, indent=2), 0o600)
@@ -508,9 +523,9 @@ prekey_bundle_file = "{DATA}/prekey-bundle.json"
 [server.logging]
 file_enabled = false
 [server.tun]
-enabled = false
+enabled = {str(state.get("tun", False)).lower()}
 """)
-    service("rvpn-server", DATA, f"{BIN}/rvpn-server --config {server_config}")
+    service("rvpn-server", DATA, f"{BIN}/rvpn-server --config {server_config}", tun=state.get("tun", False))
     print("正在验证本机 rVPN WebSocket 服务…", flush=True)
     retry(lambda: upgrade(domain, state["port"], state["path"]), 20)
     # Apt may create a stock Caddyfile. Re-read imports before touching the site.

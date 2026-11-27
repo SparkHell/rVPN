@@ -115,7 +115,9 @@ listen_address = "127.0.0.1:9800"
 ```
 
 The client prints the browser URL after the listener starts, including the actual
-port. Wildcard listeners print a loopback URL plus LAN access instructions. When
+port. Manual desktop launches also open that URL in the default browser.
+Service launches and headless Linux sessions skip the browser. Set
+`RVPN_NO_BROWSER=1` to suppress it for a manual launch. Wildcard listeners print a loopback URL plus LAN access instructions. When
 the panel is disabled, startup logs explain how to enable it.
 
 The React + Tailwind CSS interface follows `DESIGN.md` and is built with Vite 8.
@@ -123,7 +125,13 @@ The HTML, JavaScript, CSS and fonts are embedded into `rvpn`; deployment needs
 only the binary. No Node installation or CDN is needed at runtime.
 WebSocket `/ws` pushes statistics every two seconds and handles configuration
 reads, validation and saves. All existing fields have forms, including extra
-servers and per-server routing. The old `/api/stats.json` endpoint remains.
+servers and per-server routing. For SOCKS5 and HTTP connections in legacy or
+pooled mode, `exit_strategy = "failover"` tries the primary server first and
+then additional servers in configuration order. Use `"round_robin"` to rotate
+the first choice per new connection. Both strategies retry an unavailable exit
+during tunnel establishment. Explicit destination rules pin their connections
+to the named exit. Existing configurations default to `"primary"`.
+The old `/api/stats.json` endpoint remains.
 
 Saving validates the settings and atomically replaces the same TOML or JSON
 file passed to `-c`. Relative paths stay relative. Formatting and comments are
@@ -386,6 +394,8 @@ next routing decision and survive restarts. The bundled rules work offline
 before the first update. AdGuard imports domain blocking and exception rules.
 The existing custom ad block file remains available with ad blocking enabled.
 
+The control panel checkpoints used proxy traffic in the client data directory every five seconds and again at graceful shutdown.
+
 Routing statistics count each completed local DNS query and each routed proxy
 connection separately. Direct, blocked, and GFWList percentages use their
 combined total as the denominator. Each metric shows both contributions. The panel keeps the
@@ -538,7 +548,7 @@ VPN transport endpoints stay on the physical network. Desktop TUN has no
 IPv6 data plane. IPv6 routes remain managed by the operating system. Domain
 routing relies on DNS queries reaching rVPN.
 
-On the Linux server, enable `[server.tun]`, choose a virtual subnet that
+Linux servers enable `[server.tun]` by default. Choose a virtual subnet that
 does not overlap either network, and enable kernel IPv4 forwarding. With
 `[server.network].nat_enabled = true`, the server installs its own iptables
 forwarding and masquerade rules for the TUN subnet. With NAT disabled, provide
